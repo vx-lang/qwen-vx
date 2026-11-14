@@ -1,13 +1,25 @@
 # Qwen coder models in Vx
 
-This app runs Qwen coder models with a program written in Vx, on the GPU of an Apple Silicon
-Mac. The plan and its milestones are in [#3094](https://github.com/vx-lang/Vx/issues/3094). The
+This program runs Qwen coder models on the GPU of an Apple Silicon Mac. It is written in
+[Vx](https://github.com/vx-lang/Vx), and it uses the GPU kernels of Vx's `std::nn`. The plan and its milestones are in [#5](https://github.com/vx-lang/qwen-vx/issues/5). The
 mixture-of-experts (MoE) model Qwen3-Coder-30B-A3B is the next milestone,
-[#3151](https://github.com/vx-lang/Vx/issues/3151). The Vx program runs it in Q4_0, as the section
+[#6](https://github.com/vx-lang/qwen-vx/issues/6). The Vx program runs it in Q4_0, as the section
 on the MoE model below shows.
 
 The program generates tokens with greedy decoding, from a prompt given as token ids. A tokenizer
 in Vx comes later, so `reference.py` turns text into token ids for now.
+
+## Install Vx
+
+The program needs Vx v0.0.4 or later:
+
+```sh
+curl -fsSL https://vxlang.org/install.sh | sh
+```
+
+The toolchain goes in `~/.vx/current`. On a Mac, it also needs LLVM 22 (`brew install llvm@22`).
+[Getting started](https://vxlang.org/docs/getting-started.html) has the details. On a computer
+with no Apple GPU, the same program runs on the CPU.
 
 ## Prepare a model
 
@@ -21,21 +33,21 @@ The scripts need Python 3 with NumPy. `--prompt` also needs the `tokenizers` pac
 1. Convert it into the weight file that the Vx program reads:
 
    ```sh
-   python3 apps/qwen/scripts/convert.py ~/models/Qwen2.5-Coder-0.5B-Instruct qwen-0.5b.vxw
+   python3 scripts/convert.py ~/models/Qwen2.5-Coder-0.5B-Instruct qwen-0.5b.vxw
    ```
 
 1. Generate a few tokens with the NumPy reference. It prints the prompt as token ids:
 
    ```sh
-   python3 apps/qwen/scripts/reference.py qwen-0.5b.vxw \
+   python3 scripts/reference.py qwen-0.5b.vxw \
        --tokenizer ~/models/Qwen2.5-Coder-0.5B-Instruct --prompt "def fibonacci(n):" --steps 8
    ```
 
 1. Generate the same tokens with the Vx program, on the GPU:
 
    ```sh
-   vxc apps/qwen/src/main.vx --package qwen=apps/qwen/src --host default \
-       --machine fleet/m4-uma.vx -- qwen-0.5b.vxw --tokens 750,75698,1445,1648 --steps 8
+   vxc src/main.vx --package qwen=src --host default \
+       --machine ~/.vx/current/fleet/m4-uma.vx -- qwen-0.5b.vxw --tokens 750,75698,1445,1648 --steps 8
    ```
 
 `make_tiny_model.py` writes a model with the same layers and random weights. It is small enough
@@ -63,7 +75,7 @@ bf16. The Vx program reads an fp8 file like a bf16 file, and runs the fp8 kernel
 it.
 
 `reference.py` widens the codes and scales exactly to float32. With `--perplexity`, it measures
-how well a model predicts a text. On the first 512 tokens of `scripts/tools/gen_error_index.py`:
+how well a model predicts a text. On the first 512 tokens of `scripts/tools/gen_error_index.py` in the Vx repository:
 
 | Model | bf16 perplexity | fp8 perplexity | Greedy tokens of fp8 |
 | --- | --- | --- | --- |
@@ -85,23 +97,23 @@ above 4 bits.
 
 The Vx program reads a Q4_0 file like the others, and runs the Q4_0 kernels of `std::nn` for it.
 Of four 4-bit formats, Q4_0 was the closest to bf16 on the 7B model. The measurement is in
-[#3151](https://github.com/vx-lang/Vx/issues/3151#issuecomment-6763017034).
+[#6](https://github.com/vx-lang/qwen-vx/issues/6#issuecomment-6879596230).
 
 ## The MoE model
 
 Qwen3-Coder-30B-A3B is 61 GB in bf16, so this Mac runs it in Q4_0, at 17.8 GB:
 
 ```sh
-python3 apps/qwen/scripts/convert.py --q4 ~/models/Qwen3-Coder-30B-A3B-Instruct qwen3-30b-q4.vxw
-vxc apps/qwen/src/main.vx --package qwen=apps/qwen/src --host default \
-    --machine fleet/m4-uma.vx -- qwen3-30b-q4.vxw --tokens 750,75698,1445,982,257 --steps 64
+python3 scripts/convert.py --q4 ~/models/Qwen3-Coder-30B-A3B-Instruct qwen3-30b-q4.vxw
+vxc src/main.vx --package qwen=src --host default \
+    --machine ~/.vx/current/fleet/m4-uma.vx -- qwen3-30b-q4.vxw --tokens 750,75698,1445,982,257 --steps 64
 ```
 
 The tokens are `def fibonacci(n):` and a new line with 4 spaces. The Vx program wrote a recursive
 and an iterative `fibonacci` in the 64 steps. `reference.py` on the same file chose the same 64
 tokens, with each logit within 5.4e-05.
 
-Both programs measured the perplexity on `src/dialect/MetalImage.cpp` at 7e3cf6a3, as
+Both programs measured the perplexity on `src/dialect/MetalImage.cpp` of Vx at vx-lang/Vx@7e3cf6a3, as
 `llama-perplexity -c 512 --chunks 8 --no-escape` measures it:
 
 | Weights | Perplexity |
@@ -113,7 +125,7 @@ Both programs measured the perplexity on `src/dialect/MetalImage.cpp` at 7e3cf6a
 A token took 28.0 ms in Vx with the cheaper kernel launches of
 [#3152](https://github.com/vx-lang/Vx/pull/3152) and [#3165](https://github.com/vx-lang/Vx/pull/3165),
 and 24.3 ms in llama.cpp. Each token runs about 477 kernels. The details are in
-[#3151](https://github.com/vx-lang/Vx/issues/3151#issuecomment-6768053118).
+[#6](https://github.com/vx-lang/qwen-vx/issues/6#issuecomment-6879596324).
 
 ## The Vx code
 
@@ -124,22 +136,23 @@ and 24.3 ms in llama.cpp. Each token runs about 477 kernels. The details are in
 | `src/main.vx` | Generates tokens with greedy decoding, and prints the lines of `reference.py`. |
 
 A program imports the modules as `qwen::weights` and `qwen::model`, with
-`vxc --package qwen=apps/qwen/src`.
+`vxc --package qwen=src`. A program in another folder names the `src` folder of this repository.
 
-The tests are in `tests/`. Run them from the root of the Vx repository, with `vxc`, `FileCheck`
-and a Python 3 that has NumPy on `PATH`:
+The tests are in `tests/`. They need a Python 3 that has NumPy and ml_dtypes, and `FileCheck` from
+LLVM or the Python port (`pip install numpy ml_dtypes filecheck`). `tests/run.sh` takes `vxc` and the
+machine files from `~/.vx/current`, or from the toolchain in `VX_HOME`:
 
 ```sh
-apps/qwen/tests/run.sh
+tests/run.sh
 ```
 
 `tests/print_weights.vx` also checks a real model. Its lines must equal those of
 `reference.py --tensors`:
 
 ```sh
-vxc apps/qwen/tests/print_weights.vx --package qwen=apps/qwen/src --host default \
-    --machine fleet/m4-uma.vx -- qwen-0.5b.vxw
-python3 apps/qwen/scripts/reference.py qwen-0.5b.vxw --tensors
+vxc tests/print_weights.vx --package qwen=src --host default \
+    --machine ~/.vx/current/fleet/m4-uma.vx -- qwen-0.5b.vxw
+python3 scripts/reference.py qwen-0.5b.vxw --tensors
 ```
 
 ## The check of the Vx program
@@ -179,8 +192,8 @@ For the tiny MoE model, `make_tiny_model.py --moe --hugging-face DIR` also write
 Hugging Face folder, which MLX reads:
 
 ```sh
-python3 apps/qwen/scripts/make_tiny_model.py --moe --hugging-face tiny-moe tiny-moe.vxw
-python3 apps/qwen/scripts/check_against_mlx.py --tokens 17,200,3,95,41 tiny-moe tiny-moe.vxw
+python3 scripts/make_tiny_model.py --moe --hugging-face tiny-moe tiny-moe.vxw
+python3 scripts/check_against_mlx.py --tokens 17,200,3,95,41 tiny-moe tiny-moe.vxw
 ```
 
 Over 32 greedy steps, both chose the same tokens, and the largest logit difference was 8.7e-06.

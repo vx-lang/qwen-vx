@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Convert a Qwen2 or Qwen3 MoE model folder from Hugging Face into the weight file of the Qwen app.
 
-    python3 apps/qwen/scripts/convert.py ~/models/Qwen2.5-Coder-0.5B-Instruct qwen-0.5b.vxw
-    python3 apps/qwen/scripts/convert.py --fp8 ~/models/Qwen2.5-Coder-0.5B-Instruct qwen-0.5b-fp8.vxw
-    python3 apps/qwen/scripts/convert.py --q4 ~/models/Qwen3-Coder-30B-A3B-Instruct qwen3-30b-q4.vxw
+    python3 scripts/convert.py ~/models/Qwen2.5-Coder-0.5B-Instruct qwen-0.5b.vxw
+    python3 scripts/convert.py --fp8 ~/models/Qwen2.5-Coder-0.5B-Instruct qwen-0.5b-fp8.vxw
+    python3 scripts/convert.py --q4 ~/models/Qwen3-Coder-30B-A3B-Instruct qwen3-30b-q4.vxw
 
 The file keeps the bf16 values exactly. Q, K and V of a layer become one matrix with one bias
 vector, Q rows first, and gate and up become one matrix, gate rows first, so that one kernel
