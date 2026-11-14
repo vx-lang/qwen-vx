@@ -1,9 +1,9 @@
 # Qwen coder models in Vx
 
 This program runs Qwen coder models on the GPU of an Apple Silicon Mac. It is written in
-[Vx](https://github.com/vx-lang/Vx), and it uses the GPU kernels of Vx's `std::nn`. The plan and its milestones are in [#3094](https://github.com/vx-lang/Vx/issues/3094). The
+[Vx](https://github.com/vx-lang/Vx), and it uses the GPU kernels of Vx's `std::nn`. The plan and its milestones are in [#5](https://github.com/vx-lang/qwen-vx/issues/5). The
 mixture-of-experts (MoE) model Qwen3-Coder-30B-A3B is the next milestone,
-[#3151](https://github.com/vx-lang/Vx/issues/3151). The Vx program runs it in Q4_0, as the section
+[#6](https://github.com/vx-lang/qwen-vx/issues/6). The Vx program runs it in Q4_0, as the section
 on the MoE model below shows.
 
 The program generates tokens with greedy decoding, from a prompt given as token ids. A tokenizer
@@ -97,7 +97,7 @@ above 4 bits.
 
 The Vx program reads a Q4_0 file like the others, and runs the Q4_0 kernels of `std::nn` for it.
 Of four 4-bit formats, Q4_0 was the closest to bf16 on the 7B model. The measurement is in
-[#3151](https://github.com/vx-lang/Vx/issues/3151#issuecomment-6763017034).
+[#6](https://github.com/vx-lang/qwen-vx/issues/6#issuecomment-6879596230).
 
 ## The MoE model
 
@@ -125,7 +125,7 @@ Both programs measured the perplexity on `src/dialect/MetalImage.cpp` of Vx at v
 A token took 28.0 ms in Vx with the cheaper kernel launches of
 [#3152](https://github.com/vx-lang/Vx/pull/3152) and [#3165](https://github.com/vx-lang/Vx/pull/3165),
 and 24.3 ms in llama.cpp. Each token runs about 477 kernels. The details are in
-[#3151](https://github.com/vx-lang/Vx/issues/3151#issuecomment-6768053118).
+[#6](https://github.com/vx-lang/qwen-vx/issues/6#issuecomment-6879596324).
 
 ## The Vx code
 
