@@ -11,7 +11,7 @@ in Vx comes later, so `reference.py` turns text into token ids for now.
 
 ## Install Vx
 
-The program needs Vx v0.0.4 or later:
+The program needs Vx v0.0.5 or later:
 
 ```sh
 curl -fsSL https://vxlang.org/install.sh | sh
