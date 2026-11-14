@@ -1,6 +1,6 @@
 """Tests of qwen_weights.py: the f8e4m3 and Q4_0 codes, their scales, and the quantized weight files.
 
-    python3 -m unittest discover -s apps/qwen/scripts -p 'test_*.py'
+    python3 -m unittest discover -s scripts -p 'test_*.py'
 
 The test that compares the codes with the ml_dtypes package runs only when that package is
 installed.

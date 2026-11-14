@@ -5,8 +5,8 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
-// Loads the weight file that `apps/qwen/scripts/convert.py` writes, and puts each tensor in GPU
-// memory once. `apps/qwen/scripts/qwen_weights.py` describes the format. A matrix of rows x cols
+// Loads the weight file that `scripts/convert.py` writes, and puts each tensor in GPU
+// memory once. `scripts/qwen_weights.py` describes the format. A matrix of rows x cols
 // is a rank-1 tensor with row r at r * cols, as the kernels of `std::nn` read it.
 import std::libc;
 import std::mmap;

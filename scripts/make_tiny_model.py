@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Write a tiny Qwen model with random weights, for tests that cannot download a real model.
 
-    python3 apps/qwen/scripts/make_tiny_model.py tiny.vxw
-    python3 apps/qwen/scripts/make_tiny_model.py --fp8 tiny-fp8.vxw
-    python3 apps/qwen/scripts/make_tiny_model.py --moe --q4 tiny-moe-q4.vxw
-    python3 apps/qwen/scripts/make_tiny_model.py --moe --hugging-face DIR tiny-moe.vxw
+    python3 scripts/make_tiny_model.py tiny.vxw
+    python3 scripts/make_tiny_model.py --fp8 tiny-fp8.vxw
+    python3 scripts/make_tiny_model.py --moe --q4 tiny-moe-q4.vxw
+    python3 scripts/make_tiny_model.py --moe --hugging-face DIR tiny-moe.vxw
 
 The model has the layers of Qwen2.5-Coder at a small size: hidden size 128, 2 layers, 2 query
 heads that share 1 key-value head of 64 values, and a vocabulary of 256 tokens. Its weights come

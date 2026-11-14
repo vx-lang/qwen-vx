@@ -7,11 +7,11 @@
 // mixture-of-experts model.
 //
 // RUN: python3 %S/../scripts/make_tiny_model.py %t.vxw > /dev/null
-// RUN: vxc %s --package qwen=%S/../src --host default --machine fleet/m4-uma.vx -- %t.vxw | FileCheck %s
+// RUN: vxc %s --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t.vxw | FileCheck %s
 // RUN: python3 %S/../scripts/make_tiny_model.py --fp8 %t-fp8.vxw > /dev/null
-// RUN: vxc %s --package qwen=%S/../src --host default --machine fleet/m4-uma.vx -- %t-fp8.vxw | FileCheck %s --check-prefix=FP8
+// RUN: vxc %s --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t-fp8.vxw | FileCheck %s --check-prefix=FP8
 // RUN: python3 %S/../scripts/make_tiny_model.py --moe --q4 %t-moe-q4.vxw > /dev/null
-// RUN: vxc %s --package qwen=%S/../src --host default --machine fleet/m4-uma.vx -- %t-moe-q4.vxw | FileCheck %s --check-prefix=MOE-Q4
+// RUN: vxc %s --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t-moe-q4.vxw | FileCheck %s --check-prefix=MOE-Q4
 //
 // CHECK: {{^}}config hidden=128 layers=2 vocab=256;{{$}}
 // CHECK-NEXT: {{^}}embed count=32768 codes=47665,15857,48564,48396 sum=1052457310;{{$}}

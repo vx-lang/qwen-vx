@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Check reference.py against MLX, an independent implementation of the same model.
 
-    python3 apps/qwen/scripts/check_against_mlx.py ~/models/Qwen2.5-Coder-0.5B-Instruct qwen-0.5b.vxw
-    python3 apps/qwen/scripts/check_against_mlx.py --tokens 1,2,3 TINY_MOE_DIR tiny-moe.vxw
+    python3 scripts/check_against_mlx.py ~/models/Qwen2.5-Coder-0.5B-Instruct qwen-0.5b.vxw
+    python3 scripts/check_against_mlx.py --tokens 1,2,3 TINY_MOE_DIR tiny-moe.vxw
 
 MLX reads the Hugging Face folder and runs in float32. reference.py reads the converted weight
 file. So agreement also checks the converter. The script prints the largest difference of the

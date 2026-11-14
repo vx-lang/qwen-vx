@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Compute the logits and the greedy tokens of a Qwen2 or Qwen3 MoE model with NumPy, in float32.
 
-    python3 apps/qwen/scripts/reference.py qwen-0.5b.vxw --tokens 750,75698,1445,1648 --steps 8
-    python3 apps/qwen/scripts/reference.py qwen-0.5b.vxw --tokenizer DIR --prompt "def f(n):"
-    python3 apps/qwen/scripts/reference.py qwen-0.5b.vxw --tensors
-    python3 apps/qwen/scripts/reference.py qwen-0.5b.vxw --tokenizer DIR --perplexity FILE
+    python3 scripts/reference.py qwen-0.5b.vxw --tokens 750,75698,1445,1648 --steps 8
+    python3 scripts/reference.py qwen-0.5b.vxw --tokenizer DIR --prompt "def f(n):"
+    python3 scripts/reference.py qwen-0.5b.vxw --tensors
+    python3 scripts/reference.py qwen-0.5b.vxw --tokenizer DIR --perplexity FILE
 
 It reads the weight file that `convert.py` writes, so the Vx program and this script use the same
 bytes. Tests of the Vx program compare with the lines it prints:

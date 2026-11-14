@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare the output of the Vx program with the output of reference.py.
 
-    python3 apps/qwen/scripts/compare.py REFERENCE_OUTPUT VX_OUTPUT [--tolerance 0.01]
+    python3 scripts/compare.py REFERENCE_OUTPUT VX_OUTPUT [--tolerance 0.01]
 
 Both outputs have a `prompt=...;` line and one `step=K token=T logit=L ...;` line per step. The
 prompts and the tokens must be equal. The logits must be within the tolerance: the GPU adds in
