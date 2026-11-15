@@ -250,7 +250,7 @@ and 24.3 ms in llama.cpp. Each token runs about 477 kernels. The details are in
 ## The prompt in chunks
 
 A generated token reads every weight that it uses, so it waits for memory. The prompt has all its
-tokens at the start, so the program runs it in chunks of up to 256 tokens. A chunk reads each
+tokens at the start, so the program runs it in chunks of up to 512 tokens. A chunk reads each
 weight once for all its tokens. `src/prefill.vx` has the kernels of a chunk:
 
 - One product for each weight format. A block decodes 128 rows of the matrix and 32 columns at a
@@ -258,22 +258,33 @@ weight once for all its tokens. `src/prefill.vx` has the kernels of a chunk:
   tiles (`@`).
 - For the experts of a MoE layer, the CPU sorts the tokens of the chunk by expert. Then a tile of
   16 tokens reads the weights of one expert.
-- Attention as `nn_attention`, with one block for each token and key-value head. The block reads
-  the cache once for all the query heads of that key-value head.
+- Attention in three passes: the scores, as a matmul of the queries and the keys; their softmax;
+  and the sum of the values, as a matmul of the weights and the values. The rows of the matmuls
+  are the query heads of one key-value head for two tokens, so a tile of the cache serves 16
+  rows. The matmuls skip the positions after the tokens of their tile. Attention takes 128
+  tokens of the chunk at a time, so that its scratch tensor of scores does not grow with the
+  chunk.
 
 The time of each prompt token, on an M4 with 32 GB, with the prompt as the first tokens of this
 README:
 
 | Model | Prompt | One token at a time | In chunks |
 | --- | --- | --- | --- |
-| Qwen2.5-Coder-0.5B-Instruct, bf16 | 600 tokens | 11.1 ms | 1.26 ms |
-| Qwen3-Coder-30B-A3B-Instruct, Q4_0 | 1000 tokens | 46.7 ms | 16.7 ms |
+| Qwen2.5-Coder-0.5B-Instruct, bf16 | 600 tokens | 11.1 ms | 1.15 ms |
+| Qwen3-Coder-30B-A3B-Instruct, Q4_0 | 1000 tokens | 46.7 ms | 10.8 ms |
+| Qwen3-Coder-30B-A3B-Instruct, Q4_0 | 2000 tokens | | 8.1 ms |
 
 Both ways chose the same tokens after the prompt. On the 0.5B model, `compare.py` compared 32 steps
-with `reference.py`, and the largest logit difference was 5.3e-05. On the 30B model, the products
-of the experts take about two thirds of the time of a chunk. A newer Vx, whose `@` uses the
-simdgroup matrices of Metal, ran the same prompt at 16.2 ms a token. So the decoding of the
-weights, and not the multiplication, limits these products.
+with `reference.py`, and the largest logit difference was 5.5e-05. The times include the first
+compile of the kernels of a chunk, about 4 seconds. Without it, the prompt of 2000 tokens takes
+7.0 ms a token.
+
+Before the attention in tiles, each block did one token, and so each chunk read the whole cache
+once for each token in each layer. Then the prompts of 1000 and 2000 tokens took 15.1 ms and
+16.2 ms a token. Now the products of the experts take most of the time of a chunk. Their `@`
+loads its sum from shared memory and stores it back for each 32 columns, and the 32 KB of shared
+memory does not hold larger tiles
+([#19](https://github.com/vx-lang/qwen-vx/issues/19)).
 
 `tests/prefill.vx` runs a prompt of 40 tokens through each tiny model one token at a time, and in
 chunks of 16 tokens. The logits of the last token must be within 0.0001, and the next 8 tokens
