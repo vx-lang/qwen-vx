@@ -6,8 +6,8 @@ mixture-of-experts (MoE) model Qwen3-Coder-30B-A3B is the next milestone,
 [#6](https://github.com/vx-lang/qwen-vx/issues/6). The Vx program runs it in Q4_0, as the section
 on the MoE model below shows.
 
-The program generates tokens with greedy decoding, from a prompt given as token ids. A tokenizer
-in Vx comes later, so `reference.py` turns text into token ids for now.
+The program generates tokens with greedy decoding. Its tokenizer is also in Vx, so the prompt can
+be text or token ids, and the program prints text or token ids.
 
 ## Install Vx
 
@@ -58,10 +58,32 @@ pip install numpy tokenizers huggingface_hub
    hf download Qwen/Qwen2.5-Coder-0.5B-Instruct --local-dir ~/models/Qwen2.5-Coder-0.5B-Instruct
    ```
 
-1. Convert it into the weight file that the Vx program reads:
+1. Convert it into the weight file and the tokenizer file that the Vx program reads:
 
    ```sh
    python3 scripts/convert.py ~/models/Qwen2.5-Coder-0.5B-Instruct qwen-0.5b.vxw
+   python3 scripts/convert_tokenizer.py ~/models/Qwen2.5-Coder-0.5B-Instruct qwen.vxt
+   ```
+
+1. Generate text with the Vx program, on the GPU:
+
+   ```sh
+   vxc src/main.vx --package qwen=src --host default \
+       --machine ~/.vx/current/fleet/m4-uma.vx -- qwen-0.5b.vxw \
+       --tokenizer qwen.vxt --prompt "def fibonacci(n):" --steps 64
+   ```
+
+   `vxc` first warns that it cannot check the memory of some functions with a dynamic shape
+   (W1029). These warnings are expected. The program then prints the prompt, the text that the
+   model writes, and the time of a token, about 11 ms on an M4.
+
+   With `--chat`, the prompt is a request to the Instruct model. The program prints only the
+   reply, and it stops at the end of the reply. `--prompt-file FILE` reads the prompt from a file:
+
+   ```sh
+   vxc src/main.vx --package qwen=src --host default \
+       --machine ~/.vx/current/fleet/m4-uma.vx -- qwen-0.5b.vxw \
+       --tokenizer qwen.vxt --chat --prompt "Write a C++ function that reverses a string." --steps 300
    ```
 
 1. Generate a few tokens with the NumPy reference. It prints the prompt as token ids:
@@ -71,17 +93,19 @@ pip install numpy tokenizers huggingface_hub
        --tokenizer ~/models/Qwen2.5-Coder-0.5B-Instruct --prompt "def fibonacci(n):" --steps 8
    ```
 
-1. Generate the same tokens with the Vx program, on the GPU:
+1. Generate the same tokens with the Vx program. With `--tokens`, the prompt is token ids, and the
+   program prints the lines of `reference.py`. `--lines` prints the same lines for a text prompt:
 
    ```sh
    vxc src/main.vx --package qwen=src --host default \
        --machine ~/.vx/current/fleet/m4-uma.vx -- qwen-0.5b.vxw --tokens 750,75698,1445,1648 --steps 8
+   vxc src/main.vx --package qwen=src --host default \
+       --machine ~/.vx/current/fleet/m4-uma.vx -- qwen-0.5b.vxw \
+       --tokenizer qwen.vxt --prompt "def fibonacci(n):" --lines --steps 8
    ```
 
-   `vxc` first warns that it cannot check the memory of some functions with a dynamic shape
-   (W1029). These warnings are expected. The program then prints the same tokens as
-   `reference.py`, and the time of a token, about 11 ms on an M4. `compare.py` checks the two
-   outputs, when each is saved in a file:
+   `compare.py` checks the output of `reference.py` and of the Vx program, when each is saved in a
+   file:
 
    ```sh
    python3 scripts/compare.py reference.txt vx.txt
@@ -104,6 +128,9 @@ of Qwen3-Coder-30B-A3B.
 | `scripts/test_qwen_weights.py` | Tests the f8e4m3 and Q4_0 codes, their scales and the quantized weight files. |
 | `scripts/importance.py` | Measures the importance matrix of a bf16 model, for `convert.py --importance`. |
 | `scripts/test_importance.py` | Tests `importance.py`. |
+| `scripts/convert_tokenizer.py` | Converts a tokenizer.json into a tokenizer file. Its first comment describes the format. |
+| `scripts/make_tiny_tokenizer.py` | Writes a tiny tokenizer.json, and texts that test each step of the tokenizer. |
+| `scripts/test_tokenizer.py` | Compares the tokenizer in Vx with the `tokenizers` package. |
 
 [`examples/`](examples/README.md) asks the 30B model for programs in Rust, C++ and Python. It
 compiles each one and checks its output.
@@ -158,7 +185,9 @@ vxc src/main.vx --package qwen=src --host default \
 ```
 
 The conversion took 3.4 minutes and 18.6 GB of memory on an M4 with 32 GB. The tokens are
-`def fibonacci(n):` and a new line with 4 spaces. The Vx program wrote a recursive
+`def fibonacci(n):` and a new line with 4 spaces. The tokenizer of the 30B model gives the same
+tokens for that text, so `--tokenizer qwen3.vxt --prompt "$(printf 'def fibonacci(n):\n    ')"` is
+the same prompt, after `convert_tokenizer.py ~/models/Qwen3-Coder-30B-A3B-Instruct qwen3.vxt`. The Vx program wrote a recursive
 and an iterative `fibonacci` in the 64 steps. `reference.py` on the same file chose the same 64
 tokens, with each logit within 5.4e-05.
 
@@ -217,9 +246,10 @@ and 24.3 ms in llama.cpp. Each token runs about 477 kernels. The details are in
 | --- | --- |
 | `src/weights.vx` | Loads a weight file into GPU memory, for the kernels of `std::nn`. |
 | `src/model.vx` | Makes the tensors and the KV cache once, and runs one token through all layers. |
-| `src/main.vx` | Generates tokens with greedy decoding, and prints the lines of `reference.py`. |
+| `src/tokenizer.vx` | Turns text into token ids and token ids into text, with a tokenizer file. |
+| `src/main.vx` | Generates tokens with greedy decoding, and prints text or the lines of `reference.py`. |
 
-A program imports the modules as `qwen::weights` and `qwen::model`, with
+A program imports the modules as `qwen::weights`, `qwen::model` and `qwen::tokenizer`, with
 `vxc --package qwen=src`. A program in another folder names the `src` folder of this repository.
 
 The tests are in `tests/`. They need a Python 3 that has NumPy and ml_dtypes, and `FileCheck` from
@@ -238,6 +268,33 @@ tests/run.sh
 vxc tests/print_weights.vx --package qwen=src --host default \
     --machine ~/.vx/current/fleet/m4-uma.vx -- qwen-0.5b.vxw
 python3 scripts/reference.py qwen-0.5b.vxw --tensors
+```
+
+## The tokenizer
+
+`src/tokenizer.vx` is the byte-level BPE tokenizer of Qwen2 and Qwen3. It splits out the added
+tokens, such as `<|im_start|>`, and applies Unicode NFC to the text between them. Then it splits
+the text with the regex of the pre-tokenizer, and merges the bytes of each piece by the ranks of
+tokenizer.json. `convert_tokenizer.py` describes the file and the steps. The file holds sorted
+tables, so each lookup is a binary search in the mapped file.
+
+The tokenizer gives the ids of the `tokenizers` package of Hugging Face. On 21.5 MB of text,
+`test_tokenizer.py` found the same ids for each of 4783 texts, with both the Qwen2.5-Coder and the
+Qwen3-Coder tokenizer. The texts were this repository, Python, Rust and C++ sources, and 3000 texts
+of random Unicode characters, marks, Hangul, emoji, white space and added tokens. The Vx program
+encoded 3 MB of source files, 820,000 tokens, in about 2.4 seconds.
+
+The NFC step of `tokenizers` has the data of an old Unicode version. It does not know the
+combining class of 120 marks that later versions added, and it does not make 21 newer composites.
+`convert_tokenizer.py` leaves both out of its tables, so that the ids are the same.
+`test_tokenizer.py` measures the two lists again, and fails when they change.
+
+`tests/tokenize.vx` checks a tiny tokenizer from `make_tiny_tokenizer.py` against the ids that
+`tokenizers` gave for it. So CI checks the tokenizer without a download. To compare with
+`tokenizers` on a large corpus:
+
+```sh
+QWEN_TOKENIZER_CORPUS_MB=40 python3 scripts/test_tokenizer.py
 ```
 
 ## The check of the Vx program

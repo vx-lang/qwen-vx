@@ -9,14 +9,89 @@
 //
 //   vxc src/main.vx --package qwen=src --host default \
 //       --machine ~/.vx/current/fleet/m4-uma.vx -- WEIGHTS --tokens 750,75698,1445 --steps 16
+//   vxc src/main.vx ... -- WEIGHTS --tokenizer TOKENIZER --prompt "def fibonacci(n):" --steps 64
+//   vxc src/main.vx ... -- WEIGHTS --tokenizer TOKENIZER --chat --prompt-file FILE --steps 512
 //
-// It prints the lines that `scripts/reference.py` prints, without the margin, and
+// With --tokens, it prints the lines that `scripts/reference.py` prints, without the margin, and
 // then the time of a token. `scripts/compare.py` compares the two outputs.
+//
+// With --tokenizer, a file of `scripts/convert_tokenizer.py`, the prompt is text: --prompt TEXT or
+// --prompt-file FILE. The program prints the prompt and the text that it generates. It stops at a
+// special token, such as <|im_end|>, or after --steps tokens. --chat puts the prompt in the chat
+// format of the Instruct models and prints only the reply. --lines prints the lines of --tokens
+// in place of the text.
 import core::convert;
 import std::time;
 import std::vec;
 import qwen::weights;
 import qwen::model;
+import qwen::tokenizer;
+
+/// The options of the command line.
+struct Options {
+  weights : *const i8,
+  tokens : *const i8,
+  tokenizer : *const i8,
+  prompt : *const i8,
+  prompt_file : *const i8,
+  steps : *const i8,
+  has_tokens : bool,
+  has_tokenizer : bool,
+  has_prompt : bool,
+  has_prompt_file : bool,
+  has_steps : bool,
+  chat : bool,
+  lines : bool,
+}
+
+/// The options of `argv`. Asserts that they are complete and that they fit together.
+fn parse_options(argc : i32, argv : *mut *mut i8) -> Options {
+  assert(argc >= 4, "give: WEIGHTS --tokens 1,2,3 --steps N, or WEIGHTS --tokenizer FILE (--prompt TEXT | --prompt-file FILE) [--chat] [--lines] --steps N");
+  let empty : *const i8 = "";
+  let mut o = Options {
+    weights: unsafe { argv[1] }, tokens: empty, tokenizer: empty, prompt: empty, prompt_file: empty,
+    steps: empty, has_tokens: false, has_tokenizer: false, has_prompt: false, has_prompt_file: false,
+    has_steps: false, chat: false, lines: false,
+  };
+  let mut i = 2;
+  while i < argc {
+    let name = unsafe { argv[i] };
+    if same(name, "--chat") {
+      o.chat = true;
+      i = i + 1;
+    } else if same(name, "--lines") {
+      o.lines = true;
+      i = i + 1;
+    } else {
+      assert(i + 1 < argc, "give: WEIGHTS --tokens 1,2,3 --steps N, or WEIGHTS --tokenizer FILE (--prompt TEXT | --prompt-file FILE) [--chat] [--lines] --steps N");
+      let value = unsafe { argv[i + 1] };
+      if same(name, "--tokens") {
+        o.tokens = value;
+        o.has_tokens = true;
+      } else if same(name, "--tokenizer") {
+        o.tokenizer = value;
+        o.has_tokenizer = true;
+      } else if same(name, "--prompt") {
+        o.prompt = value;
+        o.has_prompt = true;
+      } else if same(name, "--prompt-file") {
+        o.prompt_file = value;
+        o.has_prompt_file = true;
+      } else {
+        assert(same(name, "--steps"), "give: WEIGHTS --tokens 1,2,3 --steps N, or WEIGHTS --tokenizer FILE (--prompt TEXT | --prompt-file FILE) [--chat] [--lines] --steps N");
+        o.steps = value;
+        o.has_steps = true;
+      }
+      i = i + 2;
+    }
+  }
+  assert(o.has_steps, "give: WEIGHTS --tokens 1,2,3 --steps N, or WEIGHTS --tokenizer FILE (--prompt TEXT | --prompt-file FILE) [--chat] [--lines] --steps N");
+  let one_text = o.has_prompt != o.has_prompt_file;
+  let no_text = !o.has_prompt && !o.has_prompt_file;
+  assert((o.has_tokens && no_text) || (o.has_tokenizer && !o.has_tokens && one_text), "give: WEIGHTS --tokens 1,2,3 --steps N, or WEIGHTS --tokenizer FILE (--prompt TEXT | --prompt-file FILE) [--chat] [--lines] --steps N");
+  assert(o.has_tokenizer || (!o.chat && !o.lines), "--chat and --lines need --tokenizer");
+  return o;
+}
 
 /// One token of the prompt, in GPU memory. The struct is there because the flat code generator
 /// declines a reference to an element of a `Vec` of tensors, and accepts one to a field.
@@ -69,16 +144,42 @@ fn same(a : *const i8, b : *const i8) -> bool {
   return unsafe { strcmp(a, b) } == 0;
 }
 
+/// The token ids of the prompt: the numbers of --tokens, or the tokens of the text.
+fn prompt_ids(o : &Options, t : &Tokenizer) -> Vec<i32> {
+  if o.has_tokens {
+    return parse_numbers(o.tokens);
+  }
+  let text = if o.has_prompt {
+    c_text(o.prompt)
+  } else {
+    read_text_file(o.prompt_file)
+  };
+  let full = if o.chat {
+    chat_text(&text)
+  } else {
+    text
+  };
+  let ids = encode(t, full.bytes, full.length);
+  assert(ids.len() > 0, "the prompt has no tokens");
+  return ids;
+}
+
 fn main(argc : i32, argv : *mut *mut i8) -> i32 {
-  assert(argc == 6, "give: WEIGHTS --tokens 1,2,3 --steps N");
-  assert(same(unsafe { argv[2] }, "--tokens") && same(unsafe { argv[4] }, "--steps"), "give: WEIGHTS --tokens 1,2,3 --steps N");
-  let prompt = parse_numbers(unsafe { argv[3] });
-  let steps_list = parse_numbers(unsafe { argv[5] });
+  let o = parse_options(argc, argv);
+  let t = if o.has_tokenizer {
+    load_tokenizer(o.tokenizer)
+  } else {
+    no_tokenizer()
+  };
+  // Text mode prints text. Otherwise the program prints the lines of `reference.py`.
+  let text_mode = o.has_tokenizer && !o.lines;
+  let prompt = prompt_ids(&o, &t);
+  let steps_list = parse_numbers(o.steps);
   let steps = steps_list[0];
   let count = prompt.len();
   assert(steps > 0, "--steps must be at least 1");
 
-  let w = load_weights(unsafe { argv[1] });
+  let w = load_weights(o.weights);
   let mut s = new_state(&w.config, count + steps);
   // One tensor for each token of the prompt, made before the first token runs.
   let mut prompt_tokens = Vec<PromptToken>::new();
@@ -92,14 +193,22 @@ fn main(argc : i32, argv : *mut *mut i8) -> i32 {
   }
   let mut next = transfer(Tensor<i32>([1]), Memory::HBM);
 
-  print!("prompt=");
-  for i in 0..count {
-    if i > 0 {
-      print!(",");
+  if text_mode {
+    if !o.chat {
+      for i in 0..count {
+        write_token(&t, prompt[i]);
+      }
     }
-    print!("{}", prompt[i]);
+  } else {
+    print!("prompt=");
+    for i in 0..count {
+      if i > 0 {
+        print!(",");
+      }
+      print!("{}", prompt[i]);
+    }
+    println!(";");
   }
-  println!(";");
 
   for i in 0..count {
     run_layers(&w, &mut s, &prompt_tokens[i].t, i);
@@ -109,16 +218,29 @@ fn main(argc : i32, argv : *mut *mut i8) -> i32 {
   // covers only the steps - 1 tokens that the loop decodes.
   let mut token = read_token(&next);
   let start = Instant::now();
+  // The number of tokens that the loop ran through the model.
+  let mut decoded = 0;
   for step in 0..steps {
-    println!("step={} token={} logit={};", step, token, read_logit(&s.logits, token));
+    if text_mode {
+      if is_special(&t, token) || token == w.config.eos_token_id {
+        break;
+      }
+      write_token(&t, token);
+    } else {
+      println!("step={} token={} logit={};", step, token, read_logit(&s.logits, token));
+    }
     if step + 1 < steps {
       run_layers(&w, &mut s, &next, count + step);
       predict(&w, &mut s, &mut next);
       token = read_token(&next);
+      decoded = decoded + 1;
     }
   }
-  if steps > 1 {
-    let ms = f64::from(start.elapsed().as_secs_f32()) * 1000.0 / f64::from(steps - 1);
+  if text_mode {
+    println!("");
+  }
+  if decoded > 0 {
+    let ms = f64::from(start.elapsed().as_secs_f32()) * 1000.0 / f64::from(decoded);
     println!("time ms_per_token={};", ms);
   }
   return 0;
