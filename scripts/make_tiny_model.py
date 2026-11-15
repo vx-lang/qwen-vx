@@ -216,6 +216,7 @@ def main():
     weight_format.add_argument("--q4", action="store_true", help="store the weight matrices as Q4_0 codes")
     parser.add_argument("--moe", action="store_true", help="write the tiny mixture-of-experts model")
     parser.add_argument("--hugging-face", metavar="DIR", help="also write the MoE model as a Hugging Face folder")
+    parser.add_argument("--max-positions", type=int, help="the positions of the model, 64 if not given; the weights do not change")
     args = parser.parse_args()
     if args.moe:
         hf = tiny_moe_model()
@@ -225,6 +226,8 @@ def main():
     else:
         assert not args.hugging_face, "--hugging-face needs --moe"
         config, tensors = CONFIG, tiny_model()
+    if args.max_positions:
+        config = dict(config, max_positions=args.max_positions)
     if args.fp8 or args.q4:
         config, tensors = qwen_weights.quantize(config, tensors, "fp8" if args.fp8 else "q4_0")
     qwen_weights.write_weight_file(args.output, config, tensors)
