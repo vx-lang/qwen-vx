@@ -9,7 +9,8 @@ keeps its standard output until it ends, so the requests and the replies go thro
 pipes. Each turn sends the whole conversation in the chat format of
 the Instruct models, and the session runs only the tokens after the longest prefix that its KV
 cache holds. With --cache, the session loads the KV cache of the system prompt from FILE, or makes
-FILE first when it is missing. So a long system prompt runs once, ahead of time.
+FILE first when it is missing or does not fit, as a file of an older version does not. So a long
+system prompt runs once, ahead of time.
 
 --check runs a short conversation and prints whether each turn gives the text of a fresh run of
 the Vx program, whether the later turns reuse the cache, and whether a saved cache gives the same
@@ -172,9 +173,15 @@ def interactive(args):
         system = Path(args.system_file).read_text()
     session = Session(args.weights, args.tokenizer, args.context)
     if args.cache and system:
+        loaded = False
         if os.path.exists(args.cache):
-            print(f"[{session.load(os.path.abspath(args.cache))} from {args.cache}]")
-        else:
+            try:
+                print(f"[{session.load(os.path.abspath(args.cache))} from {args.cache}]")
+                loaded = True
+            except RuntimeError as e:
+                # A file of an older version, or of another model or context: make it again.
+                print(f"[{args.cache} does not fit: {e}. The system prompt runs again.]")
+        if not loaded:
             _, stats = session.generate(chat_text(system, []), 0)
             print(f"[the system prompt ran: {stats['prompt']} tokens in {stats['prompt_ms']:.0f} ms. {session.save(os.path.abspath(args.cache))}]")
     turns = []

@@ -341,8 +341,9 @@ Qwen3-Coder-30B-A3B in Q4_0:
 | The second, in the same session | 2539 tokens | 29 | 2.3 s |
 | The first, in a new session that loaded the cache of the system prompt | 2465 tokens | 20 | 2.5 s |
 
-The cache of the 2445 tokens of the system prompt took 481 MB. It took 0.4 s to save and 1.9 s
-to load, and the reply after the load was the same text as the reply with no cache. A session
+The KV cache holds f16 values, 98 KB for each token of Qwen3-Coder-30B-A3B, so the cache file of
+the 2445 tokens of the system prompt takes 240 MB. With f32 values it took 481 MB, 0.4 s to save
+and 1.9 s to load, and the reply after the load was the same text as the reply with no cache. A session
 takes about a minute to start, to compile the program and to load the weights.
 
 [`docs/vx-guides`](docs/vx-guides) has system prompts that teach Qwen3-Coder to write Vx, which

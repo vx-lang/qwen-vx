@@ -19,7 +19,7 @@ import std::nn;
 /// The blocks of the first kernel split the positions, 32 to a block below position 640 and 64 from
 /// there on. A block serves the 8 heads of Q that share a head of K and V, so it reads each row of
 /// the cache once for all 8. A second kernel merges the parts of the blocks for each head.
-fn split_attention<M : Memory>(out : &mut Tensor<f32, [?, ?], Memory::M>, part : &mut Tensor<f32, [?, ?, ?, ?], Memory::M>, q : &Tensor<f32, [?, ?], Memory::M>, k_cache : &Tensor<f32, [?, ?, ?], Memory::M>, v_cache : &Tensor<f32, [?, ?, ?], Memory::M>, pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+fn split_attention<M : Memory>(out : &mut Tensor<f32, [?, ?], Memory::M>, part : &mut Tensor<f32, [?, ?, ?, ?], Memory::M>, q : &Tensor<f32, [?, ?], Memory::M>, k_cache : &Tensor<f16, [?, ?, ?], Memory::M>, v_cache : &Tensor<f16, [?, ?, ?], Memory::M>, pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
   nn_check_heads(q.extent(0), q.extent(1), q_heads, head_dim);
   nn_check_heads(out.extent(0), out.extent(1), q_heads, head_dim);
   nn_check_cache(k_cache.extent(0), k_cache.extent(1), k_cache.extent(2), pos, kv_heads, head_dim);
@@ -53,7 +53,7 @@ fn split_attention_scratch(max_seq : i32, q_heads : i32, kv_heads : i32, head_di
 }
 
 /// The parts of `split_attention` for blocks of 32 positions: 4 SIMD groups of 2 heads of Q.
-fn split_attention_parts_32<M : Memory>(part : &mut Tensor<f32, [?, ?, ?, ?], Memory::M>, q : &Tensor<f32, [?, ?], Memory::M>, k_cache : &Tensor<f32, [?, ?, ?], Memory::M>, v_cache : &Tensor<f32, [?, ?, ?], Memory::M>, pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+fn split_attention_parts_32<M : Memory>(part : &mut Tensor<f32, [?, ?, ?, ?], Memory::M>, q : &Tensor<f32, [?, ?], Memory::M>, k_cache : &Tensor<f16, [?, ?, ?], Memory::M>, v_cache : &Tensor<f16, [?, ?, ?], Memory::M>, pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
   let group = q_heads / kv_heads;
   let tiles = (group + 7) / 8;
   let scale = 1.0 / (head_dim as f32).sqrt();
@@ -95,7 +95,7 @@ fn split_attention_parts_32<M : Memory>(part : &mut Tensor<f32, [?, ?, ?, ?], Me
             let mut dot0_0 : f32 = 0.0;
             let mut dot0_1 : f32 = 0.0;
             for d in 0..head_dim {
-              let k0 = k_cache[t0][g][d];
+              let k0 = k_cache[t0][g][d] as f32;
               let q0 = q[h0][d];
               dot0_0 = dot0_0 + q0 * k0;
               let q1 = q[h1][d];
@@ -148,10 +148,10 @@ fn split_attention_parts_32<M : Memory>(part : &mut Tensor<f32, [?, ?, ?, ?], Me
             }
             for t in 0..last + 1 {
               let row = c * 32 + t;
-              let v0 = v_cache[row][g][d0];
-              let v1 = v_cache[row][g][d1];
-              let v2 = v_cache[row][g][d2];
-              let v3 = v_cache[row][g][d3];
+              let v0 = v_cache[row][g][d0] as f32;
+              let v1 = v_cache[row][g][d1] as f32;
+              let v2 = v_cache[row][g][d2] as f32;
+              let v3 = v_cache[row][g][d3] as f32;
               let w0 = w[s][0][t];
               acc0_0 = acc0_0 + w0 * v0;
               acc0_1 = acc0_1 + w0 * v1;
@@ -208,7 +208,7 @@ fn split_attention_parts_32<M : Memory>(part : &mut Tensor<f32, [?, ?, ?, ?], Me
 }
 
 /// The parts of `split_attention` for blocks of 64 positions: 2 SIMD groups of 4 heads of Q.
-fn split_attention_parts_64<M : Memory>(part : &mut Tensor<f32, [?, ?, ?, ?], Memory::M>, q : &Tensor<f32, [?, ?], Memory::M>, k_cache : &Tensor<f32, [?, ?, ?], Memory::M>, v_cache : &Tensor<f32, [?, ?, ?], Memory::M>, pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+fn split_attention_parts_64<M : Memory>(part : &mut Tensor<f32, [?, ?, ?, ?], Memory::M>, q : &Tensor<f32, [?, ?], Memory::M>, k_cache : &Tensor<f16, [?, ?, ?], Memory::M>, v_cache : &Tensor<f16, [?, ?, ?], Memory::M>, pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
   let group = q_heads / kv_heads;
   let tiles = (group + 7) / 8;
   let scale = 1.0 / (head_dim as f32).sqrt();
@@ -268,8 +268,8 @@ fn split_attention_parts_64<M : Memory>(part : &mut Tensor<f32, [?, ?, ?, ?], Me
             let mut dot1_2 : f32 = 0.0;
             let mut dot1_3 : f32 = 0.0;
             for d in 0..head_dim {
-              let k0 = k_cache[t0][g][d];
-              let k1 = k_cache[t1][g][d];
+              let k0 = k_cache[t0][g][d] as f32;
+              let k1 = k_cache[t1][g][d] as f32;
               let q0 = q[h0][d];
               dot0_0 = dot0_0 + q0 * k0;
               dot1_0 = dot1_0 + q0 * k1;
@@ -388,10 +388,10 @@ fn split_attention_parts_64<M : Memory>(part : &mut Tensor<f32, [?, ?, ?, ?], Me
             }
             for t in 0..last + 1 {
               let row = c * 64 + t;
-              let v0 = v_cache[row][g][d0];
-              let v1 = v_cache[row][g][d1];
-              let v2 = v_cache[row][g][d2];
-              let v3 = v_cache[row][g][d3];
+              let v0 = v_cache[row][g][d0] as f32;
+              let v1 = v_cache[row][g][d1] as f32;
+              let v2 = v_cache[row][g][d2] as f32;
+              let v3 = v_cache[row][g][d3] as f32;
               let w0 = w[s][0][t];
               acc0_0 = acc0_0 + w0 * v0;
               acc0_1 = acc0_1 + w0 * v1;
@@ -530,6 +530,112 @@ fn split_attention_merge<M : Memory>(out : &mut Tensor<f32, [?, ?], Memory::M>, 
               acc = acc + w * part[gt][c][at][d];
             }
             out[h][d] = acc / total;
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+// The kernels that store the K and V of a generated token: copies of `nn_rope_and_store` and
+// `nn_norm_rope_and_store` of `std::nn`, with a KV cache of f16. They compute in f32 and round
+// what they store.
+
+/// RoPE for the token at position `pos`, and its K and V into the KV cache. Writes each head of
+/// q, turned, to `q_out`, and each head of k, turned, and of v to row `pos` of the cache. Value i
+/// of a head pairs with value i + head_dim / 2, as in the Llama and Qwen models of Hugging Face.
+/// Both turn by the angle whose cosine and sine are cos[pos][i] and sin[pos][i].
+fn rope_and_store<M : Memory>(q_out : &mut Tensor<f32, [?, ?], Memory::M>, k_cache : &mut Tensor<f16, [?, ?, ?], Memory::M>, v_cache : &mut Tensor<f16, [?, ?, ?], Memory::M>, q : &Tensor<f32, [?, ?], Memory::M>, k : &Tensor<f32, [?, ?], Memory::M>, v : &Tensor<f32, [?, ?], Memory::M>, cos : &Tensor<f32, [?, ?], Memory::M>, sin : &Tensor<f32, [?, ?], Memory::M>, pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+  let half = head_dim / 2;
+  nn_check_heads(q.extent(0), q.extent(1), q_heads, head_dim);
+  nn_check_heads(q_out.extent(0), q_out.extent(1), q_heads, head_dim);
+  nn_check_heads(k.extent(0), k.extent(1), kv_heads, head_dim);
+  nn_check_heads(v.extent(0), v.extent(1), kv_heads, head_dim);
+  nn_check_cache(k_cache.extent(0), k_cache.extent(1), k_cache.extent(2), pos, kv_heads, head_dim);
+  nn_check_cache(v_cache.extent(0), v_cache.extent(1), v_cache.extent(2), pos, kv_heads, head_dim);
+  assert(pos < cos.extent(0) && pos < sin.extent(0) && half <= cos.extent(1) && half <= sin.extent(1), "rope_and_store: `cos` and `sin` need a row for `pos` with head_dim / 2 values");
+  spawn on(Topology::Device) {
+    for h in 0..q_heads + kv_heads across blocks {
+      for i in 0..128 across lanes {
+        if i < head_dim {
+          // Value i of the head, its partner, and the angle that they share.
+          let mut j = i;
+          let mut sign : f32 = -1.0;
+          let mut partner = i + half;
+          if i >= half {
+            j = i - half;
+            sign = 1.0;
+            partner = i - half;
+          }
+          let c = cos[pos][j];
+          let s = sin[pos][j];
+          if h < q_heads {
+            q_out[h][i] = q[h][i] * c + sign * q[h][partner] * s;
+          } else {
+            k_cache[pos][h - q_heads][i] = (k[h - q_heads][i] * c + sign * k[h - q_heads][partner] * s) as f16;
+            v_cache[pos][h - q_heads][i] = v[h - q_heads][i] as f16;
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// As `rope_and_store`, after an RMSNorm over each head of q and of k: value i of a head x
+/// becomes x[i] / sqrt(mean(x^2) + eps) * norm[i], where `norm` is `q_norm` for q and `k_norm`
+/// for k. Qwen3 has these norms.
+fn norm_rope_and_store<M : Memory>(q_out : &mut Tensor<f32, [?, ?], Memory::M>, k_cache : &mut Tensor<f16, [?, ?, ?], Memory::M>, v_cache : &mut Tensor<f16, [?, ?, ?], Memory::M>, q : &Tensor<f32, [?, ?], Memory::M>, k : &Tensor<f32, [?, ?], Memory::M>, v : &Tensor<f32, [?, ?], Memory::M>, q_norm : &Tensor<bf16, [?], Memory::M>, k_norm : &Tensor<bf16, [?], Memory::M>, cos : &Tensor<f32, [?, ?], Memory::M>, sin : &Tensor<f32, [?, ?], Memory::M>, pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32, eps : f32) -> void {
+  let half = head_dim / 2;
+  nn_check_heads(q.extent(0), q.extent(1), q_heads, head_dim);
+  nn_check_heads(q_out.extent(0), q_out.extent(1), q_heads, head_dim);
+  nn_check_heads(k.extent(0), k.extent(1), kv_heads, head_dim);
+  nn_check_heads(v.extent(0), v.extent(1), kv_heads, head_dim);
+  nn_check_cache(k_cache.extent(0), k_cache.extent(1), k_cache.extent(2), pos, kv_heads, head_dim);
+  nn_check_cache(v_cache.extent(0), v_cache.extent(1), v_cache.extent(2), pos, kv_heads, head_dim);
+  assert(q_norm.len() >= head_dim && k_norm.len() >= head_dim, "norm_rope_and_store: `q_norm` and `k_norm` need head_dim values");
+  assert(pos < cos.extent(0) && pos < sin.extent(0) && half <= cos.extent(1) && half <= sin.extent(1), "norm_rope_and_store: `cos` and `sin` need a row for `pos` with head_dim / 2 values");
+  spawn on(Topology::Device) {
+    for h in 0..q_heads + kv_heads across blocks {
+      let mut x = unsafe { Tensor<f32, [128], Memory::SMEM>::uninit() };
+      let mut part = unsafe { Tensor<f32, [128], Memory::SMEM>::uninit() };
+      for i in 0..128 across lanes {
+        let mut a : f32 = 0.0;
+        if i < head_dim {
+          if h < q_heads {
+            a = q[h][i];
+          } else {
+            a = k[h - q_heads][i];
+          }
+        }
+        x[i] = a;
+        part[i] = a * a;
+      }
+      let ss = lanes::sum(&part, 128);
+      let inv = 1.0 / (ss / (head_dim as f32) + eps).sqrt();
+      for i in 0..128 across lanes {
+        if i < head_dim {
+          // Value i of the head, its partner, and the angle that they share.
+          let mut j = i;
+          let mut sign : f32 = -1.0;
+          let mut partner = i + half;
+          if i >= half {
+            j = i - half;
+            sign = 1.0;
+            partner = i - half;
+          }
+          let c = cos[pos][j];
+          let s = sin[pos][j];
+          if h < q_heads {
+            let a = x[i] * inv * (q_norm[i] as f32);
+            let b = x[partner] * inv * (q_norm[partner] as f32);
+            q_out[h][i] = a * c + sign * b * s;
+          } else {
+            let a = x[i] * inv * (k_norm[i] as f32);
+            let b = x[partner] * inv * (k_norm[partner] as f32);
+            k_cache[pos][h - q_heads][i] = (a * c + sign * b * s) as f16;
+            v_cache[pos][h - q_heads][i] = v[h - q_heads][i] as f16;
           }
         }
       }
