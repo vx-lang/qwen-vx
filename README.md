@@ -68,6 +68,9 @@ of Qwen3-Coder-30B-A3B.
 | `scripts/importance.py` | Measures the importance matrix of a bf16 model, for `convert.py --importance`. |
 | `scripts/test_importance.py` | Tests `importance.py`. |
 
+[`examples/`](examples/README.md) asks the 30B model for programs in Rust, C++ and Python. It
+compiles each one and checks its output.
+
 ## fp8 weights
 
 `convert.py --fp8` stores each weight matrix as f8e4m3 codes, one byte for each weight, with one f32

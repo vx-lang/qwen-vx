@@ -1,0 +1,1 @@
+Write a Python 3 program that counts the solutions of the N-Queens problem with backtracking, using sets for the columns and both diagonals. Print the counts for n = 1 to 10 on one line, separated by spaces. Reply with only the code, in one ```python block.
