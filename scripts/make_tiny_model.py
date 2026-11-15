@@ -100,11 +100,11 @@ class Xorshift:
         return (low + (high - low) * values).astype(np.float32)
 
 
-def tiny_model():
+def tiny_model(config=CONFIG):
     rng = Xorshift(SEED)
-    shapes = qwen_weights.tensor_shapes(CONFIG)
+    shapes = qwen_weights.tensor_shapes(config)
     tensors = {}
-    for name in qwen_weights.tensor_names(CONFIG):
+    for name in qwen_weights.tensor_names(config):
         shape = shapes[name]
         count = int(np.prod(shape))
         if name.endswith("norm"):
@@ -217,7 +217,9 @@ def main():
     parser.add_argument("--moe", action="store_true", help="write the tiny mixture-of-experts model")
     parser.add_argument("--hugging-face", metavar="DIR", help="also write the MoE model as a Hugging Face folder")
     parser.add_argument("--max-positions", type=int, help="the positions of the model, 64 if not given; the weights do not change")
+    parser.add_argument("--vocab-size", type=int, help="the tokens of the dense model, 256 if not given, for a bigger tokenizer; other weights come out")
     args = parser.parse_args()
+    assert not (args.moe and args.vocab_size), "--vocab-size is for the dense model"
     if args.moe:
         hf = tiny_moe_model()
         if args.hugging_face:
@@ -225,7 +227,8 @@ def main():
         config, tensors = convert.convert_tensors(qwen_weights.config_from_json(MOE_CONFIG), hf)
     else:
         assert not args.hugging_face, "--hugging-face needs --moe"
-        config, tensors = CONFIG, tiny_model()
+        config = CONFIG if not args.vocab_size else dict(CONFIG, vocab_size=args.vocab_size)
+        config, tensors = config, tiny_model(config)
     if args.max_positions:
         config = dict(config, max_positions=args.max_positions)
     if args.fp8 or args.q4:

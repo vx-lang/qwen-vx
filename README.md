@@ -137,6 +137,7 @@ of Qwen3-Coder-30B-A3B.
 | `scripts/convert_tokenizer.py` | Converts a tokenizer.json into a tokenizer file. Its first comment describes the format. |
 | `scripts/make_tiny_tokenizer.py` | Writes a tiny tokenizer.json, and texts that test each step of the tokenizer. |
 | `scripts/test_tokenizer.py` | Compares the tokenizer in Vx with the `tokenizers` package. |
+| `scripts/chat.py` | Chats with a model through a session, with a cache of the system prompt. |
 
 [`examples/`](examples/README.md) asks the 30B model for programs in Rust, C++ and Python. It
 compiles each one and checks its output.
@@ -300,6 +301,42 @@ position 640, where a block takes 64 positions in place of 32. `compare.py` gave
 as `reference.py`, with each logit within 5.3e-05. `tests/generate.vx` also runs the tiny models
 with 1024 positions after a prompt of 700 tokens.
 
+## Sessions and the prompt cache
+
+`scripts/chat.py` keeps the model and its KV cache between turns. It runs `src/main.vx --session`,
+and sends each turn the whole conversation. The session finds the longest prefix of tokens that the
+cache holds, and runs only the tokens after it:
+
+```sh
+python3 scripts/convert_tokenizer.py ~/models/Qwen3-Coder-30B-A3B-Instruct qwen3.vxt
+python3 scripts/chat.py qwen3-30b-q4.vxw qwen3.vxt --system-file SYSTEM.md --cache system.kv
+```
+
+With `--cache`, the first session runs the system prompt once and saves its KV cache to the file.
+Later sessions load the file, so the system prompt does not run again. A cache file fits only the
+model and the weight file that made it.
+
+vxc does not give its standard input to the program, and it keeps the standard output of the
+program until the program ends. So a session reads its requests from one named pipe and writes its
+replies to another. The comment at the start of `src/session.vx` describes the requests.
+
+On an M4 with 32 GB, with a system prompt of the first 8000 characters of this README, and
+Qwen3-Coder-30B-A3B in Q4_0:
+
+| Turn | Prompt | Tokens that ran | Time of the prompt |
+| --- | --- | --- | --- |
+| The first, with no cache | 2465 tokens | 2465 | 50.0 s |
+| The second, in the same session | 2539 tokens | 29 | 2.3 s |
+| The first, in a new session that loaded the cache of the system prompt | 2465 tokens | 20 | 2.5 s |
+
+The cache of the 2445 tokens of the system prompt took 481 MB. It took 0.4 s to save and 1.9 s
+to load, and the reply after the load was the same text as the reply with no cache. A session
+takes about a minute to start, to compile the program and to load the weights.
+
+`tests/session.vx` runs a conversation of three turns on the tiny model with
+`scripts/chat.py --check`. Each turn must give the text of a fresh run, and a saved cache must give
+the same text in a new session.
+
 ## The Vx code
 
 | File | What it does |
@@ -309,10 +346,11 @@ with 1024 positions after a prompt of 700 tokens.
 | `src/prefill.vx` | Runs the prompt through all layers in chunks of tokens. |
 | `src/attention.vx` | The attention of a generated token, with the positions split among blocks. |
 | `src/tokenizer.vx` | Turns text into token ids and token ids into text, with a tokenizer file. |
+| `src/session.vx` | Keeps the model and the KV cache, and answers the requests of `scripts/chat.py`. |
 | `src/main.vx` | Generates tokens with greedy decoding, and prints text or the lines of `reference.py`. |
 
-A program imports the modules as `qwen::weights`, `qwen::model`, `qwen::attention`,
-`qwen::prefill` and `qwen::tokenizer`, with `vxc --package qwen=src`. A program in another folder
+A program imports the modules as `qwen::weights`, `qwen::model`, `qwen::attention`, `qwen::prefill`,
+`qwen::tokenizer` and `qwen::session`, with `vxc --package qwen=src`. A program in another folder
 names the `src` folder of this repository.
 
 The tests are in `tests/`. They need a Python 3 that has NumPy and ml_dtypes, and `FileCheck` from
