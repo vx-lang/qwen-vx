@@ -258,8 +258,10 @@ weight once for all its tokens. `src/prefill.vx` has the kernels of a chunk:
   tiles (`@`).
 - For the experts of a MoE layer, the CPU sorts the tokens of the chunk by expert. Then a tile of
   16 tokens reads the weights of one expert.
-- Attention as `nn_attention`, with one block for each token and key-value head. The block reads
-  the cache once for all the query heads of that key-value head.
+- Attention in three passes: the scores, as a matmul of the queries and the keys; their softmax;
+  and the sum of the values, as a matmul of the weights and the values. The rows of the matmuls
+  are the query heads of one key-value head for two tokens, so a tile of the cache serves 16
+  rows. The matmuls skip the positions after the tokens of their tile.
 
 The time of each prompt token, on an M4 with 32 GB, with the prompt as the first tokens of this
 README:
