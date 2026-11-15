@@ -18,17 +18,45 @@ curl -fsSL https://vxlang.org/install.sh | sh
 ```
 
 The toolchain goes in `~/.vx/current`. On a Mac, it also needs LLVM 22 (`brew install llvm@22`).
+The commands below call `vxc`, so put the toolchain on `PATH`, as the installer says:
+
+```sh
+export PATH="$HOME/.vx/bin:$PATH"
+```
+
+To install Vx in another folder, give it as `VX_HOME`, and keep `VX_HOME` set:
+
+```sh
+export VX_HOME="$HOME/tools/vx"
+curl -fsSL https://vxlang.org/install.sh | sh
+export PATH="$VX_HOME/bin:$PATH"
+```
+
+The commands below then name `$VX_HOME` in place of `~/.vx`, as in
+`--machine $VX_HOME/current/fleet/m4-uma.vx`.
+
 [Getting started](https://vxlang.org/docs/getting-started.html) has the details. On a computer
 with no Apple GPU, the same program runs on the CPU.
 
 ## Prepare a model
 
 The scripts need Python 3 with NumPy. `--prompt` also needs the `tokenizers` package, and
-`check_against_mlx.py` needs `mlx-lm`.
+`check_against_mlx.py` needs `mlx-lm`. The Python of Homebrew takes no packages of its own, so
+put them in a virtual environment:
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+pip install numpy tokenizers huggingface_hub
+```
 
 1. Download a model from Hugging Face, for example
-   [Qwen2.5-Coder-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-Coder-0.5B-Instruct), into a
-   folder such as `~/models/Qwen2.5-Coder-0.5B-Instruct`.
+   [Qwen2.5-Coder-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-Coder-0.5B-Instruct), which
+   is 1 GB:
+
+   ```sh
+   hf download Qwen/Qwen2.5-Coder-0.5B-Instruct --local-dir ~/models/Qwen2.5-Coder-0.5B-Instruct
+   ```
 
 1. Convert it into the weight file that the Vx program reads:
 
@@ -48,6 +76,15 @@ The scripts need Python 3 with NumPy. `--prompt` also needs the `tokenizers` pac
    ```sh
    vxc src/main.vx --package qwen=src --host default \
        --machine ~/.vx/current/fleet/m4-uma.vx -- qwen-0.5b.vxw --tokens 750,75698,1445,1648 --steps 8
+   ```
+
+   `vxc` first warns that it cannot check the memory of some functions with a dynamic shape
+   (W1029). These warnings are expected. The program then prints the same tokens as
+   `reference.py`, and the time of a token, about 11 ms on an M4. `compare.py` checks the two
+   outputs, when each is saved in a file:
+
+   ```sh
+   python3 scripts/compare.py reference.txt vx.txt
    ```
 
 `make_tiny_model.py` writes a model with the same layers and random weights. It is small enough
@@ -117,7 +154,8 @@ vxc src/main.vx --package qwen=src --host default \
     --machine ~/.vx/current/fleet/m4-uma.vx -- qwen3-30b-q4.vxw --tokens 750,75698,1445,982,257 --steps 64
 ```
 
-The tokens are `def fibonacci(n):` and a new line with 4 spaces. The Vx program wrote a recursive
+The conversion took 3.4 minutes and 18.6 GB of memory on an M4 with 32 GB. The tokens are
+`def fibonacci(n):` and a new line with 4 spaces. The Vx program wrote a recursive
 and an iterative `fibonacci` in the 64 steps. `reference.py` on the same file chose the same 64
 tokens, with each logit within 5.4e-05.
 
@@ -183,7 +221,8 @@ A program imports the modules as `qwen::weights` and `qwen::model`, with
 
 The tests are in `tests/`. They need a Python 3 that has NumPy and ml_dtypes, and `FileCheck` from
 LLVM or the Python port (`pip install numpy ml_dtypes filecheck`). `tests/run.sh` takes `vxc` and the
-machine files from `~/.vx/current`, or from the toolchain in `VX_HOME`:
+machine files from `$VX_HOME/current` when `VX_HOME` is set, else from the `vxc` on `PATH`, else
+from `~/.vx/current`:
 
 ```sh
 tests/run.sh

@@ -6,8 +6,10 @@
 #   tests/run.sh              # the Python tests of the scripts, and every test here
 #   tests/run.sh FILE...      # only these tests
 #
-# vxc and the machine files come from the Vx toolchain in VX_HOME (default ~/.vx/current). A vxc
-# that is already on PATH comes first. VX_FLEET names another folder of machine files, such as the
+# vxc and the machine files come from the Vx toolchain in VX_HOME/current, where VX_HOME is the
+# folder of the Vx installer (`curl -fsSL https://vxlang.org/install.sh | VX_HOME=DIR sh`). Without
+# VX_HOME, a vxc that is already on PATH comes first, with the machine files of its toolchain, and
+# then the toolchain in ~/.vx/current. VX_FLEET names another folder of machine files, such as the
 # fleet/ folder of a Vx checkout.
 #
 # Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
@@ -16,9 +18,21 @@
 
 set -u
 cd "$(dirname "$0")/.." || exit 2
-VX_HOME=${VX_HOME:-$HOME/.vx/current}
-export VX_FLEET=${VX_FLEET:-$VX_HOME/fleet}
-command -v vxc > /dev/null || PATH="$VX_HOME/bin:$PATH"
+if [ -n "${VX_HOME:-}" ]; then
+  toolchain=$VX_HOME/current
+  # VX_HOME may also name a toolchain folder itself, as run.sh once took it.
+  [ -d "$toolchain" ] || toolchain=$VX_HOME
+  PATH="$toolchain/bin:$PATH"
+elif command -v vxc > /dev/null; then
+  toolchain=$(cd "$(dirname "$(readlink -f "$(command -v vxc)")")/.." && pwd)
+else
+  toolchain=$HOME/.vx/current
+  PATH="$toolchain/bin:$PATH"
+fi
+fleet=$toolchain/fleet
+# A vxc that a Vx checkout built has no fleet/ beside it.
+[ -d "$fleet" ] || fleet=$HOME/.vx/current/fleet
+export VX_FLEET=${VX_FLEET:-$fleet}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 # The RUN lines call FileCheck. The Python port has the same options, under another name.
