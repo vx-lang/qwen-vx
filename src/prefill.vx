@@ -299,11 +299,82 @@ fn pf_mm_fp8(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Me
   return;
 }
 
+/// y = the product of a Q4_0 matrix, as `pf_mm_q4` with no bias and no `add`. The tiles of the
+/// weights and the inputs are f16, half the shared memory of f32 tiles. `lanes::fill` starts the
+/// sums and `lanes::copy` writes them to `y`, and nothing else reads them, so on the Apple GPU they
+/// stay in the simdgroup matrices of the subgroups, with no tile in shared memory. A weight is
+/// (code - 8) times its scale, rounded to f16, and an input is rounded to f16: the products differ
+/// from those of f32 tiles by about 1e-3 of their size.
+fn pf_mm_q4_set(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, list : &Tensor<i32, [?], Memory::HBM>, bases : &Tensor<i32, [?], Memory::HBM>, stride : i32, rows : i32, cols : i32, tiles : i32) -> void {
+  assert(cols % 32 == 0 && tiles > 0 && list.len() >= tiles * 16 && bases.len() >= tiles, "pf_mm_q4_set: cols must be a multiple of 32, and list and bases need the tiles");
+  let words = cols / 8;
+  let groups = cols / 32;
+  spawn on(Topology::Device) {
+    for rb in 0..(rows + 127) / 128 across blocks {
+      for tb in 0..tiles across blocks {
+        let mut sw = unsafe { Tensor<f16, [4, 32, 32], Memory::SMEM>::uninit() };
+        let mut sx = unsafe { Tensor<f16, [1, 16, 32], Memory::SMEM>::uninit() };
+        let mut acc = unsafe { Tensor<f32, [4, 16, 32], Memory::SMEM>::uninit() };
+        for sg in 0..4 across subgroups {
+          lanes::fill(&mut acc[sg], 0.0);
+        }
+        for g in 0..groups {
+          for sg in 0..4 across subgroups {
+            for l in 0..32 across lanes(32) {
+              let r = rb * 128 + sg * 32 + l;
+              if r < rows {
+                let row = bases[tb] * stride + r;
+                let at = row * words + g * 4;
+                let sc = scales[row * groups + g] as f32;
+                let m = -8.0 * sc;
+                for i in 0..4 {
+                  let word = w[at + i];
+                  sw[sg][i * 8][l] = (((word & 15u32) as f32) * sc + m) as f16;
+                  sw[sg][i * 8 + 1][l] = ((((word >> 4u32) & 15u32) as f32) * sc + m) as f16;
+                  sw[sg][i * 8 + 2][l] = ((((word >> 8u32) & 15u32) as f32) * sc + m) as f16;
+                  sw[sg][i * 8 + 3][l] = ((((word >> 12u32) & 15u32) as f32) * sc + m) as f16;
+                  sw[sg][i * 8 + 4][l] = ((((word >> 16u32) & 15u32) as f32) * sc + m) as f16;
+                  sw[sg][i * 8 + 5][l] = ((((word >> 20u32) & 15u32) as f32) * sc + m) as f16;
+                  sw[sg][i * 8 + 6][l] = ((((word >> 24u32) & 15u32) as f32) * sc + m) as f16;
+                  sw[sg][i * 8 + 7][l] = ((((word >> 28u32) & 15u32) as f32) * sc + m) as f16;
+                }
+              } else {
+                for k in 0..32 {
+                  sw[sg][k][l] = 0.0 as f16;
+                }
+              }
+              for q in 0..4 {
+                let from = list[tb * 16 + sg * 4 + q];
+                let mut v : f32 = 0.0;
+                if from >= 0 {
+                  v = x[from][g * 32 + l];
+                }
+                sx[0][sg * 4 + q][l] = v as f16;
+              }
+            }
+          }
+          for sg in 0..4 across subgroups {
+            acc[sg] = acc[sg] + (sx[0] as f32) @ (sw[sg] as f32);
+          }
+        }
+        for sg in 0..4 across subgroups {
+          lanes::copy(y, &acc[sg], [tb * 16, rb * 128 + sg * 32]);
+        }
+      }
+    }
+  }
+  return;
+}
+
 /// The product of a Q4_0 matrix, in the format of `nn_matvec_q4`: a weight is (code - 8) times
 /// the f16 scale of its 32 columns. The weights go to shared memory as [column][row], and the
 /// inputs as [token][column], so that the lanes of a subgroup write consecutive words, and the
 /// matmul gives [token][row].
 fn pf_mm_q4(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, list : &Tensor<i32, [?], Memory::HBM>, bases : &Tensor<i32, [?], Memory::HBM>, stride : i32, bias : &Tensor<bf16, [?], Memory::HBM>, use_bias : bool, add : bool, rows : i32, cols : i32, tiles : i32) -> void {
+  if !use_bias && !add {
+    pf_mm_q4_set(y, w, scales, x, list, bases, stride, rows, cols, tiles);
+    return;
+  }
   assert(cols % 32 == 0 && tiles > 0 && list.len() >= tiles * 16 && bases.len() >= tiles, "pf_mm_q4: cols must be a multiple of 32, and list and bases need the tiles");
   let words = cols / 8;
   let groups = cols / 32;
