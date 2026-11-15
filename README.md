@@ -9,8 +9,8 @@ This program runs Qwen coder models on the GPU of an Apple Silicon Mac. It is wr
 
 The plan and its milestones are in [#5](https://github.com/vx-lang/qwen-vx/issues/5). Milestones 1
 to 6 are done. The MoE model was milestone 6,
-[#6](https://github.com/vx-lang/qwen-vx/issues/6). Milestone 7 added a tokenizer in Vx, and runs the
-prompt on the GPU in chunks of tokens.
+[#6](https://github.com/vx-lang/qwen-vx/issues/6). Milestone 7 added a tokenizer in Vx, and the
+prompt now runs on the GPU in chunks of tokens.
 
 The program generates tokens with greedy decoding. Its tokenizer is also in Vx, so the prompt can
 be text or token ids, and the program prints text or token ids.
