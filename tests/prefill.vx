@@ -1,0 +1,103 @@
+//===- prefill.vx - Qwen app ------------------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// Runs a prompt of 40 tokens through the tiny model twice: one token at a time with `run_layers`,
+// and in chunks of 16 tokens with `prefill_in_chunks`. So the chunks have 16, 16 and 8 tokens,
+// and the last tile of the last chunk is half empty. Prints the largest difference between the
+// logits of the last token, and whether the next 8 greedy tokens are equal. The logits must be
+// within 0.0001. Each group of RUN lines does this for another weight file.
+//
+// RUN: python3 %S/../scripts/make_tiny_model.py %t.vxw > /dev/null
+// RUN: vxc %s --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t.vxw | FileCheck %s
+// RUN: python3 %S/../scripts/make_tiny_model.py --fp8 %t-fp8.vxw > /dev/null
+// RUN: vxc %s --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t-fp8.vxw | FileCheck %s
+// RUN: python3 %S/../scripts/make_tiny_model.py --q4 %t-q4.vxw > /dev/null
+// RUN: vxc %s --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t-q4.vxw | FileCheck %s
+// RUN: python3 %S/../scripts/make_tiny_model.py --moe %t-moe.vxw > /dev/null
+// RUN: vxc %s --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t-moe.vxw | FileCheck %s
+// RUN: python3 %S/../scripts/make_tiny_model.py --moe --q4 %t-moe-q4.vxw > /dev/null
+// RUN: vxc %s --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t-moe-q4.vxw | FileCheck %s
+//
+// CHECK: {{^}}logits within 0.0001: true{{$}}
+// CHECK: {{^}}tokens equal: true{{$}}
+import core::convert;
+import std::vec;
+import qwen::weights;
+import qwen::model;
+import qwen::prefill;
+
+struct PromptToken {
+  t : Tensor<i32, [?], Memory::HBM>,
+}
+
+/// out gets the first n values of `logits`.
+fn copy_logits(logits : &Tensor<f32, [?], Memory::HBM>, out : &mut Vec<f32>, n : i32) -> void {
+  let h = transfer(logits, Memory::CPU_DRAM);
+  for i in 0..n {
+    out.push(h[i]);
+  }
+  return;
+}
+
+/// `logits` gets the logits of the last token of the prompt, and `tokens` the next `steps` greedy
+/// tokens. With `chunk` 0 the prompt runs one token at a time, and else in chunks of that size.
+fn run(w : &Weights, prompt : &Vec<i32>, chunk : i32, steps : i32, logits : &mut Vec<f32>, tokens : &mut Vec<i32>) -> void {
+  let count = prompt.len();
+  let mut s = new_state(&w.config, count + steps);
+  let mut next = transfer(Tensor<i32>([1]), Memory::HBM);
+  if chunk == 0 {
+    let mut each = Vec<PromptToken>::new();
+    for i in 0..count {
+      let mut h = Tensor<i32>([1]);
+      h[0] = prompt[i];
+      each.push(PromptToken {
+        t: transfer(h, Memory::HBM)
+      });
+    }
+    for i in 0..count {
+      run_layers(w, &mut s, &each[i].t, i);
+    }
+  } else {
+    prefill_in_chunks(w, &mut s, prompt, chunk);
+  }
+  predict(w, &mut s, &mut next);
+  copy_logits(&s.logits, logits, w.config.vocab_size);
+  for step in 0..steps {
+    let h = transfer(&next, Memory::CPU_DRAM);
+    tokens.push(h[0]);
+    run_layers(w, &mut s, &next, count + step);
+    predict(w, &mut s, &mut next);
+  }
+  return;
+}
+
+fn main(argc : i32, argv : *mut *mut i8) -> i32 {
+  assert(argc == 2, "give: WEIGHTS");
+  let w = load_weights(unsafe { argv[1] });
+  let mut prompt = Vec<i32>::new();
+  for i in 0..40 {
+    prompt.push((i * 37 + 11) % w.config.vocab_size);
+  }
+  let mut one = Vec<i32>::new();
+  let mut chunked = Vec<i32>::new();
+  let mut a = Vec<f32>::new();
+  let mut b = Vec<f32>::new();
+  run(&w, &prompt, 0, 8, &mut a, &mut one);
+  run(&w, &prompt, 16, 8, &mut b, &mut chunked);
+  let mut diff : f32 = 0.0;
+  for i in 0..w.config.vocab_size {
+    diff = diff.max((a[i] - b[i]).abs());
+  }
+  let mut same = true;
+  for i in 0..8 {
+    same = same && one[i] == chunked[i];
+  }
+  println!("largest logit difference: {}", diff);
+  println!("logits within 0.0001: {}", diff <= 0.0001);
+  println!("tokens equal: {}", same);
+  return 0;
+}
