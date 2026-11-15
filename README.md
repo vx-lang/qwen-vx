@@ -138,6 +138,7 @@ of Qwen3-Coder-30B-A3B.
 | `scripts/make_tiny_tokenizer.py` | Writes a tiny tokenizer.json, and texts that test each step of the tokenizer. |
 | `scripts/test_tokenizer.py` | Compares the tokenizer in Vx with the `tokenizers` package. |
 | `scripts/chat.py` | Chats with a model through a session, with a cache of the system prompt. |
+| `scripts/make_vx_guides.py` | Makes the guides of `docs/vx-guides` from the Vx book. |
 
 [`examples/`](examples/README.md) asks the 30B model for programs in Rust, C++ and Python. It
 compiles each one and checks its output.
@@ -332,6 +333,10 @@ Qwen3-Coder-30B-A3B in Q4_0:
 The cache of the 2445 tokens of the system prompt took 481 MB. It took 0.4 s to save and 1.9 s
 to load, and the reply after the load was the same text as the reply with no cache. A session
 takes about a minute to start, to compile the program and to load the weights.
+
+[`docs/vx-guides`](docs/vx-guides) has system prompts that teach Qwen3-Coder to write Vx, which
+it never learned. Each one is a set of chapters of the Vx book for one kind of program, such as
+kernels on the GPU of a Mac, of about 13000 tokens. With `--cache`, it runs once.
 
 `tests/session.vx` runs a conversation of three turns on the tiny model with
 `scripts/chat.py --check`. Each turn must give the text of a fresh run, and a saved cache must give
