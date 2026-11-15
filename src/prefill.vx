@@ -28,7 +28,11 @@ import qwen::weights;
 import qwen::model;
 
 /// The most tokens of a chunk, unless the caller gives another number. A multiple of 16.
-const CHUNK : i32 = 256;
+const CHUNK : i32 = 512;
+
+/// The most tokens of a chunk that attention takes at a time. The scratch tensor of the scores
+/// has a row of positions for each of them, so it does not grow with the chunk.
+const ATTENTION_TOKENS : i32 = 128;
 
 /// The tensors of a chunk, made once. `rows` is the list of input rows of the dense products:
 /// row t for a token of the chunk, and -1 after the last one. `zeros` gives the expert 0 to each
@@ -104,7 +108,7 @@ fn new_prefill(c : &Config, max_seq : i32, chunk : i32) -> Prefill {
     q: transfer(Tensor<f32>([chunk, c.num_q_heads, c.head_dim]), Memory::HBM),
     heads: transfer(Tensor<f32>([chunk, c.num_kv_heads, 8, c.head_dim]), Memory::HBM),
     att: transfer(Tensor<f32>([chunk, c.num_q_heads * c.head_dim]), Memory::HBM),
-    scores: transfer(Tensor<f32>([chunk, c.num_kv_heads, 8, (max_seq + 31) / 32 * 32]), Memory::HBM),
+    scores: transfer(Tensor<f32>([i32::min(chunk, ATTENTION_TOKENS), c.num_kv_heads, 8, (max_seq + 31) / 32 * 32]), Memory::HBM),
     gu: transfer(Tensor<f32>([dense_rows, 2 * inter]), Memory::HBM),
     h: transfer(Tensor<f32>([dense_rows, inter]), Memory::HBM),
     router: transfer(Tensor<f32>([chunk, experts]), Memory::HBM),
@@ -296,7 +300,9 @@ fn pf_mm_fp8(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Me
 }
 
 /// The product of a Q4_0 matrix, in the format of `nn_matvec_q4`: a weight is (code - 8) times
-/// the f16 scale of its 32 columns.
+/// the f16 scale of its 32 columns. The weights go to shared memory as [column][row], and the
+/// inputs as [token][column], so that the lanes of a subgroup write consecutive words, and the
+/// matmul gives [token][row].
 fn pf_mm_q4(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, list : &Tensor<i32, [?], Memory::HBM>, bases : &Tensor<i32, [?], Memory::HBM>, stride : i32, bias : &Tensor<bf16, [?], Memory::HBM>, use_bias : bool, add : bool, rows : i32, cols : i32, tiles : i32) -> void {
   assert(cols % 32 == 0 && tiles > 0 && list.len() >= tiles * 16 && bases.len() >= tiles, "pf_mm_q4: cols must be a multiple of 32, and list and bases need the tiles");
   let words = cols / 8;
@@ -304,19 +310,19 @@ fn pf_mm_q4(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Mem
   spawn on(Topology::Device) {
     for rb in 0..(rows + 127) / 128 across blocks {
       for tb in 0..tiles across blocks {
-        let mut sa = unsafe {
+        let mut sw = unsafe {
           Tensor<f32, [4, 32, 32], Memory::SMEM>::uninit()
         };
-        let mut sb = unsafe {
-          Tensor<f32, [1, 32, 16], Memory::SMEM>::uninit()
+        let mut sx = unsafe {
+          Tensor<f32, [1, 16, 32], Memory::SMEM>::uninit()
         };
         let mut acc = unsafe {
-          Tensor<f32, [4, 32, 16], Memory::SMEM>::uninit()
+          Tensor<f32, [4, 16, 32], Memory::SMEM>::uninit()
         };
         for sg in 0..4 across subgroups {
           for l in 0..32 across lanes(32) {
             for t in 0..16 {
-              acc[sg][l][t] = 0.0;
+              acc[sg][t][l] = 0.0;
             }
           }
         }
@@ -328,20 +334,21 @@ fn pf_mm_q4(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Mem
                 let row = bases[tb] * stride + r;
                 let at = row * words + g * 4;
                 let sc = scales[row * groups + g] as f32;
+                let m = -8.0 * sc;
                 for i in 0..4 {
                   let word = w[at + i];
-                  sa[sg][l][i * 8] = (((word & 15u32) as f32) - 8.0) * sc;
-                  sa[sg][l][i * 8 + 1] = ((((word >> 4u32) & 15u32) as f32) - 8.0) * sc;
-                  sa[sg][l][i * 8 + 2] = ((((word >> 8u32) & 15u32) as f32) - 8.0) * sc;
-                  sa[sg][l][i * 8 + 3] = ((((word >> 12u32) & 15u32) as f32) - 8.0) * sc;
-                  sa[sg][l][i * 8 + 4] = ((((word >> 16u32) & 15u32) as f32) - 8.0) * sc;
-                  sa[sg][l][i * 8 + 5] = ((((word >> 20u32) & 15u32) as f32) - 8.0) * sc;
-                  sa[sg][l][i * 8 + 6] = ((((word >> 24u32) & 15u32) as f32) - 8.0) * sc;
-                  sa[sg][l][i * 8 + 7] = ((((word >> 28u32) & 15u32) as f32) - 8.0) * sc;
+                  sw[sg][i * 8][l] = ((word & 15u32) as f32) * sc + m;
+                  sw[sg][i * 8 + 1][l] = (((word >> 4u32) & 15u32) as f32) * sc + m;
+                  sw[sg][i * 8 + 2][l] = (((word >> 8u32) & 15u32) as f32) * sc + m;
+                  sw[sg][i * 8 + 3][l] = (((word >> 12u32) & 15u32) as f32) * sc + m;
+                  sw[sg][i * 8 + 4][l] = (((word >> 16u32) & 15u32) as f32) * sc + m;
+                  sw[sg][i * 8 + 5][l] = (((word >> 20u32) & 15u32) as f32) * sc + m;
+                  sw[sg][i * 8 + 6][l] = (((word >> 24u32) & 15u32) as f32) * sc + m;
+                  sw[sg][i * 8 + 7][l] = (((word >> 28u32) & 15u32) as f32) * sc + m;
                 }
               } else {
                 for k in 0..32 {
-                  sa[sg][l][k] = 0.0;
+                  sw[sg][k][l] = 0.0;
                 }
               }
               for q in 0..4 {
@@ -350,12 +357,12 @@ fn pf_mm_q4(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Mem
                 if from >= 0 {
                   v = x[from][g * 32 + l];
                 }
-                sb[0][l][sg * 4 + q] = v;
+                sx[0][sg * 4 + q][l] = v;
               }
             }
           }
           for sg in 0..4 across subgroups {
-            acc[sg] = acc[sg] + sa[sg] @ sb[0];
+            acc[sg] = acc[sg] + sx[0] @ sw[sg];
           }
         }
         for sg in 0..4 across subgroups {
@@ -368,9 +375,9 @@ fn pf_mm_q4(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Mem
               }
               for t in 0..16 {
                 if add {
-                  y[tb * 16 + t][r] = y[tb * 16 + t][r] + acc[sg][l][t];
+                  y[tb * 16 + t][r] = y[tb * 16 + t][r] + acc[sg][t][l];
                 } else {
-                  y[tb * 16 + t][r] = acc[sg][l][t] + b;
+                  y[tb * 16 + t][r] = acc[sg][t][l] + b;
                 }
               }
             }
@@ -531,15 +538,16 @@ fn pf_norm_rope_and_store(q_out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, k_ca
   return;
 }
 
-/// The scores of attention, for tokens start to start + n - 1 of a chunk: scores[t][g][j][p] =
-/// (query head g * group + j of token t) . (key p of head g) / sqrt(head_dim). A block does two
-/// tokens, the 16 rows of their query heads, against 128 positions, as a matmul of tiles. It skips
-/// the positions that neither token sees, and so writes the scores of p up to start + t + 1 at
-/// least, but not those of p at start + n or after.
-fn pf_scores(scores : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f32, [?, ?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+/// The scores of attention, for the n tokens of a chunk from token `first`, at positions start to
+/// start + n - 1: scores[t][g][j][p] = (query head g * group + j of token first + t) . (key p of
+/// head g) / sqrt(head_dim). A block does two tokens, the 16 rows of their query heads, against
+/// 128 positions, as a matmul of tiles. It skips the positions that neither token sees, and so
+/// writes the scores of p up to start + t + 1 at least, but not those of p at start + n or after.
+fn pf_scores(scores : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f32, [?, ?, ?], Memory::HBM>, first : i32, start : i32, n : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
   assert(q_heads % kv_heads == 0 && q_heads / kv_heads <= 8 && head_dim <= 128, "pf_scores: q_heads must be a multiple of kv_heads, and at most 8 times it, and head_dim at most 128");
   let group = q_heads / kv_heads;
   let end = start + n;
+  assert(scores.extent(0) >= n && first + n <= q.extent(0), "pf_scores: `scores` needs n tokens, and q first + n");
   assert(scores.extent(3) >= end && end <= k_cache.extent(0), "pf_scores: `scores` and the cache need start + n positions");
   let scale = 1.0 / (head_dim as f32).sqrt();
   let dims = (head_dim + 31) / 32;
@@ -579,7 +587,7 @@ fn pf_scores(scores : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, q : &Tensor<f
                   let d = kc * 32 + l;
                   let mut v : f32 = 0.0;
                   if t < n && j < group && d < head_dim {
-                    v = q[t][g * group + j][d] * scale;
+                    v = q[first + t][g * group + j][d] * scale;
                   }
                   sq[0][sg * 4 + i][l] = v;
                 }
@@ -671,13 +679,15 @@ fn pf_softmax(scores : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, start : i32,
   return;
 }
 
-/// out[t][g][j] = the sum of the rows p of V of head g, each times its weight scores[t][g][j][p],
-/// over the positions that token t sees. A block does the 16 rows of two tokens, for all the
+/// out[first + t][g][j] = the sum of the rows p of V of head g, each times its weight
+/// scores[t][g][j][p], over the positions that token t sees, for t below n. Token t is at position
+/// start + t. A block does the 16 rows of two tokens, for all the
 /// values of a head, as a matmul of tiles. It reads the weights up to a multiple of 32, so those
 /// after start + t must be 0, as `pf_softmax` leaves them.
-fn pf_weigh_values(out : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, scores : &Tensor<f32, [?, ?, ?, ?], Memory::HBM>, v_cache : &Tensor<f32, [?, ?, ?], Memory::HBM>, start : i32, n : i32, kv_heads : i32, group : i32, head_dim : i32) -> void {
+fn pf_weigh_values(out : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, scores : &Tensor<f32, [?, ?, ?, ?], Memory::HBM>, v_cache : &Tensor<f32, [?, ?, ?], Memory::HBM>, first : i32, start : i32, n : i32, kv_heads : i32, group : i32, head_dim : i32) -> void {
   let end = start + n;
   assert(scores.extent(3) >= (end + 31) / 32 * 32 && head_dim <= 128, "pf_weigh_values: `scores` needs start + n positions, rounded up to 32");
+  assert(first + n <= out.extent(0), "pf_weigh_values: `out` needs first + n tokens");
   spawn on(Topology::Device) {
     for g in 0..kv_heads across blocks {
       for tp in 0..(n + 1) / 2 across blocks {
@@ -728,7 +738,7 @@ fn pf_weigh_values(out : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, scores : &
               for m2 in 0..2 {
                 for j in 0..8 {
                   if tp * 2 + m2 < n && j < group {
-                    out[tp * 2 + m2][g][j][d] = acc[sg][m2 * 8 + j][l];
+                    out[first + tp * 2 + m2][g][j][d] = acc[sg][m2 * 8 + j][l];
                   }
                 }
               }
@@ -742,13 +752,20 @@ fn pf_weigh_values(out : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, scores : &
 }
 
 /// Attention of each token of the chunk over the positions up to its own, as `nn_attention`. Token
-/// t is at position start + t. Query head g * group + j of token t goes to out[t][g][j], and its
-/// weights to scores[t][g][j].
+/// t is at position start + t. Query head g * group + j of token t goes to out[t][g][j]. The
+/// tokens go in slices of as many tokens as `scores` has rows for.
 fn pf_attention(out : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, scores : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f32, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f32, [?, ?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
   let group = q_heads / kv_heads;
-  pf_scores(scores, q, k_cache, start, n, q_heads, kv_heads, head_dim);
-  pf_softmax(scores, start, n, kv_heads, group, (start + n + 31) / 32 * 32);
-  pf_weigh_values(out, scores, v_cache, start, n, kv_heads, group, head_dim);
+  let slice = scores.extent(0);
+  let mut first = 0;
+  while first < n {
+    let m = i32::min(slice, n - first);
+    let at = start + first;
+    pf_scores(scores, q, k_cache, first, at, m, q_heads, kv_heads, head_dim);
+    pf_softmax(scores, at, m, kv_heads, group, (at + m + 31) / 32 * 32);
+    pf_weigh_values(out, scores, v_cache, first, at, m, kv_heads, group, head_dim);
+    first = first + m;
+  }
   return;
 }
 
