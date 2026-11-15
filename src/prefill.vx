@@ -1,0 +1,882 @@
+//===- prefill.vx - Qwen app ------------------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// The prompt in chunks of up to CHUNK tokens. A token of the decoder reads every weight of a
+// layer to make one product, so it waits for memory. A chunk reads each weight once for many
+// tokens. The kernels here do for a chunk what the kernels of `std::nn` do for one token:
+//
+// - A matrix product is a list of tiles of 16 rows of the input. A list of input rows names the
+//   row of each tile row, and -1 gives a row of zeros. For a dense layer the list is the tokens of
+//   the chunk. For the experts of a layer, the CPU sorts the tokens by expert, so that each tile
+//   has the tokens of one expert, and `bases` names that expert. A block of the product does 128
+//   rows of the matrix for one tile. For each 32 columns, its lanes decode the weights and copy the
+//   inputs into shared memory once, and each subgroup adds a matmul of tiles.
+// - Attention computes the scores of each token as `nn_attention` does, in a scratch tensor of
+//   [chunk, kv_heads, 8, max_seq]. A block does the query heads of one key-value head, at most 8,
+//   so it reads the cache once for all of them.
+import core::convert;
+import core::num;
+import std::nn;
+import std::vec;
+import qwen::weights;
+import qwen::model;
+
+/// The most tokens of a chunk, unless the caller gives another number. A multiple of 16.
+const CHUNK : i32 = 256;
+
+/// The tensors of a chunk, made once. `rows` is the list of input rows of the dense products:
+/// row t for a token of the chunk, and -1 after the last one. `zeros` gives the expert 0 to each
+/// tile of a dense product. The `e_` tensors are those of the experts, in the order of the CPU's
+/// sort: position p of `e_rows` is a token, or -1 for padding, and `slot[t][j]` is the position of
+/// expert j of token t.
+struct Prefill {
+  chunk : i32,
+  tokens : Tensor<i32, [?], Memory::HBM>,
+  rows : Tensor<i32, [?], Memory::HBM>,
+  zeros : Tensor<i32, [?], Memory::HBM>,
+  no_bias : Tensor<bf16, [?], Memory::HBM>,
+  x : Tensor<f32, [?, ?], Memory::HBM>,
+  xn : Tensor<f32, [?, ?], Memory::HBM>,
+  qkv : Tensor<f32, [?, ?], Memory::HBM>,
+  q : Tensor<f32, [?, ?, ?], Memory::HBM>,
+  heads : Tensor<f32, [?, ?, ?, ?], Memory::HBM>,
+  att : Tensor<f32, [?, ?], Memory::HBM>,
+  scores : Tensor<f32, [?, ?, ?, ?], Memory::HBM>,
+  gu : Tensor<f32, [?, ?], Memory::HBM>,
+  h : Tensor<f32, [?, ?], Memory::HBM>,
+  router : Tensor<f32, [?, ?], Memory::HBM>,
+  ids : Tensor<i32, [?, ?], Memory::HBM>,
+  wts : Tensor<f32, [?, ?], Memory::HBM>,
+  e_rows : Tensor<i32, [?], Memory::HBM>,
+  e_ident : Tensor<i32, [?], Memory::HBM>,
+  e_bases : Tensor<i32, [?], Memory::HBM>,
+  slot : Tensor<i32, [?, ?], Memory::HBM>,
+  e_gu : Tensor<f32, [?, ?], Memory::HBM>,
+  e_h : Tensor<f32, [?, ?], Memory::HBM>,
+  e_out : Tensor<f32, [?, ?], Memory::HBM>,
+}
+
+/// The positions of the experts of a chunk: one for each of its chunk * k choices, and up to 15 of
+/// padding for each expert. A multiple of 16.
+fn expert_positions(c : &Config, chunk : i32) -> i32 {
+  let k = i32::max(c.experts_per_token, 1);
+  let experts = i32::max(c.num_experts, 1);
+  return (chunk * k + experts * 15 + 15) / 16 * 16;
+}
+
+/// The tensors for chunks of up to `chunk` tokens, at up to `max_seq` positions.
+fn new_prefill(c : &Config, max_seq : i32, chunk : i32) -> Prefill {
+  assert(chunk > 0 && chunk % 16 == 0, "new_prefill: the chunk must be a multiple of 16");
+  let qkv_rows = (c.num_q_heads + 2 * c.num_kv_heads) * c.head_dim;
+  let moe = c.num_experts > 0;
+  let k = i32::max(c.experts_per_token, 1);
+  let experts = i32::max(c.num_experts, 1);
+  let positions = expert_positions(c, chunk);
+  let mut ident = Tensor<i32>([positions]);
+  for p in 0..positions {
+    ident[p] = p;
+  }
+  // A dense model uses no tensor of the experts, and a model of experts no dense MLP.
+  let mut dense_rows = 1;
+  let mut moe_rows = 1;
+  if moe {
+    moe_rows = positions;
+  } else {
+    dense_rows = chunk;
+  }
+  let inter = i32::max(c.intermediate_size, 1);
+  let moe_inter = i32::max(c.moe_intermediate_size, 1);
+  return Prefill {
+    chunk: chunk,
+    tokens: transfer(Tensor<i32>([chunk]), Memory::HBM),
+    rows: transfer(Tensor<i32>([chunk]), Memory::HBM),
+    zeros: transfer(Tensor<i32>([chunk / 16]), Memory::HBM),
+    no_bias: transfer(Tensor<bf16>([1]), Memory::HBM),
+    x: transfer(Tensor<f32>([chunk, c.hidden_size]), Memory::HBM),
+    xn: transfer(Tensor<f32>([chunk, c.hidden_size]), Memory::HBM),
+    qkv: transfer(Tensor<f32>([chunk, qkv_rows]), Memory::HBM),
+    q: transfer(Tensor<f32>([chunk, c.num_q_heads, c.head_dim]), Memory::HBM),
+    heads: transfer(Tensor<f32>([chunk, c.num_kv_heads, 8, c.head_dim]), Memory::HBM),
+    att: transfer(Tensor<f32>([chunk, c.num_q_heads * c.head_dim]), Memory::HBM),
+    scores: transfer(Tensor<f32>([chunk, c.num_kv_heads, 8, max_seq]), Memory::HBM),
+    gu: transfer(Tensor<f32>([dense_rows, 2 * inter]), Memory::HBM),
+    h: transfer(Tensor<f32>([dense_rows, inter]), Memory::HBM),
+    router: transfer(Tensor<f32>([chunk, experts]), Memory::HBM),
+    ids: transfer(Tensor<i32>([chunk, k]), Memory::HBM),
+    wts: transfer(Tensor<f32>([chunk, k]), Memory::HBM),
+    e_rows: transfer(Tensor<i32>([positions]), Memory::HBM),
+    e_ident: transfer(ident, Memory::HBM),
+    e_bases: transfer(Tensor<i32>([positions / 16]), Memory::HBM),
+    slot: transfer(Tensor<i32>([chunk, k]), Memory::HBM),
+    e_gu: transfer(Tensor<f32>([moe_rows, 2 * moe_inter]), Memory::HBM),
+    e_h: transfer(Tensor<f32>([moe_rows, moe_inter]), Memory::HBM),
+    e_out: transfer(Tensor<f32>([moe_rows, c.hidden_size]), Memory::HBM),
+  };
+}
+
+// ----------------------------------------------------------------------------- products ---
+//
+// y[16b + t][r] = (row bases[b] * stride + r of w) . x[list[16b + t]], for r below `rows`, and
+// each tile b below `tiles`. With `use_bias`, b[r] is added. With `add`, y gets the product added
+// instead. `cols` must be a multiple of 32.
+
+/// The product of a bf16 matrix.
+fn pf_mm_bf16(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<bf16, [?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, list : &Tensor<i32, [?], Memory::HBM>, bases : &Tensor<i32, [?], Memory::HBM>, stride : i32, bias : &Tensor<bf16, [?], Memory::HBM>, use_bias : bool, add : bool, rows : i32, cols : i32, tiles : i32) -> void {
+  assert(cols % 32 == 0 && tiles > 0 && list.len() >= tiles * 16 && bases.len() >= tiles, "pf_mm_bf16: cols must be a multiple of 32, and list and bases need the tiles");
+  let groups = cols / 32;
+  spawn on(Topology::Device) {
+    for rb in 0..(rows + 127) / 128 across blocks {
+      for tb in 0..tiles across blocks {
+        let mut sa = unsafe {
+          Tensor<f32, [4, 32, 32], Memory::SMEM>::uninit()
+        };
+        let mut sb = unsafe {
+          Tensor<f32, [1, 32, 16], Memory::SMEM>::uninit()
+        };
+        let mut acc = unsafe {
+          Tensor<f32, [4, 32, 16], Memory::SMEM>::uninit()
+        };
+        for sg in 0..4 across subgroups {
+          for l in 0..32 across lanes(32) {
+            for t in 0..16 {
+              acc[sg][l][t] = 0.0;
+            }
+          }
+        }
+        for g in 0..groups {
+          for sg in 0..4 across subgroups {
+            for l in 0..32 across lanes(32) {
+              let r = rb * 128 + sg * 32 + l;
+              if r < rows {
+                let at = (bases[tb] * stride + r) * cols + g * 32;
+                for k in 0..32 {
+                  sa[sg][l][k] = w[at + k] as f32;
+                }
+              } else {
+                for k in 0..32 {
+                  sa[sg][l][k] = 0.0;
+                }
+              }
+              for q in 0..4 {
+                let from = list[tb * 16 + sg * 4 + q];
+                let mut v : f32 = 0.0;
+                if from >= 0 {
+                  v = x[from][g * 32 + l];
+                }
+                sb[0][l][sg * 4 + q] = v;
+              }
+            }
+          }
+          for sg in 0..4 across subgroups {
+            acc[sg] = acc[sg] + sa[sg] @ sb[0];
+          }
+        }
+        for sg in 0..4 across subgroups {
+          for l in 0..32 across lanes(32) {
+            let r = rb * 128 + sg * 32 + l;
+            if r < rows {
+              let mut b : f32 = 0.0;
+              if use_bias {
+                b = bias[r] as f32;
+              }
+              for t in 0..16 {
+                if add {
+                  y[tb * 16 + t][r] = y[tb * 16 + t][r] + acc[sg][l][t];
+                } else {
+                  y[tb * 16 + t][r] = acc[sg][l][t] + b;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// The product of an fp8 matrix, in the format of `nn_matvec_fp8`: each code decodes through a
+/// table of 256 values in shared memory, times the scale of its block of 128 x 128.
+fn pf_mm_fp8(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f32, [?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, list : &Tensor<i32, [?], Memory::HBM>, bases : &Tensor<i32, [?], Memory::HBM>, stride : i32, bias : &Tensor<bf16, [?], Memory::HBM>, use_bias : bool, add : bool, rows : i32, cols : i32, tiles : i32) -> void {
+  assert(cols % 128 == 0 && tiles > 0 && list.len() >= tiles * 16 && bases.len() >= tiles, "pf_mm_fp8: cols must be a multiple of 128, and list and bases need the tiles");
+  let groups = cols / 32;
+  let words = cols / 4;
+  let blocks_per_row = cols / 128;
+  spawn on(Topology::Device) {
+    for rb in 0..(rows + 127) / 128 across blocks {
+      for tb in 0..tiles across blocks {
+        let mut sa = unsafe {
+          Tensor<f32, [4, 32, 32], Memory::SMEM>::uninit()
+        };
+        let mut sb = unsafe {
+          Tensor<f32, [1, 32, 16], Memory::SMEM>::uninit()
+        };
+        let mut acc = unsafe {
+          Tensor<f32, [4, 32, 16], Memory::SMEM>::uninit()
+        };
+        let mut lut = unsafe { Tensor<f32, [256], Memory::SMEM>::uninit() };
+        for sg in 0..4 across subgroups {
+          for l in 0..32 across lanes(32) {
+            // As in `nn_matvec_fp8`: e = 0 gives m * 2^-9, else the bits with 120 added to the
+            // exponent are the value in f32.
+            let mag = (sg * 32 + l) as u32;
+            let mut value = f32::from_bits((mag << 20u32) + 1006632960u32);
+            if mag < 8u32 {
+              value = (mag as f32) * 0.001953125;
+            }
+            lut[sg * 32 + l] = value;
+            lut[sg * 32 + l + 128] = 0.0 - value;
+            for t in 0..16 {
+              acc[sg][l][t] = 0.0;
+            }
+          }
+        }
+        for g in 0..groups {
+          for sg in 0..4 across subgroups {
+            for l in 0..32 across lanes(32) {
+              let r = rb * 128 + sg * 32 + l;
+              if r < rows {
+                let row = bases[tb] * stride + r;
+                let at = row * words + g * 8;
+                let scale = scales[(row / 128) * blocks_per_row + g / 4];
+                for i in 0..8 {
+                  let word = w[at + i];
+                  sa[sg][l][i * 4] = lut[(word & 255u32) as i32] * scale;
+                  sa[sg][l][i * 4 + 1] = lut[((word >> 8u32) & 255u32) as i32] * scale;
+                  sa[sg][l][i * 4 + 2] = lut[((word >> 16u32) & 255u32) as i32] * scale;
+                  sa[sg][l][i * 4 + 3] = lut[(word >> 24u32) as i32] * scale;
+                }
+              } else {
+                for k in 0..32 {
+                  sa[sg][l][k] = 0.0;
+                }
+              }
+              for q in 0..4 {
+                let from = list[tb * 16 + sg * 4 + q];
+                let mut v : f32 = 0.0;
+                if from >= 0 {
+                  v = x[from][g * 32 + l];
+                }
+                sb[0][l][sg * 4 + q] = v;
+              }
+            }
+          }
+          for sg in 0..4 across subgroups {
+            acc[sg] = acc[sg] + sa[sg] @ sb[0];
+          }
+        }
+        for sg in 0..4 across subgroups {
+          for l in 0..32 across lanes(32) {
+            let r = rb * 128 + sg * 32 + l;
+            if r < rows {
+              let mut b : f32 = 0.0;
+              if use_bias {
+                b = bias[r] as f32;
+              }
+              for t in 0..16 {
+                if add {
+                  y[tb * 16 + t][r] = y[tb * 16 + t][r] + acc[sg][l][t];
+                } else {
+                  y[tb * 16 + t][r] = acc[sg][l][t] + b;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// The product of a Q4_0 matrix, in the format of `nn_matvec_q4`: a weight is (code - 8) times
+/// the f16 scale of its 32 columns.
+fn pf_mm_q4(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, list : &Tensor<i32, [?], Memory::HBM>, bases : &Tensor<i32, [?], Memory::HBM>, stride : i32, bias : &Tensor<bf16, [?], Memory::HBM>, use_bias : bool, add : bool, rows : i32, cols : i32, tiles : i32) -> void {
+  assert(cols % 32 == 0 && tiles > 0 && list.len() >= tiles * 16 && bases.len() >= tiles, "pf_mm_q4: cols must be a multiple of 32, and list and bases need the tiles");
+  let words = cols / 8;
+  let groups = cols / 32;
+  spawn on(Topology::Device) {
+    for rb in 0..(rows + 127) / 128 across blocks {
+      for tb in 0..tiles across blocks {
+        let mut sa = unsafe {
+          Tensor<f32, [4, 32, 32], Memory::SMEM>::uninit()
+        };
+        let mut sb = unsafe {
+          Tensor<f32, [1, 32, 16], Memory::SMEM>::uninit()
+        };
+        let mut acc = unsafe {
+          Tensor<f32, [4, 32, 16], Memory::SMEM>::uninit()
+        };
+        for sg in 0..4 across subgroups {
+          for l in 0..32 across lanes(32) {
+            for t in 0..16 {
+              acc[sg][l][t] = 0.0;
+            }
+          }
+        }
+        for g in 0..groups {
+          for sg in 0..4 across subgroups {
+            for l in 0..32 across lanes(32) {
+              let r = rb * 128 + sg * 32 + l;
+              if r < rows {
+                let row = bases[tb] * stride + r;
+                let at = row * words + g * 4;
+                let sc = scales[row * groups + g] as f32;
+                for i in 0..4 {
+                  let word = w[at + i];
+                  sa[sg][l][i * 8] = (((word & 15u32) as f32) - 8.0) * sc;
+                  sa[sg][l][i * 8 + 1] = ((((word >> 4u32) & 15u32) as f32) - 8.0) * sc;
+                  sa[sg][l][i * 8 + 2] = ((((word >> 8u32) & 15u32) as f32) - 8.0) * sc;
+                  sa[sg][l][i * 8 + 3] = ((((word >> 12u32) & 15u32) as f32) - 8.0) * sc;
+                  sa[sg][l][i * 8 + 4] = ((((word >> 16u32) & 15u32) as f32) - 8.0) * sc;
+                  sa[sg][l][i * 8 + 5] = ((((word >> 20u32) & 15u32) as f32) - 8.0) * sc;
+                  sa[sg][l][i * 8 + 6] = ((((word >> 24u32) & 15u32) as f32) - 8.0) * sc;
+                  sa[sg][l][i * 8 + 7] = ((((word >> 28u32) & 15u32) as f32) - 8.0) * sc;
+                }
+              } else {
+                for k in 0..32 {
+                  sa[sg][l][k] = 0.0;
+                }
+              }
+              for q in 0..4 {
+                let from = list[tb * 16 + sg * 4 + q];
+                let mut v : f32 = 0.0;
+                if from >= 0 {
+                  v = x[from][g * 32 + l];
+                }
+                sb[0][l][sg * 4 + q] = v;
+              }
+            }
+          }
+          for sg in 0..4 across subgroups {
+            acc[sg] = acc[sg] + sa[sg] @ sb[0];
+          }
+        }
+        for sg in 0..4 across subgroups {
+          for l in 0..32 across lanes(32) {
+            let r = rb * 128 + sg * 32 + l;
+            if r < rows {
+              let mut b : f32 = 0.0;
+              if use_bias {
+                b = bias[r] as f32;
+              }
+              for t in 0..16 {
+                if add {
+                  y[tb * 16 + t][r] = y[tb * 16 + t][r] + acc[sg][l][t];
+                } else {
+                  y[tb * 16 + t][r] = acc[sg][l][t] + b;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// The product of `m`, with the kernel for its dtype.
+fn pf_mm(y : &mut Tensor<f32, [?, ?], Memory::HBM>, m : &WeightMatrix, x : &Tensor<f32, [?, ?], Memory::HBM>, list : &Tensor<i32, [?], Memory::HBM>, bases : &Tensor<i32, [?], Memory::HBM>, stride : i32, bias : &Tensor<bf16, [?], Memory::HBM>, use_bias : bool, add : bool, rows : i32, cols : i32, tiles : i32) -> void {
+  if m.dtype == U4 {
+    pf_mm_q4(y, &m.codes, &m.group_scales, x, list, bases, stride, bias, use_bias, add, rows, cols, tiles);
+  } else if m.dtype == F8E4M3 {
+    pf_mm_fp8(y, &m.codes, &m.scales, x, list, bases, stride, bias, use_bias, add, rows, cols, tiles);
+  } else {
+    pf_mm_bf16(y, &m.bf16, x, list, bases, stride, bias, use_bias, add, rows, cols, tiles);
+  }
+  return;
+}
+
+// ------------------------------------------------------------------ the other kernels ---
+
+/// x[t] = row tokens[t] of `table`, for t below n.
+fn pf_embed(x : &mut Tensor<f32, [?, ?], Memory::HBM>, table : &Tensor<bf16, [?], Memory::HBM>, tokens : &Tensor<i32, [?], Memory::HBM>, n : i32, dim : i32) -> void {
+  let rows = table.len() / dim;
+  spawn on(Topology::Device) {
+    for t in 0..n across blocks {
+      for b in 0..(dim + 255) / 256 across blocks {
+        for l in 0..256 across lanes {
+          let i = b * 256 + l;
+          if i < dim {
+            let token = tokens[t];
+            assert(token >= 0 && token < rows, "pf_embed: a token is not a row of the table");
+            x[t][i] = table[token * dim + i] as f32;
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// y[t] = the RMSNorm of x[t] times w, as `nn_rms_norm`, for t below n.
+fn pf_rms_norm(y : &mut Tensor<f32, [?, ?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<bf16, [?], Memory::HBM>, n : i32, dim : i32, eps : f32) -> void {
+  spawn on(Topology::Device) {
+    for t in 0..n across blocks {
+      let mut part = unsafe { Tensor<f32, [1024], Memory::SMEM>::uninit() };
+      for l in 0..1024 across lanes {
+        let mut s : f32 = 0.0;
+        let mut i = l;
+        while i < dim {
+          s = s + x[t][i] * x[t][i];
+          i = i + 1024;
+        }
+        part[l] = s;
+      }
+      let ss = lanes::sum(&part, 1024);
+      let inv = 1.0 / (ss / (dim as f32) + eps).sqrt();
+      for l in 0..1024 across lanes {
+        for j in 0..(dim + 1023) / 1024 {
+          let i = j * 1024 + l;
+          if i < dim {
+            y[t][i] = x[t][i] * inv * (w[i] as f32);
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// RoPE for the tokens of the chunk, as `nn_rope_and_store`: token t is at position start + t.
+/// The heads of q, k and v are one after another in qkv[t].
+fn pf_rope_and_store(q_out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, v_cache : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, qkv : &Tensor<f32, [?, ?], Memory::HBM>, cos : &Tensor<f32, [?, ?], Memory::HBM>, sin : &Tensor<f32, [?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+  assert(start + n <= k_cache.extent(0) && start + n <= cos.extent(0), "pf_rope_and_store: the chunk goes past the end of the KV cache");
+  let half = head_dim / 2;
+  spawn on(Topology::Device) {
+    for t in 0..n across blocks {
+      for h in 0..q_heads + kv_heads across blocks {
+        for i in 0..128 across lanes {
+          if i < head_dim {
+            let mut j = i;
+            let mut sign : f32 = -1.0;
+            let mut partner = i + half;
+            if i >= half {
+              j = i - half;
+              sign = 1.0;
+              partner = i - half;
+            }
+            let pos = start + t;
+            let c = cos[pos][j];
+            let s = sin[pos][j];
+            let base = h * head_dim;
+            if h < q_heads {
+              q_out[t][h][i] = qkv[t][base + i] * c + sign * qkv[t][base + partner] * s;
+            } else {
+              k_cache[start + t][h - q_heads][i] = qkv[t][base + i] * c + sign * qkv[t][base + partner] * s;
+              v_cache[start + t][h - q_heads][i] = qkv[t][base + kv_heads * head_dim + i];
+            }
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// As `pf_rope_and_store`, after the RMSNorm of each head of q and k, as `nn_norm_rope_and_store`.
+fn pf_norm_rope_and_store(q_out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, v_cache : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, qkv : &Tensor<f32, [?, ?], Memory::HBM>, q_norm : &Tensor<bf16, [?], Memory::HBM>, k_norm : &Tensor<bf16, [?], Memory::HBM>, cos : &Tensor<f32, [?, ?], Memory::HBM>, sin : &Tensor<f32, [?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32, head_dim : i32, eps : f32) -> void {
+  assert(start + n <= k_cache.extent(0) && start + n <= cos.extent(0), "pf_norm_rope_and_store: the chunk goes past the end of the KV cache");
+  let half = head_dim / 2;
+  spawn on(Topology::Device) {
+    for t in 0..n across blocks {
+      for h in 0..q_heads + kv_heads across blocks {
+        let mut x = unsafe { Tensor<f32, [128], Memory::SMEM>::uninit() };
+        let mut part = unsafe { Tensor<f32, [128], Memory::SMEM>::uninit() };
+        for i in 0..128 across lanes {
+          let mut a : f32 = 0.0;
+          if i < head_dim {
+            a = qkv[t][h * head_dim + i];
+          }
+          x[i] = a;
+          part[i] = a * a;
+        }
+        let ss = lanes::sum(&part, 128);
+        let inv = 1.0 / (ss / (head_dim as f32) + eps).sqrt();
+        for i in 0..128 across lanes {
+          if i < head_dim {
+            let mut j = i;
+            let mut sign : f32 = -1.0;
+            let mut partner = i + half;
+            if i >= half {
+              j = i - half;
+              sign = 1.0;
+              partner = i - half;
+            }
+            let pos = start + t;
+            let c = cos[pos][j];
+            let s = sin[pos][j];
+            if h < q_heads {
+              let a = x[i] * inv * (q_norm[i] as f32);
+              let b = x[partner] * inv * (q_norm[partner] as f32);
+              q_out[t][h][i] = a * c + sign * b * s;
+            } else {
+              let a = x[i] * inv * (k_norm[i] as f32);
+              let b = x[partner] * inv * (k_norm[partner] as f32);
+              k_cache[start + t][h - q_heads][i] = a * c + sign * b * s;
+              v_cache[start + t][h - q_heads][i] = qkv[t][(h + kv_heads) * head_dim + i];
+            }
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// Attention of each token of the chunk over the positions up to its own, as `nn_attention`. Token
+/// t is at position start + t. A block does the query heads of one key-value head g, at most 8,
+/// so it reads each row of the cache once for all of them. Query head g * group + j of token t
+/// goes to out[t][g][j], and its scores to scores[t][g][j].
+fn pf_attention(out : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, scores : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f32, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f32, [?, ?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+  assert(q_heads % kv_heads == 0 && q_heads / kv_heads <= 8, "pf_attention: q_heads must be a multiple of kv_heads, and at most 8 times it");
+  let group = q_heads / kv_heads;
+  assert(scores.extent(3) >= start + n && start + n <= k_cache.extent(0), "pf_attention: `scores` needs start + n values for each token and head");
+  let scale = 1.0 / (head_dim as f32).sqrt();
+  spawn on(Topology::Device) {
+    for t in 0..n across blocks {
+      for g in 0..kv_heads across blocks {
+        let mut qs = unsafe { Tensor<f32, [8, 128], Memory::SMEM>::uninit() };
+        let mut part = unsafe {
+          Tensor<f32, [8, 128], Memory::SMEM>::uninit()
+        };
+        let mut sums = unsafe {
+          Tensor<f32, [8, 128], Memory::SMEM>::uninit()
+        };
+        let pos = start + t;
+        for l in 0..128 across lanes {
+          for j in 0..group {
+            if l < head_dim {
+              qs[j][l] = q[t][g * group + j][l] * scale;
+            }
+          }
+        }
+        // The score of each position, and the largest score of the lane, for each head.
+        for l in 0..128 across lanes {
+          let mut m = unsafe { Tensor<f32, [8]>::uninit() };
+          for j in 0..8 {
+            m[j] = -3.0e38;
+          }
+          for b in 0..(pos + 128) / 128 {
+            let p = b * 128 + l;
+            if p <= pos {
+              let mut acc = unsafe { Tensor<f32, [8]>::uninit() };
+              for j in 0..8 {
+                acc[j] = 0.0;
+              }
+              for d in 0..head_dim {
+                let kd = k_cache[p][g][d];
+                for j in 0..group {
+                  acc[j] = acc[j] + qs[j][d] * kd;
+                }
+              }
+              for j in 0..8 {
+                if j < group {
+                  scores[t][g][j][p] = acc[j];
+                  m[j] = m[j].max(acc[j]);
+                }
+              }
+            }
+          }
+          for j in 0..group {
+            part[j][l] = m[j];
+          }
+        }
+        // e^(score - the largest score of the head), and the sum of the lane.
+        for l in 0..128 across lanes {
+          for j in 0..8 {
+            if j < group {
+              let mut m : f32 = -3.0e38;
+              for i in 0..128 {
+                m = m.max(part[j][i]);
+              }
+              let mut sum : f32 = 0.0;
+              for b in 0..(pos + 128) / 128 {
+                let p = b * 128 + l;
+                if p <= pos {
+                  let e = (scores[t][g][j][p] - m).fast_exp();
+                  scores[t][g][j][p] = e;
+                  sum = sum + e;
+                }
+              }
+              sums[j][l] = sum;
+            }
+          }
+        }
+        for l in 0..128 across lanes {
+          if l < head_dim {
+            let mut acc = unsafe { Tensor<f32, [8]>::uninit() };
+            for j in 0..8 {
+              acc[j] = 0.0;
+            }
+            for p in 0..pos + 1 {
+              let vd = v_cache[p][g][l];
+              for j in 0..group {
+                acc[j] = acc[j] + scores[t][g][j][p] * vd;
+              }
+            }
+            let mut total = unsafe { Tensor<f32, [8]>::uninit() };
+            for j in 0..8 {
+              total[j] = 1.0;
+              if j < group {
+                let mut sum : f32 = 0.0;
+                for i in 0..128 {
+                  sum = sum + sums[j][i];
+                }
+                total[j] = sum;
+              }
+            }
+            for j in 0..8 {
+              if j < group {
+                out[t][g][j][l] = acc[j] / total[j];
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// y[t] = the query heads of x[t] one after another, for t below n: the input of the output
+/// projection. Head g * group + j is x[t][g][j], as `pf_attention` writes it.
+fn pf_flatten_heads(y : &mut Tensor<f32, [?, ?], Memory::HBM>, x : &Tensor<f32, [?, ?, ?, ?], Memory::HBM>, n : i32, heads : i32, group : i32, head_dim : i32) -> void {
+  let dim = heads * head_dim;
+  spawn on(Topology::Device) {
+    for t in 0..n across blocks {
+      for b in 0..(dim + 255) / 256 across blocks {
+        for l in 0..256 across lanes {
+          let i = b * 256 + l;
+          if i < dim {
+            let h = i / head_dim;
+            y[t][i] = x[t][h / group][h % group][i % head_dim];
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// out[r][i] = silu(gu[r][i]) * gu[r][rows + i], for r below n: the SwiGLU of each row.
+fn pf_silu_mul(out : &mut Tensor<f32, [?, ?], Memory::HBM>, gu : &Tensor<f32, [?, ?], Memory::HBM>, n : i32, rows : i32) -> void {
+  spawn on(Topology::Device) {
+    for r in 0..n across blocks {
+      for b in 0..(rows + 255) / 256 across blocks {
+        for l in 0..256 across lanes {
+          let i = b * 256 + l;
+          if i < rows {
+            let g = gu[r][i];
+            out[r][i] = g / (1.0 + (0.0 - g).fast_exp()) * gu[r][rows + i];
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// The experts of each token of the chunk, as `nn_top_k` does for one token.
+fn pf_top_k(ids : &mut Tensor<i32, [?, ?], Memory::HBM>, weights : &mut Tensor<f32, [?, ?], Memory::HBM>, logits : &Tensor<f32, [?, ?], Memory::HBM>, n_tokens : i32, n : i32, k : i32) -> void {
+  assert(n > 0 && n <= 256 && k > 0 && k <= n, "pf_top_k: n must be 1 to 256, and k must be 1 to n");
+  spawn on(Topology::Device) {
+    for t in 0..n_tokens across blocks {
+      let mut keys = unsafe { Tensor<i64, [256], Memory::SMEM>::uninit() };
+      for l in 0..256 across lanes {
+        if l < n {
+          let bits = logits[t][l].to_bits() as i32;
+          let mut order = bits;
+          if bits < 0 {
+            order = bits ^ 2147483647;
+          }
+          keys[l] = (order as i64) * 4294967296 + ((255 - l) as i64);
+        }
+      }
+      lanes::sort_descending(&mut keys, n);
+      for l in 0..256 across lanes {
+        if l < k {
+          let m = logits[t][255 - ((keys[0] & 255) as i32)];
+          let mut total : f32 = 0.0;
+          for j in 0..k {
+            total = total + (logits[t][255 - ((keys[j] & 255) as i32)] - m).fast_exp();
+          }
+          let id = 255 - ((keys[l] & 255) as i32);
+          ids[t][l] = id;
+          weights[t][l] = (logits[t][id] - m).fast_exp() / total;
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// x[t] += the sum over j of weights[t][j] * out[slot[t][j]], for t below n: the experts of each
+/// token, each times its weight, in the order of j.
+fn pf_combine(x : &mut Tensor<f32, [?, ?], Memory::HBM>, out : &Tensor<f32, [?, ?], Memory::HBM>, weights : &Tensor<f32, [?, ?], Memory::HBM>, slot : &Tensor<i32, [?, ?], Memory::HBM>, n : i32, k : i32, dim : i32) -> void {
+  spawn on(Topology::Device) {
+    for t in 0..n across blocks {
+      for b in 0..(dim + 255) / 256 across blocks {
+        for l in 0..256 across lanes {
+          let i = b * 256 + l;
+          if i < dim {
+            let mut s : f32 = 0.0;
+            for j in 0..k {
+              s = s + weights[t][j] * out[slot[t][j]][i];
+            }
+            x[t][i] = x[t][i] + s;
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// y = x[t], a row of the chunk.
+fn pf_take_row(y : &mut Tensor<f32, [?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, t : i32, dim : i32) -> void {
+  spawn on(Topology::Device) {
+    for b in 0..(dim + 255) / 256 across blocks {
+      for l in 0..256 across lanes {
+        let i = b * 256 + l;
+        if i < dim {
+          y[i] = x[t][i];
+        }
+      }
+    }
+  }
+  return;
+}
+
+// -------------------------------------------------------------------------- the chunk ---
+
+/// Sorts the choices of the chunk by expert, on the CPU: the tokens of expert e come after those
+/// of expert e - 1, in the order of the tokens, and padding with -1 makes each expert a whole
+/// number of tiles of 16. Gives the number of tiles.
+fn sort_by_expert(p : &mut Prefill, n : i32, k : i32, experts : i32) -> i32 {
+  let ids = transfer(&p.ids, Memory::CPU_DRAM);
+  let positions = p.e_rows.len();
+  let mut rows = Tensor<i32>([positions]);
+  let mut bases = Tensor<i32>([positions / 16]);
+  let mut slot = Tensor<i32>([p.chunk, k]);
+  let mut at = 0;
+  for e in 0..experts {
+    let first = at;
+    for t in 0..n {
+      for j in 0..k {
+        if ids[t][j] == e {
+          rows[at] = t;
+          slot[t][j] = at;
+          at = at + 1;
+        }
+      }
+    }
+    while at % 16 != 0 {
+      rows[at] = -1;
+      at = at + 1;
+    }
+    let mut b = first / 16;
+    while b < at / 16 {
+      bases[b] = e;
+      b = b + 1;
+    }
+  }
+  assert(at <= positions, "sort_by_expert: more positions than the chunk has");
+  p.e_rows = transfer(rows, Memory::HBM);
+  p.e_bases = transfer(bases, Memory::HBM);
+  p.slot = transfer(slot, Memory::HBM);
+  return at / 16;
+}
+
+/// The mixture of experts of a layer, for the n tokens of the chunk: x += the experts of each
+/// token, for the norm of x in xn.
+fn pf_experts(p : &mut Prefill, layer : &Layer, c : &Config, n : i32, tiles : i32) -> void {
+  let k = c.experts_per_token;
+  let inter = c.moe_intermediate_size;
+  pf_mm_bf16(&mut p.router, &layer.router, &p.xn, &p.rows, &p.zeros, 0, &p.no_bias, false, false, c.num_experts, c.hidden_size, tiles);
+  pf_top_k(&mut p.ids, &mut p.wts, &p.router, n, c.num_experts, k);
+  let e_tiles = sort_by_expert(p, n, k, c.num_experts);
+  pf_mm(&mut p.e_gu, &layer.gate_up, &p.xn, &p.e_rows, &p.e_bases, 2 * inter, &p.no_bias, false, false, 2 * inter, c.hidden_size, e_tiles);
+  pf_silu_mul(&mut p.e_h, &p.e_gu, e_tiles * 16, inter);
+  pf_mm(&mut p.e_out, &layer.down, &p.e_h, &p.e_ident, &p.e_bases, c.hidden_size, &p.no_bias, false, false, c.hidden_size, inter, e_tiles);
+  pf_combine(&mut p.x, &p.e_out, &p.wts, &p.slot, n, k, c.hidden_size);
+  return;
+}
+
+/// Runs tokens start to start + n - 1 of the prompt, in `p.tokens`, through every layer. Their
+/// keys and values go to the caches, and their hidden states to p.x.
+fn pf_chunk(w : &Weights, s : &mut State, p : &mut Prefill, start : i32, n : i32) -> void {
+  let c = &w.config;
+  let eps = c.rms_norm_eps as f32;
+  let tiles = (n + 15) / 16;
+  let qkv_rows = (c.num_q_heads + 2 * c.num_kv_heads) * c.head_dim;
+  pf_embed(&mut p.x, &w.embed, &p.tokens, n, c.hidden_size);
+  let mut l = 0;
+  for cache in s.caches.iter_mut() {
+    let layer = &w.layers[l];
+    pf_rms_norm(&mut p.xn, &p.x, &layer.attn_norm, n, c.hidden_size, eps);
+    pf_mm(&mut p.qkv, &layer.qkv, &p.xn, &p.rows, &p.zeros, 0, &layer.qkv_bias, true, false, qkv_rows, c.hidden_size, tiles);
+    if c.qk_norm {
+      pf_norm_rope_and_store(&mut p.q, &mut cache.k, &mut cache.v, &p.qkv, &layer.q_norm, &layer.k_norm, &s.cos, &s.sin, start, n, c.num_q_heads, c.num_kv_heads, c.head_dim, eps);
+    } else {
+      pf_rope_and_store(&mut p.q, &mut cache.k, &mut cache.v, &p.qkv, &s.cos, &s.sin, start, n, c.num_q_heads, c.num_kv_heads, c.head_dim);
+    }
+    pf_attention(&mut p.heads, &mut p.scores, &p.q, &cache.k, &cache.v, start, n, c.num_q_heads, c.num_kv_heads, c.head_dim);
+    pf_flatten_heads(&mut p.att, &p.heads, n, c.num_q_heads, c.num_q_heads / c.num_kv_heads, c.head_dim);
+    pf_mm(&mut p.x, &layer.attn_out, &p.att, &p.rows, &p.zeros, 0, &p.no_bias, false, true, c.hidden_size, c.num_q_heads * c.head_dim, tiles);
+    pf_rms_norm(&mut p.xn, &p.x, &layer.mlp_norm, n, c.hidden_size, eps);
+    if c.num_experts > 0 {
+      pf_experts(p, layer, c, n, tiles);
+    } else {
+      pf_mm(&mut p.gu, &layer.gate_up, &p.xn, &p.rows, &p.zeros, 0, &p.no_bias, false, false, 2 * c.intermediate_size, c.hidden_size, tiles);
+      pf_silu_mul(&mut p.h, &p.gu, n, c.intermediate_size);
+      pf_mm(&mut p.x, &layer.down, &p.h, &p.rows, &p.zeros, 0, &p.no_bias, false, true, c.hidden_size, c.intermediate_size, tiles);
+    }
+    l = l + 1;
+  }
+  return;
+}
+
+/// Runs the prompt through every layer, in chunks of up to `chunk` tokens. The hidden state of its
+/// last token is then in `s.x`, as after `run_layers`, so `predict` gives the first new token.
+fn prefill_in_chunks(w : &Weights, s : &mut State, prompt : &Vec<i32>, chunk : i32) -> void {
+  let c = &w.config;
+  let count = prompt.len();
+  assert(count > 0 && count <= s.max_seq, "prefill: the prompt must have 1 to max_seq tokens");
+  let mut p = new_prefill(c, s.max_seq, chunk);
+  let mut start = 0;
+  let mut last = 0;
+  while start < count {
+    let n = i32::min(chunk, count - start);
+    let mut tokens = Tensor<i32>([chunk]);
+    let mut rows = Tensor<i32>([chunk]);
+    for t in 0..chunk {
+      if t < n {
+        tokens[t] = prompt[start + t];
+        rows[t] = t;
+      } else {
+        tokens[t] = 0;
+        rows[t] = -1;
+      }
+    }
+    p.tokens = transfer(tokens, Memory::HBM);
+    p.rows = transfer(rows, Memory::HBM);
+    pf_chunk(w, s, &mut p, start, n);
+    last = n;
+    start = start + n;
+  }
+  pf_take_row(&mut s.x, &p.x, last - 1, c.hidden_size);
+  return;
+}
+
+/// `prefill_in_chunks` with chunks of up to CHUNK tokens, or fewer for a shorter prompt.
+fn prefill(w : &Weights, s : &mut State, prompt : &Vec<i32>) -> void {
+  let chunk = i32::min(CHUNK, (prompt.len() + 15) / 16 * 16);
+  prefill_in_chunks(w, s, prompt, chunk);
+  return;
+}

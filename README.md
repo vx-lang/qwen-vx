@@ -240,17 +240,51 @@ A token took 28.0 ms in Vx with the cheaper kernel launches of
 and 24.3 ms in llama.cpp. Each token runs about 477 kernels. The details are in
 [#6](https://github.com/vx-lang/qwen-vx/issues/6#issuecomment-6879596324).
 
+## The prompt in chunks
+
+A generated token reads every weight that it uses, so it waits for memory. The prompt has all its
+tokens at the start, so the program runs it in chunks of up to 256 tokens. A chunk reads each
+weight once for all its tokens. `src/prefill.vx` has the kernels of a chunk:
+
+- One product for each weight format. A block decodes 128 rows of the matrix and 32 columns at a
+  time into shared memory, and multiplies them with the inputs of 16 tokens, with a matmul of
+  tiles (`@`).
+- For the experts of a MoE layer, the CPU sorts the tokens of the chunk by expert. Then a tile of
+  16 tokens reads the weights of one expert.
+- Attention as `nn_attention`, with one block for each token and key-value head. The block reads
+  the cache once for all the query heads of that key-value head.
+
+The time of each prompt token, on an M4 with 32 GB, with the prompt as the first tokens of this
+README:
+
+| Model | Prompt | One token at a time | In chunks |
+| --- | --- | --- | --- |
+| Qwen2.5-Coder-0.5B-Instruct, bf16 | 600 tokens | 11.1 ms | 1.26 ms |
+| Qwen3-Coder-30B-A3B-Instruct, Q4_0 | 1000 tokens | 46.7 ms | 16.7 ms |
+
+Both ways chose the same tokens after the prompt. On the 0.5B model, `compare.py` compared 32 steps
+with `reference.py`, and the largest logit difference was 5.3e-05. On the 30B model, the products
+of the experts take about two thirds of the time of a chunk. A newer Vx, whose `@` uses the
+simdgroup matrices of Metal, ran the same prompt at 16.2 ms a token. So the decoding of the
+weights, and not the multiplication, limits these products.
+
+`tests/prefill.vx` runs a prompt of 40 tokens through each tiny model one token at a time, and in
+chunks of 16 tokens. The logits of the last token must be within 0.0001, and the next 8 tokens
+equal.
+
 ## The Vx code
 
 | File | What it does |
 | --- | --- |
 | `src/weights.vx` | Loads a weight file into GPU memory, for the kernels of `std::nn`. |
 | `src/model.vx` | Makes the tensors and the KV cache once, and runs one token through all layers. |
+| `src/prefill.vx` | Runs the prompt through all layers in chunks of tokens. |
 | `src/tokenizer.vx` | Turns text into token ids and token ids into text, with a tokenizer file. |
 | `src/main.vx` | Generates tokens with greedy decoding, and prints text or the lines of `reference.py`. |
 
-A program imports the modules as `qwen::weights`, `qwen::model` and `qwen::tokenizer`, with
-`vxc --package qwen=src`. A program in another folder names the `src` folder of this repository.
+A program imports the modules as `qwen::weights`, `qwen::model`, `qwen::prefill` and
+`qwen::tokenizer`, with `vxc --package qwen=src`. A program in another folder names the `src`
+folder of this repository.
 
 The tests are in `tests/`. They need a Python 3 that has NumPy and ml_dtypes, and `FileCheck` from
 LLVM or the Python port (`pip install numpy ml_dtypes filecheck`). `tests/run.sh` takes `vxc` and the
