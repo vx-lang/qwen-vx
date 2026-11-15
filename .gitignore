@@ -1,3 +1,4 @@
 # Weight files and the output of the tests
 *.vxw
 __pycache__/
+.venv/
