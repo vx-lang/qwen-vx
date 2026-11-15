@@ -7,7 +7,8 @@
 // line, separated by commas. IDS holds one line of comma-separated ids for each text, and the
 // program writes the bytes of each line's tokens, each text followed by a NUL byte.
 // `scripts/test_tokenizer.py` compares both with the `tokenizers` package. The RUN lines check a
-// tiny tokenizer against the ids that `tokenizers` gave for it.
+// tiny tokenizer against the ids that `tokenizers` gave for it. The decoded bytes have NUL bytes,
+// so `grep -a` reads them as text: GNU grep prints no line of an input that it takes as binary.
 //
 // RUN: python3 %S/../scripts/make_tiny_tokenizer.py %t.json > /dev/null
 // RUN: python3 %S/../scripts/convert_tokenizer.py %t.json %t.vxt > /dev/null
