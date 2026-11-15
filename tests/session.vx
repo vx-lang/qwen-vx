@@ -1,0 +1,24 @@
+//===- session.vx - Qwen app ------------------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// Runs a conversation of three turns with `scripts/chat.py --check`, which drives a session of
+// `src/main.vx`. Each turn must give the text of a fresh run of the same prompt, and the second
+// and third turns must reuse the KV cache of the turns before them. A cache saved after the second
+// turn must give the third turn the same text in a new session. The tiny model has the 404 tokens
+// of the tiny tokenizer, so that it can take text.
+//
+// RUN: python3 %S/../scripts/make_tiny_model.py --vocab-size 404 --max-positions 1024 %t.vxw > /dev/null
+// RUN: python3 %S/../scripts/make_tiny_tokenizer.py %t.json > /dev/null
+// RUN: python3 %S/../scripts/convert_tokenizer.py %t.json %t.vxt > /dev/null
+// RUN: python3 %S/../scripts/chat.py %t.vxw %t.vxt --context 512 --check | FileCheck %s
+//
+// CHECK: {{^}}turn 1: prompt {{[0-9]+}} tokens, reused False, same text as a fresh run: True{{$}}
+// CHECK: {{^}}turn 2: prompt {{[0-9]+}} tokens, reused True, same text as a fresh run: True{{$}}
+// CHECK: {{^}}saved: True{{$}}
+// CHECK: {{^}}turn 3: prompt {{[0-9]+}} tokens, reused True, same text as a fresh run: True{{$}}
+// CHECK: {{^}}loaded: True{{$}}
+// CHECK: {{^}}turn 3 after the load: reused True, same text as the first session: True{{$}}

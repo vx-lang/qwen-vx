@@ -842,35 +842,44 @@ fn pf_chunk(w : &Weights, s : &mut State, p : &mut Prefill, start : i32, n : i32
   return;
 }
 
-/// Runs the prompt through every layer, in chunks of up to `chunk` tokens. The hidden state of its
-/// last token is then in `s.x`, as after `run_layers`, so `predict` gives the first new token.
-fn prefill_in_chunks(w : &Weights, s : &mut State, prompt : &Vec<i32>, chunk : i32) -> void {
+/// Runs tokens `first` to the end of `tokens` through every layer, in chunks of up to `p.chunk`
+/// tokens. Token i goes to position i of the KV cache, so the cache must already hold the rows of
+/// positions below `first`. The hidden state of the last token is then in `s.x`, as after
+/// `run_layers`, so `predict` gives the next token.
+fn run_prompt(w : &Weights, s : &mut State, p : &mut Prefill, tokens : &Vec<i32>, first : i32) -> void {
   let c = &w.config;
-  let count = prompt.len();
-  assert(count > 0 && count <= s.max_seq, "prefill: the prompt must have 1 to max_seq tokens");
-  let mut p = new_prefill(c, s.max_seq, chunk);
-  let mut start = 0;
+  let count = tokens.len();
+  assert(first >= 0 && first < count && count <= s.max_seq, "run_prompt: the tokens must end after `first` and fit in the KV cache");
+  let chunk = p.chunk;
+  let mut start = first;
   let mut last = 0;
   while start < count {
     let n = i32::min(chunk, count - start);
-    let mut tokens = Tensor<i32>([chunk]);
+    let mut ids = Tensor<i32>([chunk]);
     let mut rows = Tensor<i32>([chunk]);
     for t in 0..chunk {
       if t < n {
-        tokens[t] = prompt[start + t];
+        ids[t] = tokens[start + t];
         rows[t] = t;
       } else {
-        tokens[t] = 0;
+        ids[t] = 0;
         rows[t] = -1;
       }
     }
-    p.tokens = transfer(tokens, Memory::HBM);
+    p.tokens = transfer(ids, Memory::HBM);
     p.rows = transfer(rows, Memory::HBM);
-    pf_chunk(w, s, &mut p, start, n);
+    pf_chunk(w, s, p, start, n);
     last = n;
     start = start + n;
   }
   pf_take_row(&mut s.x, &p.x, last - 1, c.hidden_size);
+  return;
+}
+
+/// Runs the prompt through every layer, in chunks of up to `chunk` tokens, from position 0.
+fn prefill_in_chunks(w : &Weights, s : &mut State, prompt : &Vec<i32>, chunk : i32) -> void {
+  let mut p = new_prefill(&w.config, s.max_seq, chunk);
+  run_prompt(w, s, &mut p, prompt, 0);
   return;
 }
 
