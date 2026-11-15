@@ -9,8 +9,8 @@ This program runs Qwen coder models on the GPU of an Apple Silicon Mac. It is wr
 
 The plan and its milestones are in [#5](https://github.com/vx-lang/qwen-vx/issues/5). Milestones 1
 to 6 are done. The MoE model was milestone 6,
-[#6](https://github.com/vx-lang/qwen-vx/issues/6). Milestone 7 adds a tokenizer in Vx and runs the
-prompt on the GPU in batches of tokens.
+[#6](https://github.com/vx-lang/qwen-vx/issues/6). Milestone 7 added a tokenizer in Vx, and runs the
+prompt on the GPU in chunks of tokens.
 
 The program generates tokens with greedy decoding. Its tokenizer is also in Vx, so the prompt can
 be text or token ids, and the program prints text or token ids.
@@ -278,6 +278,28 @@ weights, and not the multiplication, limits these products.
 chunks of 16 tokens. The logits of the last token must be within 0.0001, and the next 8 tokens
 equal.
 
+## Long contexts
+
+A generated token attends to every position before it. The `nn_attention` of Vx v0.0.4 has one
+block for each query head, so its time grows with the number of positions. The `nn_attention` of
+Vx main splits the positions among blocks
+([vx-lang/Vx#3216](https://github.com/vx-lang/Vx/pull/3216)). `src/attention.vx` is a copy of it,
+until a Vx release has it ([#4](https://github.com/vx-lang/qwen-vx/issues/4)).
+
+The time of a generated token of Qwen3-Coder-30B-A3B in Q4_0, on an M4 with 32 GB, after a prompt
+of the first tokens of this README:
+
+| Positions | One block for each head | Positions split among blocks |
+| --- | --- | --- |
+| 5 | 26.7 ms | 25.4 ms |
+| 1000 | 40.7 ms | 27.5 ms |
+| 2000 | 57.3 ms | 30.8 ms |
+
+Both chose the same tokens. On Qwen2.5-Coder-0.5B, 100 tokens after a prompt of 600 went past
+position 640, where a block takes 64 positions in place of 32. `compare.py` gave the same tokens
+as `reference.py`, with each logit within 5.3e-05. `tests/generate.vx` also runs the tiny models
+with 1024 positions after a prompt of 700 tokens.
+
 ## The Vx code
 
 | File | What it does |
@@ -285,12 +307,13 @@ equal.
 | `src/weights.vx` | Loads a weight file into GPU memory, for the kernels of `std::nn`. |
 | `src/model.vx` | Makes the tensors and the KV cache once, and runs one token through all layers. |
 | `src/prefill.vx` | Runs the prompt through all layers in chunks of tokens. |
+| `src/attention.vx` | The attention of a generated token, with the positions split among blocks. |
 | `src/tokenizer.vx` | Turns text into token ids and token ids into text, with a tokenizer file. |
 | `src/main.vx` | Generates tokens with greedy decoding, and prints text or the lines of `reference.py`. |
 
-A program imports the modules as `qwen::weights`, `qwen::model`, `qwen::prefill` and
-`qwen::tokenizer`, with `vxc --package qwen=src`. A program in another folder names the `src`
-folder of this repository.
+A program imports the modules as `qwen::weights`, `qwen::model`, `qwen::attention`,
+`qwen::prefill` and `qwen::tokenizer`, with `vxc --package qwen=src`. A program in another folder
+names the `src` folder of this repository.
 
 The tests are in `tests/`. They need a Python 3 that has NumPy and ml_dtypes, and `FileCheck` from
 LLVM or the Python port (`pip install numpy ml_dtypes filecheck`). `tests/run.sh` takes `vxc` and the
