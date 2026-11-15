@@ -15,6 +15,7 @@
 // RUN: vxc %s --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t.vxt %t.texts | FileCheck %s
 // RUN: vxc %s --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t.vxt %t.texts | grep -v '^\[JIT\]' | sed '/^texts=/,$d' > %t.ids
 // RUN: vxc %s --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t.vxt %t.ids --decode | grep -v '^\[JIT\]' > %t.decoded
+// RUN: echo IDS; od -c %t.ids | head -8; echo DECODED; od -c %t.decoded | head -8; echo RAW; vxc %s --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t.vxt %t.ids --decode 2>&1 | od -c | tail -12; false
 // RUN: python3 %S/../scripts/make_tiny_tokenizer.py --check-decoded %t.decoded | FileCheck %s --check-prefix=DECODE
 //
 // The ids that the `tokenizers` package gave for the texts of `make_tiny_tokenizer.py --texts`:
