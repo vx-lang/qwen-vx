@@ -1,10 +1,16 @@
 # Qwen coder models in Vx
 
 This program runs Qwen coder models on the GPU of an Apple Silicon Mac. It is written in
-[Vx](https://github.com/vx-lang/Vx), and it uses the GPU kernels of Vx's `std::nn`. The plan and its milestones are in [#5](https://github.com/vx-lang/qwen-vx/issues/5). The
-mixture-of-experts (MoE) model Qwen3-Coder-30B-A3B is the next milestone,
-[#6](https://github.com/vx-lang/qwen-vx/issues/6). The Vx program runs it in Q4_0, as the section
-on the MoE model below shows.
+[Vx](https://github.com/vx-lang/Vx), and it uses the GPU kernels of Vx's `std::nn`. It runs:
+
+- The dense Qwen2.5-Coder models, such as 0.5B and 7B, with bf16, fp8 or Q4_0 weights.
+- The mixture-of-experts (MoE) model Qwen3-Coder-30B-A3B-Instruct, in Q4_0, as the section on the
+  MoE model below shows.
+
+The plan and its milestones are in [#5](https://github.com/vx-lang/qwen-vx/issues/5). Milestones 1
+to 6 are done. The MoE model was milestone 6,
+[#6](https://github.com/vx-lang/qwen-vx/issues/6). Milestone 7 adds a tokenizer in Vx and runs the
+prompt on the GPU in batches of tokens.
 
 The program generates tokens with greedy decoding, from a prompt given as token ids. A tokenizer
 in Vx comes later, so `reference.py` turns text into token ids for now.
