@@ -18,6 +18,39 @@ kind of program, with their programs, which are tests of the Vx compiler.
 Made from the book of vx-lang/Vx at v0.0.4.
 <!-- guides: end -->
 
+## Choose one guide
+
+This part is for an agent that starts a session for a user. Load one guide, not more. Each guide
+starts with the same rules and the same two chapters, about 5,400 tokens, so one guide is enough to
+write correct Vx. A second guide adds its tokens to the first run and to the KV cache, and repeats
+those 5,400 tokens.
+
+Read the request of the user, and use the first row that matches:
+
+| The program has | Load |
+| --- | --- |
+| Kernels or code on the GPU: blocks, lanes, tiles, shared memory, a matmul with `@`, Metal | [`vx-gpu.md`](vx-gpu.md) |
+| Tasks that run at the same time, channels, a producer and a consumer | [`vx-tasks.md`](vx-tasks.md) |
+| Tensor operations, f16, bf16 or other small numbers, gradients | [`vx-tensors.md`](vx-tensors.md) |
+| `unsafe` code, pointers, C functions, files, standard input, the clock | [`vx-unsafe.md`](vx-unsafe.md) |
+| None of the above: structs, enums, traits, generics, errors, ownership | [`vx-basics.md`](vx-basics.md) |
+
+The order of the rows is the order of difficulty: the first rows teach the parts of Vx that are
+most different from Rust. When a program has two kinds of code, for example a GPU kernel that
+reads a file, use the first row that matches. The errors of vxc teach the model the rest.
+
+To keep the memory of the Mac free for the model:
+
+- Run one session of the model at a time. Each session loads the 17.8 GB of weights. Two sessions
+  on a Mac with 32 GB make it swap, and then each token takes two times as long or more.
+- Before a session, look at the free memory with `memory_pressure | tail -1`. The weights and the
+  KV cache must fit in it. If they do not fit, tell the user, and do not start the session.
+- Keep one cache file for each guide, with the name of the guide (for example `vx-gpu.kv`), and use
+  it again for each question. Do not make a cache file for each question.
+- Do not set `--context` larger than you need. The KV cache in memory grows with it (see below).
+- For a new program, start a new session. It loads the cache file in a few seconds, and the tokens
+  of the old program do not fill the context.
+
 ## Use a guide
 
 Run a session with the guide as the system prompt, and a file for its KV cache:
