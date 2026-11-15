@@ -1,0 +1,1 @@
+Write a complete C++17 program that counts the prime numbers below 1000000 with 4 std::thread workers. Split the range into 4 equal parts, let each thread count the primes in its part by trial division, and add the counts into a std::atomic<int>. Print only the total count. Reply with only the code, in one ```cpp block.
