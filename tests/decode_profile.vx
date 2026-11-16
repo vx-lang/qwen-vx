@@ -1,0 +1,12 @@
+//===- decode_profile.vx - Qwen app -----------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// Compiles decode/profile_decode.vx with the modules of src/, so that a change to src/ that breaks
+// the profiler fails here. The profiler needs the weights of the 30B model to run, so this test
+// only compiles it.
+//
+// RUN: vxc %S/../decode/profile_decode.vx --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx --action emit-mlir > /dev/null
