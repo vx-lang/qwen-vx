@@ -1,0 +1,188 @@
+//===- profile_decode.vx - Qwen app -----------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// Profiles a generated token by subtraction: the time of a token with each part of a layer left
+// out, after a warm-up. `skip` is a mask of the parts to leave out. The results of a run with a
+// part left out are wrong, but its time shows the cost of that part. See README.md.
+//
+//   vxc decode/profile_decode.vx --package qwen=src --host default \
+//       --machine ~/.vx/current/fleet/m4-uma.vx -- qwen3-30b-q4.vxw
+import core::convert;
+import std::nn;
+import std::time;
+import std::vec;
+import qwen::attention;
+import qwen::weights;
+import qwen::model;
+import qwen::prefill;
+
+const NORMS : i32 = 1;
+const QKV : i32 = 2;
+const ROPE : i32 = 4;
+const ATTENTION : i32 = 8;
+const ATTN_OUT : i32 = 16;
+const ROUTER : i32 = 32;
+const EXPERTS : i32 = 64;
+const LM_HEAD : i32 = 128;
+
+fn has(skip : i32, part : i32) -> bool {
+  return (skip / part) % 2 == 1;
+}
+
+/// `run_layers` of src/model.vx, with the parts in `skip` left out.
+fn layers(w : &Weights, s : &mut State, token : &Tensor<i32, [?], Memory::HBM>, pos : i32, skip : i32) -> void {
+  let c = &w.config;
+  let eps = c.rms_norm_eps as f32;
+  nn_embed(&mut s.x, &w.embed, token, c.hidden_size);
+  let mut l = 0;
+  for cache in s.caches.iter_mut() {
+    let layer = &w.layers[l];
+    if !has(skip, NORMS) {
+      nn_rms_norm(&mut s.xn, &s.x, &layer.attn_norm, c.hidden_size, eps);
+    }
+    if !has(skip, QKV) {
+      qkv(&mut s.q, &mut s.k, &mut s.v, &layer.qkv, &layer.qkv_bias, &s.xn, c);
+    }
+    if !has(skip, ROPE) {
+      nn_norm_rope_and_store(&mut s.q_turned, &mut cache.k, &mut cache.v, &s.q, &s.k, &s.v, &layer.q_norm, &layer.k_norm, &s.cos, &s.sin, pos, c.num_q_heads, c.num_kv_heads, c.head_dim, eps);
+    }
+    if !has(skip, ATTENTION) {
+      split_attention(&mut s.attended, &mut s.attention_parts, &s.q_turned, &cache.k, &cache.v, pos, c.num_q_heads, c.num_kv_heads, c.head_dim);
+    }
+    if !has(skip, ATTN_OUT) {
+      matvec_heads_add(&mut s.x, &layer.attn_out, &s.attended, c.hidden_size, c.num_q_heads, c.head_dim);
+    }
+    if !has(skip, NORMS) {
+      nn_rms_norm(&mut s.xn, &s.x, &layer.mlp_norm, c.hidden_size, eps);
+    }
+    if !has(skip, ROUTER) {
+      nn_matvec(&mut s.experts.router_logits, &layer.router, &s.xn, c.num_experts, c.hidden_size);
+      nn_top_k(&mut s.experts.ids, &mut s.experts.weights, &s.experts.router_logits, c.num_experts, c.experts_per_token);
+    }
+    if !has(skip, EXPERTS) {
+      let k = c.experts_per_token;
+      let inter = c.moe_intermediate_size;
+      nn_moe_swiglu_q4(&mut s.experts.mlp, &layer.gate_up.codes, &layer.gate_up.group_scales, &s.experts.ids, &s.xn, k, inter, c.hidden_size, c.num_experts);
+      nn_moe_down_q4_add(&mut s.x, &layer.down.codes, &layer.down.group_scales, &s.experts.ids, &s.experts.weights, &s.experts.mlp, k, c.hidden_size, inter, c.num_experts);
+    }
+    l = l + 1;
+  }
+  return;
+}
+
+fn next_token(w : &Weights, s : &mut State, next : &mut Tensor<i32, [?], Memory::HBM>, skip : i32) -> void {
+  let c = &w.config;
+  nn_rms_norm(&mut s.xn, &s.x, &w.final_norm, c.hidden_size, c.rms_norm_eps as f32);
+  if !has(skip, LM_HEAD) {
+    matvec(&mut s.logits, &w.lm_head, &s.xn, c.vocab_size, c.hidden_size);
+  }
+  nn_argmax(next, &s.logits, c.vocab_size);
+  return;
+}
+
+fn read_first(t : &Tensor<i32, [?], Memory::HBM>) -> i32 {
+  let h = transfer(t, Memory::CPU_DRAM);
+  return h[0];
+}
+
+/// The time of a token, in ms, over 32 tokens from position `from`.
+fn time_tokens(w : &Weights, s : &mut State, next : &mut Tensor<i32, [?], Memory::HBM>, from : i32, skip : i32) -> f64 {
+  let start = Instant::now();
+  for i in 0..32 {
+    layers(w, s, next, from + i, skip);
+    next_token(w, s, next, skip);
+    let t = read_first(next);
+    if t < -1 {
+      println!("never");
+    }
+  }
+  return f64::from(start.elapsed().as_secs_f32()) * 1000.0 / 32.0;
+}
+
+/// The time of `count` launches of a kernel that does almost nothing, in ms, with one wait at the end.
+fn time_launches(x : &mut Tensor<f32, [?], Memory::HBM>, count : i32) -> f64 {
+  let start = Instant::now();
+  for i in 0..count {
+    spawn on(Topology::Device) {
+      for b in 0..1 across blocks {
+        for l in 0..32 across lanes(32) {
+          x[l] = x[l] + 1.0;
+        }
+      }
+    }
+  }
+  let h = transfer(x, Memory::CPU_DRAM);
+  if h[0] < -1.0 {
+    println!("never");
+  }
+  return f64::from(start.elapsed().as_secs_f32()) * 1000.0;
+}
+
+/// Prints the time of a token without the part `m`, and so the time of the part.
+fn print_part(m : i32, t : f64, part : f64) -> void {
+  if m == NORMS {
+    println!("without the norms: {} ms a token, so they take {} ms", t, part);
+  } else if m == QKV {
+    println!("without QKV: {} ms a token, so it takes {} ms", t, part);
+  } else if m == ROPE {
+    println!("without RoPE and the store into the KV cache: {} ms a token, so they take {} ms", t, part);
+  } else if m == ATTENTION {
+    println!("without attention: {} ms a token, so it takes {} ms", t, part);
+  } else if m == ATTN_OUT {
+    println!("without the attention output: {} ms a token, so it takes {} ms", t, part);
+  } else if m == ROUTER {
+    println!("without the router and top-k: {} ms a token, so they take {} ms", t, part);
+  } else if m == EXPERTS {
+    println!("without the experts: {} ms a token, so they take {} ms", t, part);
+  } else {
+    println!("without lm_head: {} ms a token, so it takes {} ms", t, part);
+  }
+  return;
+}
+
+fn main(argc : i32, argv : *mut *mut i8) -> i32 {
+  let w = load_weights(unsafe { argv[1] });
+  assert(w.config.num_experts > 0 && w.layers[0].gate_up.dtype == U4, "give the Q4_0 file of the 30B MoE model");
+  let mut s = new_state(&w.config, 2048);
+  let mut next = transfer(Tensor<i32>([1]), Memory::HBM);
+  let mut prompt = Vec<i32>::new();
+  for i in 0..64 {
+    prompt.push(1000 + i * 37);
+  }
+  prefill(&w, &mut s, &prompt);
+  next_token(&w, &mut s, &mut next, 0);
+  // Warm-up of the decode kernels.
+  let warm = time_tokens(&w, &mut s, &mut next, 64, 0);
+  println!("warm-up: {} ms a token", warm);
+  let full = time_tokens(&w, &mut s, &mut next, 96, 0);
+  println!("all parts: {} ms a token", full);
+  let parts = Vec<i32>::new();
+  let mut masks = parts;
+  masks.push(NORMS);
+  masks.push(QKV);
+  masks.push(ROPE);
+  masks.push(ATTENTION);
+  masks.push(ATTN_OUT);
+  masks.push(ROUTER);
+  masks.push(EXPERTS);
+  masks.push(LM_HEAD);
+  let mut pos = 128;
+  for i in 0..masks.len() {
+    let m = masks[i];
+    let t = time_tokens(&w, &mut s, &mut next, pos, m);
+    pos = pos + 32;
+    print_part(m, t, full - t);
+  }
+  let all = NORMS + QKV + ROPE + ATTENTION + ATTN_OUT + ROUTER + EXPERTS + LM_HEAD;
+  let bare = time_tokens(&w, &mut s, &mut next, pos, all);
+  println!("without all parts (embed, final norm, argmax, the loop): {} ms a token", bare);
+  let mut x = transfer(Tensor<f32>([32]), Memory::HBM);
+  let warm_l = time_launches(&mut x, 100);
+  let launches = time_launches(&mut x, 530);
+  println!("530 launches of a kernel that does almost nothing: {} ms (warm-up {} ms for 100)", launches, warm_l);
+  return 0;
+}
