@@ -15,6 +15,9 @@ prompt now runs on the GPU in chunks of tokens.
 The program generates tokens with greedy decoding. Its tokenizer is also in Vx, so the prompt can
 be text or token ids, and the program prints text or token ids.
 
+[`docs/optimizations.md`](docs/optimizations.md) is a journal of the optimizations: what each one
+changed, its measurements, and the changes that did not help.
+
 ## Install Vx
 
 The program needs Vx v0.0.4 or later:
