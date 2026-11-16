@@ -16,9 +16,11 @@ import qwen::attention;
 import qwen::weights;
 
 /// The keys and the values of every position so far, for one layer: [max_seq, kv_heads, head_dim].
+/// They are f16, half the memory of f32. The kernels compute in f32, and round only what they
+/// store here.
 struct Cache {
-  k : Tensor<f32, [?, ?, ?], Memory::HBM>,
-  v : Tensor<f32, [?, ?, ?], Memory::HBM>,
+  k : Tensor<f16, [?, ?, ?], Memory::HBM>,
+  v : Tensor<f16, [?, ?, ?], Memory::HBM>,
 }
 
 /// The tensors of a mixture-of-experts layer: the router's score of each expert, the chosen
@@ -72,8 +74,8 @@ fn new_state(c : &Config, max_seq : i32) -> State {
   let mut caches = Vec<Cache>::new();
   for l in 0..c.num_layers {
     caches.push(Cache {
-      k: transfer(Tensor<f32>([max_seq, c.num_kv_heads, c.head_dim]), Memory::HBM),
-      v: transfer(Tensor<f32>([max_seq, c.num_kv_heads, c.head_dim]), Memory::HBM),
+      k: transfer(Tensor<f16>([max_seq, c.num_kv_heads, c.head_dim]), Memory::HBM),
+      v: transfer(Tensor<f16>([max_seq, c.num_kv_heads, c.head_dim]), Memory::HBM),
     });
   }
   return State {
@@ -193,9 +195,9 @@ fn run_layers(w : &Weights, s : &mut State, token : &Tensor<i32, [?], Memory::HB
     nn_rms_norm(&mut s.xn, &s.x, &layer.attn_norm, c.hidden_size, eps);
     qkv(&mut s.q, &mut s.k, &mut s.v, &layer.qkv, &layer.qkv_bias, &s.xn, c);
     if c.qk_norm {
-      nn_norm_rope_and_store(&mut s.q_turned, &mut cache.k, &mut cache.v, &s.q, &s.k, &s.v, &layer.q_norm, &layer.k_norm, &s.cos, &s.sin, pos, c.num_q_heads, c.num_kv_heads, c.head_dim, eps);
+      norm_rope_and_store(&mut s.q_turned, &mut cache.k, &mut cache.v, &s.q, &s.k, &s.v, &layer.q_norm, &layer.k_norm, &s.cos, &s.sin, pos, c.num_q_heads, c.num_kv_heads, c.head_dim, eps);
     } else {
-      nn_rope_and_store(&mut s.q_turned, &mut cache.k, &mut cache.v, &s.q, &s.k, &s.v, &s.cos, &s.sin, pos, c.num_q_heads, c.num_kv_heads, c.head_dim);
+      rope_and_store(&mut s.q_turned, &mut cache.k, &mut cache.v, &s.q, &s.k, &s.v, &s.cos, &s.sin, pos, c.num_q_heads, c.num_kv_heads, c.head_dim);
     }
     split_attention(&mut s.attended, &mut s.attention_parts, &s.q_turned, &cache.k, &cache.v, pos, c.num_q_heads, c.num_kv_heads, c.head_dim);
     matvec_heads_add(&mut s.x, &layer.attn_out, &s.attended, c.hidden_size, c.num_q_heads, c.head_dim);

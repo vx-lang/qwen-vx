@@ -55,8 +55,8 @@ TOPICS = [
 # gave 6870 tokens in the chat format.
 CHARS_PER_TOKEN = 3.0
 # Bytes of KV cache for each token of Qwen3-Coder-30B-A3B: 48 layers, K and V, 4 heads of 128
-# values, f32.
-KV_BYTES_PER_TOKEN = 48 * 2 * 4 * 128 * 4
+# values, f16.
+KV_BYTES_PER_TOKEN = 48 * 2 * 4 * 128 * 2
 
 INCLUDE = re.compile(r"\{\{#include ([^}:]+):([A-Za-z0-9_-]+)\}\}")
 LINK = re.compile(r"\[([^\]]+)\]\((?!https?:)[^)]*\)")

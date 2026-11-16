@@ -15,7 +15,7 @@
 //       The reply is the generated text, a NUL byte, and one line
 //       `done prompt=… reused=… ran=… generated=… prompt_us=… us_per_token=…`.
 //       STEPS 0 runs the prompt into the KV cache and generates nothing.
-//   save PATH\n   writes the tokens of the KV cache and their rows of K and V to a file.
+//   save PATH\n   writes the tokens of the KV cache and their rows of K and V, as f16, to a file.
 //   load PATH\n   reads such a file back. Both answer `ok tokens=N`.
 //
 // A request that the session cannot do gets a NUL byte and a line that starts with `error`, and
@@ -41,7 +41,8 @@ extern {
 
 /// The bytes "VXQKV001" at the start of a cache file, read as one little-endian i64.
 const CACHE_MAGIC : i64 = 3544386053929523286;
-const CACHE_VERSION : i64 = 1;
+/// Version 2 has rows of f16 values, as the KV cache holds them. Version 1 had f32.
+const CACHE_VERSION : i64 = 2;
 /// The i64 words of the header of a cache file.
 const CACHE_HEADER_WORDS : i64 = 16;
 /// The longest line of a request.
@@ -290,11 +291,11 @@ fn cache_header(w : &Weights, session : &Session, n : i64) -> Vec<i64> {
 }
 
 /// Writes the first n rows of a cache tensor [max_seq, kv_heads, head_dim] to `f`.
-fn write_rows(f : *mut i8, cache : &Tensor<f32, [?, ?, ?], Memory::HBM>, n : i32, kv_heads : i32, head_dim : i32) -> void {
+fn write_rows(f : *mut i8, cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, n : i32, kv_heads : i32, head_dim : i32) -> void {
   let h = transfer(cache, Memory::CPU_DRAM);
   let count = (n as i64) * (kv_heads as i64) * (head_dim as i64);
-  let buf : *mut i8 = unsafe { malloc((count * 4) as usize) };
-  let values : *mut f32 = buf;
+  let buf : *mut i8 = unsafe { malloc((count * 2) as usize) };
+  let values : *mut f16 = buf;
   let mut i : i64 = 0;
   for r in 0..n {
     for k in 0..kv_heads {
@@ -304,7 +305,7 @@ fn write_rows(f : *mut i8, cache : &Tensor<f32, [?, ?, ?], Memory::HBM>, n : i32
       }
     }
   }
-  let wrote = unsafe { fwrite(buf, 4, count, f) };
+  let wrote = unsafe { fwrite(buf, 2, count, f) };
   assert(wrote == count, "cannot write the cache file");
   unsafe { free(buf); }
   return;
@@ -354,8 +355,8 @@ fn save_cache(w : &Weights, s : &State, session : &Session, path : *const i8) ->
 }
 
 /// A cache tensor [max_seq, kv_heads, head_dim] with the n rows at `values` and zeros after them.
-fn read_rows(values : *mut f32, n : i32, max_seq : i32, kv_heads : i32, head_dim : i32) -> Tensor<f32, [?, ?, ?], Memory::HBM> {
-  let mut h = Tensor<f32>([max_seq, kv_heads, head_dim]);
+fn read_rows(values : *mut f16, n : i32, max_seq : i32, kv_heads : i32, head_dim : i32) -> Tensor<f16, [?, ?, ?], Memory::HBM> {
+  let mut h = Tensor<f16>([max_seq, kv_heads, head_dim]);
   let mut i : i64 = 0;
   for r in 0..n {
     for k in 0..kv_heads {
@@ -388,7 +389,7 @@ fn load_cache(w : &Weights, s : &mut State, session : &mut Session, path : *cons
   }
   let padded = (n + 1) / 2 * 2;
   let row = (c.num_kv_heads as i64) * (c.head_dim as i64);
-  let bytes = CACHE_HEADER_WORDS * 8 + (padded as i64) * 4 + (c.num_layers as i64) * 2 * (n as i64) * row * 4;
+  let bytes = CACHE_HEADER_WORDS * 8 + (padded as i64) * 4 + (c.num_layers as i64) * 2 * (n as i64) * row * 2;
   if !fits || file.length != bytes {
     end_reply(session.output);
     out_text(session.output, "error the cache file was made for another model or context\n");
@@ -399,7 +400,7 @@ fn load_cache(w : &Weights, s : &mut State, session : &mut Session, path : *cons
   for i in 0..n {
     tokens.push(unsafe { ids[i] });
   }
-  let rows : *mut f32 = offset_mut(file.bytes, CACHE_HEADER_WORDS * 8 + (padded as i64) * 4);
+  let rows : *mut f16 = offset_mut(file.bytes, CACHE_HEADER_WORDS * 8 + (padded as i64) * 4);
   let mut at : i64 = 0;
   for cache in s.caches.iter_mut() {
     cache.k = read_rows(offset_mut(rows, at), n, s.max_seq, c.num_kv_heads, c.head_dim);

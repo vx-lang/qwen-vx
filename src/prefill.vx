@@ -454,7 +454,7 @@ fn pf_rms_norm(y : &mut Tensor<f32, [?, ?], Memory::HBM>, x : &Tensor<f32, [?, ?
 
 /// RoPE for the tokens of the chunk, as `nn_rope_and_store`: token t is at position start + t.
 /// The heads of q, k and v are one after another in qkv[t].
-fn pf_rope_and_store(q_out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, v_cache : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, qkv : &Tensor<f32, [?, ?], Memory::HBM>, cos : &Tensor<f32, [?, ?], Memory::HBM>, sin : &Tensor<f32, [?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+fn pf_rope_and_store(q_out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &mut Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &mut Tensor<f16, [?, ?, ?], Memory::HBM>, qkv : &Tensor<f32, [?, ?], Memory::HBM>, cos : &Tensor<f32, [?, ?], Memory::HBM>, sin : &Tensor<f32, [?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
   assert(start + n <= k_cache.extent(0) && start + n <= cos.extent(0), "pf_rope_and_store: the chunk goes past the end of the KV cache");
   let half = head_dim / 2;
   spawn on(Topology::Device) {
@@ -477,8 +477,8 @@ fn pf_rope_and_store(q_out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache :
             if h < q_heads {
               q_out[t][h][i] = qkv[t][base + i] * c + sign * qkv[t][base + partner] * s;
             } else {
-              k_cache[start + t][h - q_heads][i] = qkv[t][base + i] * c + sign * qkv[t][base + partner] * s;
-              v_cache[start + t][h - q_heads][i] = qkv[t][base + kv_heads * head_dim + i];
+              k_cache[start + t][h - q_heads][i] = (qkv[t][base + i] * c + sign * qkv[t][base + partner] * s) as f16;
+              v_cache[start + t][h - q_heads][i] = qkv[t][base + kv_heads * head_dim + i] as f16;
             }
           }
         }
@@ -489,7 +489,7 @@ fn pf_rope_and_store(q_out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache :
 }
 
 /// As `pf_rope_and_store`, after the RMSNorm of each head of q and k, as `nn_norm_rope_and_store`.
-fn pf_norm_rope_and_store(q_out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, v_cache : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, qkv : &Tensor<f32, [?, ?], Memory::HBM>, q_norm : &Tensor<bf16, [?], Memory::HBM>, k_norm : &Tensor<bf16, [?], Memory::HBM>, cos : &Tensor<f32, [?, ?], Memory::HBM>, sin : &Tensor<f32, [?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32, head_dim : i32, eps : f32) -> void {
+fn pf_norm_rope_and_store(q_out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &mut Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &mut Tensor<f16, [?, ?, ?], Memory::HBM>, qkv : &Tensor<f32, [?, ?], Memory::HBM>, q_norm : &Tensor<bf16, [?], Memory::HBM>, k_norm : &Tensor<bf16, [?], Memory::HBM>, cos : &Tensor<f32, [?, ?], Memory::HBM>, sin : &Tensor<f32, [?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32, head_dim : i32, eps : f32) -> void {
   assert(start + n <= k_cache.extent(0) && start + n <= cos.extent(0), "pf_norm_rope_and_store: the chunk goes past the end of the KV cache");
   let half = head_dim / 2;
   spawn on(Topology::Device) {
@@ -527,8 +527,8 @@ fn pf_norm_rope_and_store(q_out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, k_ca
             } else {
               let a = x[i] * inv * (k_norm[i] as f32);
               let b = x[partner] * inv * (k_norm[partner] as f32);
-              k_cache[start + t][h - q_heads][i] = a * c + sign * b * s;
-              v_cache[start + t][h - q_heads][i] = qkv[t][(h + kv_heads) * head_dim + i];
+              k_cache[start + t][h - q_heads][i] = (a * c + sign * b * s) as f16;
+              v_cache[start + t][h - q_heads][i] = qkv[t][(h + kv_heads) * head_dim + i] as f16;
             }
           }
         }
@@ -543,7 +543,7 @@ fn pf_norm_rope_and_store(q_out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, k_ca
 /// head g) / sqrt(head_dim). A block does two tokens, the 16 rows of their query heads, against
 /// 128 positions, as a matmul of tiles. It skips the positions that neither token sees, and so
 /// writes the scores of p up to start + t + 1 at least, but not those of p at start + n or after.
-fn pf_scores(scores : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f32, [?, ?, ?], Memory::HBM>, first : i32, start : i32, n : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+fn pf_scores(scores : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, first : i32, start : i32, n : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
   assert(q_heads % kv_heads == 0 && q_heads / kv_heads <= 8 && head_dim <= 128, "pf_scores: q_heads must be a multiple of kv_heads, and at most 8 times it, and head_dim at most 128");
   let group = q_heads / kv_heads;
   let end = start + n;
@@ -577,7 +577,7 @@ fn pf_scores(scores : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, q : &Tensor<f
                   let d = kc * 32 + k;
                   let mut v : f32 = 0.0;
                   if p < end && d < head_dim {
-                    v = k_cache[p][g][d];
+                    v = k_cache[p][g][d] as f32;
                   }
                   sk[sg][k][l] = v;
                 }
@@ -684,7 +684,7 @@ fn pf_softmax(scores : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, start : i32,
 /// start + t. A block does the 16 rows of two tokens, for all the
 /// values of a head, as a matmul of tiles. It reads the weights up to a multiple of 32, so those
 /// after start + t must be 0, as `pf_softmax` leaves them.
-fn pf_weigh_values(out : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, scores : &Tensor<f32, [?, ?, ?, ?], Memory::HBM>, v_cache : &Tensor<f32, [?, ?, ?], Memory::HBM>, first : i32, start : i32, n : i32, kv_heads : i32, group : i32, head_dim : i32) -> void {
+fn pf_weigh_values(out : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, scores : &Tensor<f32, [?, ?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, first : i32, start : i32, n : i32, kv_heads : i32, group : i32, head_dim : i32) -> void {
   let end = start + n;
   assert(scores.extent(3) >= (end + 31) / 32 * 32 && head_dim <= 128, "pf_weigh_values: `scores` needs start + n positions, rounded up to 32");
   assert(first + n <= out.extent(0), "pf_weigh_values: `out` needs first + n tokens");
@@ -712,7 +712,7 @@ fn pf_weigh_values(out : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, scores : &
                 let p = kc * 32 + k;
                 let mut v : f32 = 0.0;
                 if p < end && d < head_dim {
-                  v = v_cache[p][g][d];
+                  v = v_cache[p][g][d] as f32;
                 }
                 sv[sg][k][l] = v;
               }
@@ -754,7 +754,7 @@ fn pf_weigh_values(out : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, scores : &
 /// Attention of each token of the chunk over the positions up to its own, as `nn_attention`. Token
 /// t is at position start + t. Query head g * group + j of token t goes to out[t][g][j]. The
 /// tokens go in slices of as many tokens as `scores` has rows for.
-fn pf_attention(out : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, scores : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f32, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f32, [?, ?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+fn pf_attention(out : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, scores : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
   let group = q_heads / kv_heads;
   let slice = scores.extent(0);
   let mut first = 0;

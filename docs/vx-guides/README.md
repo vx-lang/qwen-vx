@@ -9,11 +9,11 @@ kind of program, with their programs, which are tests of the Vx compiler.
 <!-- guides: start -->
 | Guide | For | Size | Tokens | KV cache |
 | --- | --- | --- | --- | --- |
-| [`vx-basics.md`](vx-basics.md) | Programs on the CPU: errors, ownership and generics | 41 KB | about 13,900 | 2.7 GB |
-| [`vx-gpu.md`](vx-gpu.md) | Kernels on the GPU of a Mac: topologies, memory, blocks, lanes and tiles | 40 KB | about 13,600 | 2.7 GB |
-| [`vx-tasks.md`](vx-tasks.md) | Concurrent programs: tasks and channels | 37 KB | about 12,400 | 2.4 GB |
-| [`vx-tensors.md`](vx-tensors.md) | Numeric programs: tensor operations, low precision and autodiff | 37 KB | about 12,600 | 2.5 GB |
-| [`vx-unsafe.md`](vx-unsafe.md) | Systems programs: unsafe code, C functions, files, input and time | 38 KB | about 13,000 | 2.6 GB |
+| [`vx-basics.md`](vx-basics.md) | Programs on the CPU: errors, ownership and generics | 41 KB | about 13,900 | 1.4 GB |
+| [`vx-gpu.md`](vx-gpu.md) | Kernels on the GPU of a Mac: topologies, memory, blocks, lanes and tiles | 40 KB | about 13,600 | 1.3 GB |
+| [`vx-tasks.md`](vx-tasks.md) | Concurrent programs: tasks and channels | 37 KB | about 12,400 | 1.2 GB |
+| [`vx-tensors.md`](vx-tensors.md) | Numeric programs: tensor operations, low precision and autodiff | 37 KB | about 12,600 | 1.2 GB |
+| [`vx-unsafe.md`](vx-unsafe.md) | Systems programs: unsafe code, C functions, files, input and time | 38 KB | about 13,000 | 1.3 GB |
 
 Made from the book of vx-lang/Vx at v0.0.4.
 <!-- guides: end -->
@@ -33,7 +33,7 @@ the questions run. The cache fits only the model file and the guide that made it
 to either, delete the cache file.
 
 `--context` sets the size of the KV cache in memory, in tokens. It must hold the guide and the
-conversation: about 0.2 MB a token for Qwen3-Coder-30B-A3B, so 4 GB for 20480 tokens, on top of
+conversation: about 0.1 MB a token for Qwen3-Coder-30B-A3B, so 2 GB for 20480 tokens, on top of
 the 17.8 GB of weights. 20480 holds each guide and at least 4000 tokens of conversation.
 
 Compile what the model writes, and give it back the errors:

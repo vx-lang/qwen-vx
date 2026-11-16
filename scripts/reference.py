@@ -100,7 +100,7 @@ def mixture_of_experts(model, prefix, h):
 
 
 class Cache:
-    """The keys and values of every position so far, per layer."""
+    """The keys and values of every position so far, per layer, rounded to f16 as in the Vx program."""
 
     def __init__(self, config):
         self.keys = [None] * config["num_layers"]
@@ -131,6 +131,9 @@ def forward(model, tokens, cache):
             k = rms_norm(k, model.weight(p + "k_norm"), eps)
         q = rope(q, positions, c["rope_theta"])
         k = rope(k, positions, c["rope_theta"])
+        # The KV cache of the Vx program holds f16 values, so round them as it does.
+        k = k.astype(np.float16).astype(np.float32)
+        v = v.astype(np.float16).astype(np.float32)
         if cache.keys[layer] is None:
             cache.keys[layer], cache.values[layer] = k, v
         else:
