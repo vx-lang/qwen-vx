@@ -214,12 +214,14 @@ def main():
     weight_format = parser.add_mutually_exclusive_group()
     weight_format.add_argument("--fp8", action="store_true", help="store the weight matrices as f8e4m3 codes")
     weight_format.add_argument("--q4", action="store_true", help="store the weight matrices as Q4_0 codes")
+    parser.add_argument("--q6-lm-head", action="store_true", help="with --q4, store lm_head as 6-bit codes, not f8e4m3")
     parser.add_argument("--moe", action="store_true", help="write the tiny mixture-of-experts model")
     parser.add_argument("--hugging-face", metavar="DIR", help="also write the MoE model as a Hugging Face folder")
     parser.add_argument("--max-positions", type=int, help="the positions of the model, 64 if not given; the weights do not change")
     parser.add_argument("--vocab-size", type=int, help="the tokens of the dense model, 256 if not given, for a bigger tokenizer; other weights come out")
     args = parser.parse_args()
     assert not (args.moe and args.vocab_size), "--vocab-size is for the dense model"
+    assert not args.q6_lm_head or args.q4, "--q6-lm-head needs --q4"
     if args.moe:
         hf = tiny_moe_model()
         if args.hugging_face:
@@ -232,7 +234,8 @@ def main():
     if args.max_positions:
         config = dict(config, max_positions=args.max_positions)
     if args.fp8 or args.q4:
-        config, tensors = qwen_weights.quantize(config, tensors, "fp8" if args.fp8 else "q4_0")
+        weight_format = "fp8" if args.fp8 else ("q4_0_q6" if args.q6_lm_head else "q4_0")
+        config, tensors = qwen_weights.quantize(config, tensors, weight_format)
     qwen_weights.write_weight_file(args.output, config, tensors)
     print(f"wrote {args.output}")
     return 0

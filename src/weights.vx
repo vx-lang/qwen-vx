@@ -29,14 +29,20 @@ const BF16 : i64 = 1;
 const F8E4M3 : i64 = 2;
 const F16 : i64 = 3;
 const U4 : i64 = 4;
+const U2 : i64 = 5;
+/// The dtype of a 6-bit matrix in a `WeightMatrix`. The file holds such a matrix as three tensors:
+/// its low 4 bits (U4), its high 2 bits (U2) and its scales (F16).
+const U6 : i64 = 6;
 /// An fp8 matrix has one f32 scale for each block of BLOCK x BLOCK weights.
 const BLOCK : i32 = 128;
-/// A Q4_0 matrix has one f16 scale for each GROUP weights of a row.
+/// A Q4_0 or 6-bit matrix has one f16 scale for each GROUP weights of a row.
 const GROUP : i32 = 32;
 /// The weight formats of a file, as in `qwen_weights.py`.
 const FORMAT_BF16 : i32 = 0;
 const FORMAT_FP8 : i32 = 1;
 const FORMAT_Q4_0 : i32 = 2;
+/// As FORMAT_Q4_0, with a 6-bit lm_head.
+const FORMAT_Q4_0_Q6 : i32 = 3;
 
 /// The model's sizes and constants, from the header of the weight file.
 struct Config {
@@ -68,11 +74,15 @@ struct Config {
 ///   block of 128 x 128.
 /// - U4 fills `codes`, with 8 Q4_0 codes in each word, and `group_scales`, with one f16 for each
 ///   32 weights of a row.
+/// - U6 fills `codes` with the low 4 bits of the codes, as U4, `high` with their high 2 bits, 16
+///   in each word, from its low bits up, and `group_scales` as U4. A weight is (code - 32) times
+///   its scale.
 /// The fields that the form does not use hold one row of zeros.
 struct WeightMatrix {
   dtype : i64,
   bf16 : Tensor<bf16, [?], Memory::HBM>,
   codes : Tensor<u32, [?], Memory::HBM>,
+  high : Tensor<u32, [?], Memory::HBM>,
   scales : Tensor<f32, [?], Memory::HBM>,
   group_scales : Tensor<f16, [?], Memory::HBM>,
 }
@@ -188,11 +198,14 @@ fn load_next(r : &mut Reader, kind : *const i8, rows : i32, cols : i32) -> Tenso
   return transfer(host, Memory::HBM);
 }
 
-/// Copies the next tensor, of f8e4m3 or u4 codes, into GPU memory as u32 words. Word i holds the
-/// 4 codes from 4 * i, one in each byte, or the 8 u4 codes from 8 * i, from its low bits up.
+/// Copies the next tensor, of f8e4m3, u4 or u2 codes, into GPU memory as u32 words. Word i holds
+/// the 4 codes from 4 * i, one in each byte, the 8 u4 codes from 8 * i, or the 16 u2 codes from
+/// 16 * i, from its low bits up.
 fn load_codes(r : &mut Reader, kind : *const i8, dtype : i64, rows : i32, cols : i32) -> Tensor<u32, [?], Memory::HBM> {
   let bits : i64 = if dtype == U4 {
     4
+  } else if dtype == U2 {
+    2
   } else {
     8
   };
@@ -225,9 +238,13 @@ fn load_scales(r : &mut Reader, kind : *const i8, rows : i32, cols : i32) -> Ten
   return transfer(host, Memory::HBM);
 }
 
-/// The dtype of the weight matrices of a file in `weight_format`. lm_head is f8e4m3 in a Q4_0 file.
+/// The dtype of the weight matrices of a file in `weight_format`. lm_head is f8e4m3 in a Q4_0 file,
+/// and 6-bit in a Q4_0_Q6 file.
 fn matrix_dtype(weight_format : i32, lm_head : bool) -> i64 {
-  if weight_format == FORMAT_Q4_0 && !lm_head {
+  if weight_format == FORMAT_Q4_0_Q6 && lm_head {
+    return U6;
+  }
+  if (weight_format == FORMAT_Q4_0 || weight_format == FORMAT_Q4_0_Q6) && !lm_head {
     return U4;
   }
   if weight_format == FORMAT_BF16 {
@@ -244,19 +261,28 @@ fn load_matrix(r : &mut Reader, dtype : i64, kind : *const i8, scale_kind : *con
     let codes = load_codes(r, kind, U4, rows, cols);
     let scales = load_f16(r, scale_kind, rows, cols / GROUP);
     return WeightMatrix {
-      dtype: U4, bf16: zeros(8), codes: codes, scales: zero_scales(8), group_scales: scales
+      dtype: U4, bf16: zeros(8), codes: codes, high: zero_words(8), scales: zero_scales(8), group_scales: scales
+    };
+  }
+  if dtype == U6 {
+    assert(cols % GROUP == 0, "a 6-bit matrix must have a whole number of groups in each row");
+    let codes = load_codes(r, kind, U4, rows, cols);
+    let high = load_codes(r, ".high", U2, rows, cols);
+    let scales = load_f16(r, scale_kind, rows, cols / GROUP);
+    return WeightMatrix {
+      dtype: U6, bf16: zeros(8), codes: codes, high: high, scales: zero_scales(8), group_scales: scales
     };
   }
   if dtype == F8E4M3 {
     let codes = load_codes(r, kind, F8E4M3, rows, cols);
     let scales = load_scales(r, scale_kind, (rows + BLOCK - 1) / BLOCK, (cols + BLOCK - 1) / BLOCK);
     return WeightMatrix {
-      dtype: F8E4M3, bf16: zeros(8), codes: codes, scales: scales, group_scales: zero_f16(8)
+      dtype: F8E4M3, bf16: zeros(8), codes: codes, high: zero_words(8), scales: scales, group_scales: zero_f16(8)
     };
   }
   let values = load_next(r, kind, rows, cols);
   return WeightMatrix {
-    dtype: BF16, bf16: values, codes: zero_words(8), scales: zero_scales(8), group_scales: zero_f16(8)
+    dtype: BF16, bf16: values, codes: zero_words(8), high: zero_words(8), scales: zero_scales(8), group_scales: zero_f16(8)
   };
 }
 
@@ -323,7 +349,7 @@ fn load_weights(path : *const i8) -> Weights {
     rope_theta: unsafe { floats[21] },
     rms_norm_eps: unsafe { floats[22] },
   };
-  assert(config.weight_format >= FORMAT_BF16 && config.weight_format <= FORMAT_Q4_0, "the weight file has an unknown weight format");
+  assert(config.weight_format >= FORMAT_BF16 && config.weight_format <= FORMAT_Q4_0_Q6, "the weight file has an unknown weight format");
   assert(config.num_experts == 0 || (config.experts_per_token > 0 && config.experts_per_token <= config.num_experts), "a model must use between 1 and all of its experts for each token");
 
   let hidden = config.hidden_size;
@@ -387,7 +413,7 @@ fn load_weights(path : *const i8) -> Weights {
   assert(config.weight_format == FORMAT_BF16 || !config.tied_embeddings, "an fp8 or Q4_0 weight file must have its own lm_head");
   let lm_head = if config.tied_embeddings {
     WeightMatrix {
-      dtype: BF16, bf16: zeros(8), codes: zero_words(8), scales: zero_scales(8), group_scales: zero_f16(8)
+      dtype: BF16, bf16: zeros(8), codes: zero_words(8), high: zero_words(8), scales: zero_scales(8), group_scales: zero_f16(8)
     }
   } else {
     load_matrix(&mut r, matrix_dtype(config.weight_format, true), "lm_head", "lm_head.scale", config.vocab_size, hidden)

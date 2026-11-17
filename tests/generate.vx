@@ -5,6 +5,7 @@
 // - its Q4_0 file, which runs the Q4_0 kernels, and the fp8 kernel for lm_head
 // - the tiny mixture-of-experts model, whose router chooses 2 of 8 experts for each token
 // - the Q4_0 file of that model
+// - the Q4_0 file of that model with a 6-bit lm_head, which runs `matvec_q6` of `src/q6.vx`
 // - the tiny model and the Q4_0 file of the MoE model with 1024 positions, after a prompt of 700
 //   tokens. So the prompt runs in 3 chunks, and the attention of a generated token goes past
 //   position 640, where its blocks take 64 positions in place of 32.
@@ -29,6 +30,10 @@
 // RUN: python3 %S/../scripts/reference.py %t-moe-q4.vxw --tokens 1,2,3,4 --steps 16 > %t-moe-q4.reference
 // RUN: vxc %S/../src/main.vx --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t-moe-q4.vxw --tokens 1,2,3,4 --steps 16 > %t-moe-q4.vx
 // RUN: python3 %S/../scripts/compare.py %t-moe-q4.reference %t-moe-q4.vx --tolerance 0.002 | FileCheck %s --check-prefix=MOE-Q4
+// RUN: python3 %S/../scripts/make_tiny_model.py --moe --q4 --q6-lm-head %t-moe-q6.vxw > /dev/null
+// RUN: python3 %S/../scripts/reference.py %t-moe-q6.vxw --tokens 1,2,3,4 --steps 16 > %t-moe-q6.reference
+// RUN: vxc %S/../src/main.vx --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t-moe-q6.vxw --tokens 1,2,3,4 --steps 16 > %t-moe-q6.vx
+// RUN: python3 %S/../scripts/compare.py %t-moe-q6.reference %t-moe-q6.vx --tolerance 0.002 | FileCheck %s --check-prefix=MOE-Q6
 // RUN: python3 -c "print(','.join(str(i * 37 % 256) for i in range(700)))" > %t-long.ids
 // RUN: python3 %S/../scripts/make_tiny_model.py --max-positions 1024 %t-long.vxw > /dev/null
 // RUN: python3 %S/../scripts/reference.py %t-long.vxw --tokens $(cat %t-long.ids) --steps 8 > %t-long.reference
@@ -44,4 +49,5 @@
 // Q4: {{^}}16 steps, same tokens, logits within 0.001{{$}}
 // MOE: {{^}}16 steps, same tokens, logits within 0.001{{$}}
 // MOE-Q4: {{^}}16 steps, same tokens, logits within 0.002{{$}}
+// MOE-Q6: {{^}}16 steps, same tokens, logits within 0.002{{$}}
 // LONG: {{^}}8 steps, same tokens, logits within 0.001{{$}}

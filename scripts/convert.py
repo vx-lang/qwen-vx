@@ -5,14 +5,16 @@
     python3 scripts/convert.py --fp8 ~/models/Qwen2.5-Coder-0.5B-Instruct qwen-0.5b-fp8.vxw
     python3 scripts/convert.py --q4 ~/models/Qwen3-Coder-30B-A3B-Instruct qwen3-30b-q4.vxw
     python3 scripts/convert.py --q4 --importance importance.npz ~/models/Qwen3-Coder-30B-A3B-Instruct qwen3-30b-q4.vxw
+    python3 scripts/convert.py --q4 --q6-lm-head ~/models/Qwen3-Coder-30B-A3B-Instruct qwen3-30b-q4-q6.vxw
 
 The file keeps the bf16 values exactly. Q, K and V of a layer become one matrix with one bias
 vector, Q rows first, and gate and up become one matrix, gate rows first, so that one kernel
 reads each of them. The experts of a layer become one matrix for gate and up, and one for down.
 With --fp8, the weight matrices become f8e4m3 codes with a scale for each block of 128 x 128.
 With --q4, they become Q4_0 codes with a scale for each 32 weights of a row, and lm_head becomes
-f8e4m3. --importance takes the file of importance.py, and rounds each Q4_0 matrix to the smallest
-error on the inputs that matter most. `qwen_weights.py` describes the file.
+f8e4m3, or 6-bit codes with a scale for each 32 weights of a row with --q6-lm-head. --importance
+takes the file of importance.py, and rounds each Q4_0 matrix to the smallest error on the inputs
+that matter most. `qwen_weights.py` describes the file.
 
 Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
 See LICENSE for license information.
@@ -78,12 +80,15 @@ def main():
     weight_format.add_argument("--fp8", action="store_true", help="store the weight matrices as f8e4m3 codes")
     weight_format.add_argument("--q4", action="store_true", help="store the weight matrices as Q4_0 codes")
     parser.add_argument("--importance", help="the .npz file of importance.py, which guides the rounding of --q4")
+    parser.add_argument("--q6-lm-head", action="store_true", help="with --q4, store lm_head as 6-bit codes, not f8e4m3")
     args = parser.parse_args()
     assert args.importance is None or args.q4, "--importance needs --q4"
+    assert not args.q6_lm_head or args.q4, "--q6-lm-head needs --q4"
     importance = None if args.importance is None else dict(np.load(args.importance))
     config, tensors = convert(args.model_dir)
     if args.fp8 or args.q4:
-        config, tensors = qwen_weights.quantize(config, tensors, "fp8" if args.fp8 else "q4_0", importance)
+        weight_format = "fp8" if args.fp8 else ("q4_0_q6" if args.q6_lm_head else "q4_0")
+        config, tensors = qwen_weights.quantize(config, tensors, weight_format, importance)
     qwen_weights.write_weight_file(args.output, config, tensors)
     print(f"wrote {args.output}: {len(tensors)} tensors, {config['num_layers']} layers")
 

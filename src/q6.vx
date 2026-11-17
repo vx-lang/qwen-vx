@@ -1,0 +1,122 @@
+//===- q6.vx - Qwen app -----------------------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// The matrix-vector product of a 6-bit matrix, for lm_head in a Q4_0_Q6 weight file. A weight is
+// (code - 32) * scale, where the code is 0 to 63. A matrix of rows x cols has cols / 8 u32 words of
+// low bits for each row, as Q4_0 has (bits 4t to 4t + 3 of word i hold the low 4 bits of weight
+// 8i + t), cols / 16 words of high bits (bits 2t and 2t + 1 of word i hold the high 2 bits of weight
+// 16i + t), and an f16 scale for each 32 weights. That is 6.5 bits for each weight, as in the Q6_K
+// of llama.cpp.
+//
+// This is `nn_matvec_q4` of `std::nn` with the high bits added. The block is one SIMD group, and it
+// does 8 rows. A lane takes 16 weights of each row at a time: 2 words of low bits, 1 word of high
+// bits and 1 scale. It takes the bits of weight t with a mask and no shift, which gives them times
+// 16^t (low) or 4^t (high), and divides x to match. The 32 of each code comes off once for each 16
+// weights, as 32 times the sum of their values of x.
+import core::num;
+
+/// y[r] = (row r of the 6-bit matrix of `codes`, `high` and `scales`) . x, for r below `rows`.
+fn matvec_q6(y : &mut Tensor<f32, [?], Memory::HBM>, codes : &Tensor<u32, [?], Memory::HBM>, high : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, x : &Tensor<f32, [?], Memory::HBM>, rows : i32, cols : i32) -> void {
+  assert(cols % 32 == 0 && rows % 8 == 0 && y.len() >= rows && x.len() >= cols, "matvec_q6: cols must be a multiple of 32 and rows of 8, and y and x need rows and cols values");
+  assert(codes.len() / rows >= cols / 8 && high.len() / rows >= cols / 16 && scales.len() / rows >= cols / 32, "matvec_q6: the matrix has too few words or scales for rows x cols");
+  let words = cols / 8;
+  let hwords = cols / 16;
+  let groups = cols / 32;
+  spawn on(Topology::Device) {
+    for rb in 0..rows / 8 across blocks {
+      let mut part = unsafe {
+        Tensor<f32, [1, 8, 32], Memory::SMEM>::uninit()
+      };
+      // One SIMD group, so that the sums over its lanes need no barrier of the whole block.
+      for s in 0..1 across subgroups {
+        for l in 0..32 across lanes(32) {
+          let first = rb * 8 + s * 8;
+          let mut acc = unsafe { Tensor<f32, [8]>::uninit() };
+          for j in 0..8 {
+            acc[j] = 0.0;
+          }
+          let mut i = l * 2;
+          while i < words {
+            let c = i * 8;
+            let mut xp = unsafe { Tensor<f32, [16]>::uninit() };
+            let mut xh = unsafe { Tensor<f32, [16]>::uninit() };
+            for t in 0..16 {
+              xp[t] = x[c + t];
+            }
+            let sum32 = 32.0 * (xp[0] + xp[1] + xp[2] + xp[3] + xp[4] + xp[5] + xp[6] + xp[7] + xp[8] + xp[9] + xp[10] + xp[11] + xp[12] + xp[13] + xp[14] + xp[15]);
+            xh[0] = xp[0] * 16.0;
+            xh[1] = xp[1] * 4.0;
+            xh[2] = xp[2] * 1.0;
+            xh[3] = xp[3] * 0.25;
+            xh[4] = xp[4] * 0.0625;
+            xh[5] = xp[5] * 0.015625;
+            xh[6] = xp[6] * 0.00390625;
+            xh[7] = xp[7] * 0.0009765625;
+            xh[8] = xp[8] * 0.000244140625;
+            xh[9] = xp[9] * 0.00006103515625;
+            xh[10] = xp[10] * 0.0000152587890625;
+            xh[11] = xp[11] * 0.000003814697265625;
+            xh[12] = xp[12] * 0.00000095367431640625;
+            xh[13] = xp[13] * 0.0000002384185791015625;
+            xh[14] = xp[14] * 0.000000059604644775390625;
+            xh[15] = xp[15] * 0.00000001490116119384765625;
+            xp[1] = xp[1] * 0.0625;
+            xp[2] = xp[2] * 0.00390625;
+            xp[3] = xp[3] * 0.000244140625;
+            xp[4] = xp[4] * 0.0000152587890625;
+            xp[5] = xp[5] * 0.00000095367431640625;
+            xp[6] = xp[6] * 0.000000059604644775390625;
+            xp[7] = xp[7] * 0.0000000037252902984619140625;
+            xp[9] = xp[9] * 0.0625;
+            xp[10] = xp[10] * 0.00390625;
+            xp[11] = xp[11] * 0.000244140625;
+            xp[12] = xp[12] * 0.0000152587890625;
+            xp[13] = xp[13] * 0.00000095367431640625;
+            xp[14] = xp[14] * 0.000000059604644775390625;
+            xp[15] = xp[15] * 0.0000000037252902984619140625;
+            for j in 0..8 {
+              let row = first + j;
+              let at = row * words + i;
+              let w0 = codes[at];
+              let w1 = codes[at + 1];
+              let h = high[row * hwords + i / 2];
+              let low = ((w0 & 15u32) as f32) * xp[0] + ((w0 & 240u32) as f32) * xp[1] + ((w0 & 3840u32) as f32) * xp[2] + ((w0 & 61440u32) as f32) * xp[3] + ((w0 & 983040u32) as f32) * xp[4] + ((w0 & 15728640u32) as f32) * xp[5] + ((w0 & 251658240u32) as f32) * xp[6] + ((w0 & 4026531840u32) as f32) * xp[7] + ((w1 & 15u32) as f32) * xp[8] + ((w1 & 240u32) as f32) * xp[9] + ((w1 & 3840u32) as f32) * xp[10] + ((w1 & 61440u32) as f32) * xp[11] + ((w1 & 983040u32) as f32) * xp[12] + ((w1 & 15728640u32) as f32) * xp[13] + ((w1 & 251658240u32) as f32) * xp[14] + ((w1 & 4026531840u32) as f32) * xp[15];
+              let top = ((h & 3u32) as f32) * xh[0] + ((h & 12u32) as f32) * xh[1] + ((h & 48u32) as f32) * xh[2] + ((h & 192u32) as f32) * xh[3] + ((h & 768u32) as f32) * xh[4] + ((h & 3072u32) as f32) * xh[5] + ((h & 12288u32) as f32) * xh[6] + ((h & 49152u32) as f32) * xh[7] + ((h & 196608u32) as f32) * xh[8] + ((h & 786432u32) as f32) * xh[9] + ((h & 3145728u32) as f32) * xh[10] + ((h & 12582912u32) as f32) * xh[11] + ((h & 50331648u32) as f32) * xh[12] + ((h & 201326592u32) as f32) * xh[13] + ((h & 805306368u32) as f32) * xh[14] + ((h & 3221225472u32) as f32) * xh[15];
+              acc[j] = acc[j] + (low + top - sum32) * (scales[row * groups + i / 4] as f32);
+            }
+            i = i + 64;
+          }
+          part[s][0][l] = acc[0];
+          part[s][1][l] = acc[1];
+          part[s][2][l] = acc[2];
+          part[s][3][l] = acc[3];
+          part[s][4][l] = acc[4];
+          part[s][5][l] = acc[5];
+          part[s][6][l] = acc[6];
+          part[s][7][l] = acc[7];
+        }
+        let s0 = lanes::sum(&part[s][0], 32);
+        let s1 = lanes::sum(&part[s][1], 32);
+        let s2 = lanes::sum(&part[s][2], 32);
+        let s3 = lanes::sum(&part[s][3], 32);
+        let s4 = lanes::sum(&part[s][4], 32);
+        let s5 = lanes::sum(&part[s][5], 32);
+        let s6 = lanes::sum(&part[s][6], 32);
+        let s7 = lanes::sum(&part[s][7], 32);
+        y[rb * 8 + s * 8 + 0] = s0;
+        y[rb * 8 + s * 8 + 1] = s1;
+        y[rb * 8 + s * 8 + 2] = s2;
+        y[rb * 8 + s * 8 + 3] = s3;
+        y[rb * 8 + s * 8 + 4] = s4;
+        y[rb * 8 + s * 8 + 5] = s5;
+        y[rb * 8 + s * 8 + 6] = s6;
+        y[rb * 8 + s * 8 + 7] = s7;
+      }
+    }
+  }
+  return;
+}
