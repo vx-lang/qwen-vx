@@ -27,8 +27,11 @@ import std::vec;
 import qwen::weights;
 import qwen::model;
 
-/// The most tokens of a chunk, unless the caller gives another number. A multiple of 16.
-const CHUNK : i32 = 512;
+/// The most tokens of a chunk, unless the caller gives another number. A multiple of 16. A bigger
+/// chunk gives each expert more tokens, so each expert reads its weights fewer times and its tiles
+/// of 16 tokens have less padding. Chunks of 2048 tokens make a prompt of 2000 to 8000 tokens 6 to
+/// 10% faster than chunks of 512 (#42), and need about 320 MB more for the tensors of a chunk.
+const CHUNK : i32 = 2048;
 
 /// The most tokens of a chunk that attention takes at a time. The scratch tensor of the scores
 /// has a row of positions for each of them, so it does not grow with the chunk.

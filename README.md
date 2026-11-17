@@ -254,7 +254,7 @@ and 24.3 ms in llama.cpp. Each token runs about 477 kernels. The details are in
 ## The prompt in chunks
 
 A generated token reads every weight that it uses, so it waits for memory. The prompt has all its
-tokens at the start, so the program runs it in chunks of up to 512 tokens. A chunk reads each
+tokens at the start, so the program runs it in chunks of up to 2048 tokens. A chunk reads each
 weight once for all its tokens. `src/prefill.vx` has the kernels of a chunk:
 
 - One product for each weight format. A block decodes 128 rows of the matrix and 32 columns at a
