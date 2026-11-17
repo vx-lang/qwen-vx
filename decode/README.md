@@ -8,6 +8,8 @@ Qwen3-Coder-30B-A3B in Q4_0 on an M4 with 32 GB.
   tokens, but its time is right.
 - `bandwidth.m` measures how fast a Metal kernel can read memory. This is the limit of each kernel
   that reads weights.
+- `faults/` measures the page faults, the memory and the CPU time of a run. Its README has the
+  results, and how a Metal residency set closed the gap to llama.cpp at long context.
 
 ## Run them
 
