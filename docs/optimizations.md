@@ -10,17 +10,23 @@ that uses 8 of its 128 experts in each layer for each token.
 
 ## The state now
 
-| | Time | Notes |
-| --- | --- | --- |
-| A generated token, short context | 23.4 ms (about 43 tokens a second) | The floor at the speed of memory is 18.4 ms |
-| A generated token, 2000 tokens of context | about 30 ms | Measured with the f32 KV cache, before #31 halved its bytes |
-| A prompt token, 2000-token prompt | 8.1 ms (7.0 ms without the first compile) | 7.2 ms with #30, which waits for a Vx release |
-| The start of a session | about 60 s | 51 s of it is the load of the weights (#27) |
-| The KV cache | 98 KB a token | f16 since #31; it was 196 KB |
+Measured on 2026-11-16 on a quiet Mac, with `main` at 5dd0e5c and the vxc of Vx `main` at
+32acbee0, next to llama.cpp 0.7.0 (`llama-bench`), one model at a time
+([#6](https://github.com/vx-lang/qwen-vx/issues/6#issuecomment-6914809508)). All the numbers are
+for one user and one sequence.
 
-llama.cpp 0.7.0 took 24.3 ms for a generated token on the same Mac, in `llama-bench -n 128`
-([#6](https://github.com/vx-lang/qwen-vx/issues/6#issuecomment-6879596324)). The two were not
-measured side by side since, so compare them again before a claim.
+| | Qwen-vx | llama.cpp | Notes |
+| --- | --- | --- | --- |
+| A generated token, 5 tokens of context | 24.6 ms (40.7 tokens a second) | 24.0 ms | The floor at the speed of memory is 18.4 ms |
+| A generated token, 2,000 tokens of context | 27.7 ms (36.2 tokens a second) | 26.3 ms | |
+| A generated token, 8,000 tokens of context | 37.7 ms (26.5 tokens a second) | 36.3 ms | |
+| The prompt, 2,000 tokens | 135 tokens a second (7.4 ms a token) | 361 tokens a second | 151 with #30, which waits for a Vx release |
+| The prompt, 8,000 tokens | 80 tokens a second (12.5 ms a token) | 237 tokens a second | 88 with #30 |
+| The start of a session | about 60 s | | 51 s of it is the load of the weights (#27) |
+| The KV cache | 98 KB a token | | f16 since #31; it was 196 KB |
+
+Generated tokens are within 5% of llama.cpp at all three lengths. The prompt is the large gap:
+llama.cpp reads it 2.4 to 2.9 times as fast.
 
 ## How to measure
 
@@ -225,6 +231,8 @@ between about 530 kernels that each wait for the one before (#34).
 
 ## Open work
 
+- **The prompt**: 135 tokens a second at 2,000 tokens, against 361 for llama.cpp. #30 is a first
+  step (151).
 - **The load of the weights** (#27): 51 s, because the program copies each tensor two times. A load
   with no copy needs vx-lang/Vx#3498 (a tensor over memory that the program does not own) and
   vx-lang/Vx#3499 (the Metal runtime gives a mapped file to the GPU once). It would also let macOS
@@ -233,5 +241,7 @@ between about 530 kernels that each wait for the one before (#34).
   after them, and the router into top-k, and measure each change with a Metal trace.
 - **Fewer bytes for a token** (#33): lm_head in Q4_0 (#9) would save about 1.3 ms, after a check of
   the perplexity.
+- **Attention at a long context** (#38): about 4 ms of a token at 8,000 positions, above the
+  floor. An earlier measurement of 63.9 ms there was slowed by swap.
 - **A short turn at a long context** (#26): a turn of 20 tokens still runs almost every expert of
   every layer, so it takes about 2 s.
