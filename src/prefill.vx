@@ -331,7 +331,9 @@ fn pf_mm_q4_set(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?],
         for sg in 0..4 across subgroups {
           lanes::fill(&mut acc[sg], 0.0);
         }
-        for g in 0..groups {
+        // A tile after those of the last expert has the base -1, and only gets zeros.
+        let live = i32::min(bases[tb] + 1, 1);
+        for g in 0..groups * live {
           for sg in 0..4 across subgroups {
             for l in 0..32 across lanes(32) {
               let r = rb * 128 + sg * 32 + l;
