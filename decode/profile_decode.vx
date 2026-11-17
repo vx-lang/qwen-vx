@@ -51,7 +51,11 @@ fn layers(w : &Weights, s : &mut State, token : &Tensor<i32, [?], Memory::HBM>, 
       norm_rope_and_store(&mut s.q_turned, &mut cache.k, &mut cache.v, &s.q, &s.k, &s.v, &layer.q_norm, &layer.k_norm, &s.cos, &s.sin, pos, c.num_q_heads, c.num_kv_heads, c.head_dim, eps);
     }
     if !has(skip, ATTENTION) {
-      split_attention(&mut s.attended, &mut s.attention_parts, &s.q_turned, &cache.k, &cache.v, pos, c.num_q_heads, c.num_kv_heads, c.head_dim);
+      if c.head_dim == 128 {
+        vec_attention(&mut s.attended, &mut s.vec_parts, &s.q_turned, &cache.k, &cache.v, pos, c.num_q_heads, c.num_kv_heads, c.head_dim);
+      } else {
+        split_attention(&mut s.attended, &mut s.attention_parts, &s.q_turned, &cache.k, &cache.v, pos, c.num_q_heads, c.num_kv_heads, c.head_dim);
+      }
     }
     if !has(skip, ATTN_OUT) {
       matvec_heads_add(&mut s.x, &layer.attn_out, &s.attended, c.hidden_size, c.num_q_heads, c.head_dim);

@@ -45,6 +45,7 @@ struct State {
   q_turned : Tensor<f32, [?, ?], Memory::HBM>,
   attended : Tensor<f32, [?, ?], Memory::HBM>,
   attention_parts : Tensor<f32, [?, ?, ?, ?], Memory::HBM>,
+  vec_parts : Tensor<f32, [?, ?, ?], Memory::HBM>,
   mlp : Tensor<f32, [?], Memory::HBM>,
   experts : Experts,
   logits : Tensor<f32, [?], Memory::HBM>,
@@ -90,6 +91,7 @@ fn new_state(c : &Config, max_seq : i32) -> State {
     q_turned: transfer(Tensor<f32>([c.num_q_heads, c.head_dim]), Memory::HBM),
     attended: transfer(Tensor<f32>([c.num_q_heads, c.head_dim]), Memory::HBM),
     attention_parts: transfer(split_attention_scratch(max_seq, c.num_q_heads, c.num_kv_heads, c.head_dim), Memory::HBM),
+    vec_parts: transfer(vec_attention_scratch(c.num_q_heads), Memory::HBM),
     mlp: transfer(Tensor<f32>([c.intermediate_size]), Memory::HBM),
     experts: Experts {
       router_logits: transfer(Tensor<f32>([experts]), Memory::HBM),
@@ -201,7 +203,11 @@ fn run_layers(w : &Weights, s : &mut State, token : &Tensor<i32, [?], Memory::HB
     } else {
       rope_and_store(&mut s.q_turned, &mut cache.k, &mut cache.v, &s.q, &s.k, &s.v, &s.cos, &s.sin, pos, c.num_q_heads, c.num_kv_heads, c.head_dim);
     }
-    split_attention(&mut s.attended, &mut s.attention_parts, &s.q_turned, &cache.k, &cache.v, pos, c.num_q_heads, c.num_kv_heads, c.head_dim);
+    if c.head_dim == 128 {
+      vec_attention(&mut s.attended, &mut s.vec_parts, &s.q_turned, &cache.k, &cache.v, pos, c.num_q_heads, c.num_kv_heads, c.head_dim);
+    } else {
+      split_attention(&mut s.attended, &mut s.attention_parts, &s.q_turned, &cache.k, &cache.v, pos, c.num_q_heads, c.num_kv_heads, c.head_dim);
+    }
     matvec_heads_add(&mut s.x, &layer.attn_out, &s.attended, c.hidden_size, c.num_q_heads, c.head_dim);
     nn_rms_norm(&mut s.xn, &s.x, &layer.mlp_norm, c.hidden_size, eps);
     if c.num_experts > 0 {
