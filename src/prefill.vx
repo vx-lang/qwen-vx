@@ -82,7 +82,7 @@ struct Prefill {
 fn expert_positions(c : &Config, chunk : i32) -> i32 {
   let k = i32::max(c.experts_per_token, 1);
   let experts = i32::max(c.num_experts, 1);
-  return (chunk * k + experts * 15 + 15) / 16 * 16;
+  return (chunk * k + experts * 31 + 31) / 32 * 32;
 }
 
 /// The tensors for chunks of up to `chunk` tokens, at up to `max_seq` positions.
@@ -93,6 +93,8 @@ fn new_prefill(c : &Config, max_seq : i32, chunk : i32) -> Prefill {
   let k = i32::max(c.experts_per_token, 1);
   let experts = i32::max(c.num_experts, 1);
   let positions = expert_positions(c, chunk);
+  // The products of Q4_0 matrices take 32 rows at a time.
+  let cap = (chunk + 31) / 32 * 32;
   let mut ident = Tensor<i32>([positions]);
   for p in 0..positions {
     ident[p] = p;
@@ -103,19 +105,19 @@ fn new_prefill(c : &Config, max_seq : i32, chunk : i32) -> Prefill {
   if moe {
     moe_rows = positions;
   } else {
-    dense_rows = chunk;
+    dense_rows = cap;
   }
   let inter = i32::max(c.intermediate_size, 1);
   let moe_inter = i32::max(c.moe_intermediate_size, 1);
   return Prefill {
     chunk: chunk,
     tokens: transfer(Tensor<i32>([chunk]), Memory::HBM),
-    rows: transfer(Tensor<i32>([chunk]), Memory::HBM),
-    zeros: transfer(Tensor<i32>([chunk / 16]), Memory::HBM),
+    rows: transfer(Tensor<i32>([cap]), Memory::HBM),
+    zeros: transfer(Tensor<i32>([cap / 16]), Memory::HBM),
     no_bias: transfer(Tensor<bf16>([1]), Memory::HBM),
-    x: transfer(Tensor<f32>([chunk, c.hidden_size]), Memory::HBM),
-    xn: transfer(Tensor<f32>([chunk, c.hidden_size]), Memory::HBM),
-    qkv: transfer(Tensor<f32>([chunk, qkv_rows]), Memory::HBM),
+    x: transfer(Tensor<f32>([cap, c.hidden_size]), Memory::HBM),
+    xn: transfer(Tensor<f32>([cap, c.hidden_size]), Memory::HBM),
+    qkv: transfer(Tensor<f32>([cap, qkv_rows]), Memory::HBM),
     q: transfer(Tensor<f32>([chunk, c.num_q_heads, c.head_dim]), Memory::HBM),
     heads: transfer(Tensor<f32>([c.num_kv_heads * 1024, 128]), Memory::HBM),
     att: transfer(Tensor<f32>([chunk, c.num_q_heads * c.head_dim]), Memory::HBM),
@@ -324,30 +326,36 @@ fn pf_mm_fp8(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Me
 /// times its scale, rounded to f16. The inputs stay f32: with f16 inputs, the logits of the tiny
 /// model of experts moved 20 times as much, for 2% less time.
 fn pf_mm_q4_set(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, list : &Tensor<i32, [?], Memory::HBM>, bases : &Tensor<i32, [?], Memory::HBM>, stride : i32, rows : i32, cols : i32, tiles : i32) -> void {
-  assert(cols % 32 == 0 && tiles > 0 && list.len() >= tiles * 16 && bases.len() >= tiles, "pf_mm_q4_set: cols must be a multiple of 32, and list and bases need the tiles");
+  // A block takes 32 tokens: two tiles of 16, which must have the same base.
+  let pairs = (tiles + 1) / 2;
+  assert(cols % 32 == 0 && tiles > 0 && list.len() >= pairs * 32 && bases.len() >= 2 * pairs - 1, "pf_mm_q4_set: cols must be a multiple of 32, and list and bases need the tiles of 32 tokens");
   let words = cols / 8;
   let groups = cols / 32;
   spawn on(Topology::Device) {
-    for rb in 0..(rows + 127) / 128 across blocks {
-      for tb in 0..tiles across blocks {
-        let mut sw = unsafe { Tensor<f16, [4, 32, 32], Memory::SMEM>::uninit() };
-        let mut sx = unsafe { Tensor<f32, [1, 16, 32], Memory::SMEM>::uninit() };
+    for rb in 0..(rows + 63) / 64 across blocks {
+      for tb in 0..pairs across blocks {
+        // sw[sg]: columns (sg % 2) * 16 to + 15 of rows (sg / 2) * 32 to + 31 of the block, as
+        // [column][row]. sx[sg]: tokens (sg / 2) * 16 to + 15 of the block, columns (sg % 2) * 16 to
+        // + 15. Subgroup sg makes tokens (sg / 2) * 16 to + 15 and rows (sg % 2) * 32 to + 31.
+        let mut sw = unsafe { Tensor<f16, [4, 16, 32], Memory::SMEM>::uninit() };
+        let mut sx = unsafe { Tensor<f16, [4, 16, 16], Memory::SMEM>::uninit() };
         let mut acc = unsafe { Tensor<f32, [4, 16, 32], Memory::SMEM>::uninit() };
         for sg in 0..4 across subgroups {
           lanes::fill(&mut acc[sg], 0.0);
         }
         // A tile after those of the last expert has the base -1, and only gets zeros.
-        let live = i32::min(bases[tb] + 1, 1);
+        let base = bases[tb * 2];
+        let live = i32::min(base + 1, 1);
         for g in 0..groups * live {
           for sg in 0..4 across subgroups {
             for l in 0..32 across lanes(32) {
-              let r = rb * 128 + sg * 32 + l;
+              let r = rb * 64 + (sg / 2) * 32 + l;
               if r < rows {
-                let row = bases[tb] * stride + r;
-                let at = row * words + g * 4;
+                let row = base * stride + r;
+                let at = row * words + g * 4 + (sg % 2) * 2;
                 let sc = scales[row * groups + g] as f32;
                 let m = -8.0 * sc;
-                for i in 0..4 {
+                for i in 0..2 {
                   let word = w[at + i];
                   sw[sg][i * 8][l] = (((word & 15u32) as f32) * sc + m) as f16;
                   sw[sg][i * 8 + 1][l] = ((((word >> 4u32) & 15u32) as f32) * sc + m) as f16;
@@ -359,26 +367,28 @@ fn pf_mm_q4_set(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?],
                   sw[sg][i * 8 + 7][l] = ((((word >> 28u32) & 15u32) as f32) * sc + m) as f16;
                 }
               } else {
-                for k in 0..32 {
+                for k in 0..16 {
                   sw[sg][k][l] = 0.0 as f16;
                 }
               }
-              for q in 0..4 {
-                let from = list[tb * 16 + sg * 4 + q];
+              // Lane l copies 8 columns of token l / 2 of the tile of subgroup sg.
+              let from = list[tb * 32 + (sg / 2) * 16 + l / 2];
+              for j in 0..8 {
                 let mut v : f32 = 0.0;
                 if from >= 0 {
-                  v = x[from][g * 32 + l];
+                  v = x[from][g * 32 + (sg % 2) * 16 + (l % 2) * 8 + j];
                 }
-                sx[0][sg * 4 + q][l] = v;
+                sx[sg][l / 2][(l % 2) * 8 + j] = v as f16;
               }
             }
           }
           for sg in 0..4 across subgroups {
-            acc[sg] = acc[sg] + sx[0] @ (sw[sg] as f32);
+            acc[sg] = acc[sg] + (sx[(sg / 2) * 2] as f32) @ (sw[(sg % 2) * 2] as f32);
+            acc[sg] = acc[sg] + (sx[(sg / 2) * 2 + 1] as f32) @ (sw[(sg % 2) * 2 + 1] as f32);
           }
         }
         for sg in 0..4 across subgroups {
-          lanes::copy(y, &acc[sg], [tb * 16, rb * 128 + sg * 32]);
+          lanes::copy(y, &acc[sg], [tb * 32 + (sg / 2) * 16, rb * 64 + (sg % 2) * 32]);
         }
       }
     }
@@ -1032,7 +1042,7 @@ fn pf_place_experts(rows : &Tensor<i32, [?], Memory::HBM>, slot : &Tensor<i32, [
       for l in 0..32 across lanes {
         let mut first = 0;
         for f in 0..e {
-          first = first + (counts[f] + 15) / 16 * 16;
+          first = first + (counts[f] + 31) / 32 * 32;
         }
         let mut at = first;
         for i in 0..l {
@@ -1051,7 +1061,7 @@ fn pf_place_experts(rows : &Tensor<i32, [?], Memory::HBM>, slot : &Tensor<i32, [
           }
         }
         if l == 31 {
-          let end = first + (counts[e] + 15) / 16 * 16;
+          let end = first + (counts[e] + 31) / 32 * 32;
           while at < end {
             atomic_store_i32(rows, at, -1, AtomicOrdering::Relaxed);
             at = at + 1;
@@ -1072,7 +1082,7 @@ fn pf_expert_bases(bases : &mut Tensor<i32, [?], Memory::HBM>, counts : &Tensor<
         let mut end = 0;
         let mut base = -1;
         for e in 0..experts {
-          end = end + (counts[e] + 15) / 16 * 16;
+          end = end + (counts[e] + 31) / 32 * 32;
           if base < 0 && tb * 16 < end {
             base = e;
           }
@@ -1160,14 +1170,18 @@ fn run_prompt(w : &Weights, s : &mut State, p : &mut Prefill, tokens : &Vec<i32>
   while start < count {
     let n = i32::min(chunk, count - start);
     let mut ids = Tensor<i32>([chunk]);
-    let mut rows = Tensor<i32>([chunk]);
+    let mut rows = Tensor<i32>([p.rows.len()]);
+    for t in 0..p.rows.len() {
+      rows[t] = -1;
+      if t < n {
+        rows[t] = t;
+      }
+    }
     for t in 0..chunk {
       if t < n {
         ids[t] = tokens[start + t];
-        rows[t] = t;
       } else {
         ids[t] = 0;
-        rows[t] = -1;
       }
     }
     p.tokens = transfer(ids, Memory::HBM);
