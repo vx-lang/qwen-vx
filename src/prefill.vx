@@ -407,6 +407,8 @@ fn pf_mm_q4_set(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?],
 ///
 /// The design is that of llama.cpp (ggml/src/ggml-metal/kernels/mul_mm.metal), MIT License,
 /// Copyright (c) 2023-2026 The ggml authors.
+///
+/// scripts/mlir_kernels/expert_product.py writes this function: change that script, not the MLIR.
 fn pf_mm_q4_mlir(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, list : &Tensor<i32, [?], Memory::HBM>, bases : &Tensor<i32, [?], Memory::HBM>, stride : i32, rows : i32, cols : i32, tiles : i32) -> void {
   spawn on(Topology::Device) {
     for rb in 0..rows / 64 across blocks {
@@ -1192,6 +1194,8 @@ fn pf_weigh_values(out : &mut Tensor<f32, [?, ?], Memory::HBM>, probs : &Tensor<
 ///
 /// The design is that of llama.cpp (ggml/src/ggml-metal/kernels/fa_common.metal), MIT License,
 /// Copyright (c) 2023-2026 The ggml authors.
+///
+/// scripts/mlir_kernels/flash_attention.py writes this function: change that script, not the MLIR.
 fn pf_flash_attention(att : &mut Tensor<f32, [?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, group : i32, scale : f32) -> void {
   assert(q.extent(2) == 128 && k_cache.extent(2) == 128 && k_cache.extent(0) % 64 == 0 && start + n <= k_cache.extent(0), "pf_flash_attention: head_dim 128, and a KV cache of a multiple of 64 positions");
   spawn on(Topology::Device) {
