@@ -163,7 +163,7 @@ fn pf_mm_bf16(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<bf16, [?], 
           }
         }
         // A tile after those of the last expert has the base -1, and only gets zeros.
-        let live = i32::min(bases[tb] + 1, 1);
+        let live = (bases[tb] + 1048576) / 1048576;
         for g in 0..groups * live {
           for sg in 0..4 across subgroups {
             for l in 0..32 across lanes(32) {
@@ -253,7 +253,7 @@ fn pf_mm_fp8(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Me
           }
         }
         // A tile after those of the last expert has the base -1, and only gets zeros.
-        let live = i32::min(bases[tb] + 1, 1);
+        let live = (bases[tb] + 1048576) / 1048576;
         for g in 0..groups * live {
           for sg in 0..4 across subgroups {
             for l in 0..32 across lanes(32) {
@@ -332,7 +332,7 @@ fn pf_mm_q4_set(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?],
           lanes::fill(&mut acc[sg], 0.0);
         }
         // A tile after those of the last expert has the base -1, and only gets zeros.
-        let live = i32::min(bases[tb] + 1, 1);
+        let live = (bases[tb] + 1048576) / 1048576;
         for g in 0..groups * live {
           for sg in 0..4 across subgroups {
             for l in 0..32 across lanes(32) {
@@ -413,7 +413,7 @@ fn pf_mm_q4(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Mem
           }
         }
         // A tile after those of the last expert has the base -1, and only gets zeros.
-        let live = i32::min(bases[tb] + 1, 1);
+        let live = (bases[tb] + 1048576) / 1048576;
         for g in 0..groups * live {
           for sg in 0..4 across subgroups {
             for l in 0..32 across lanes(32) {
