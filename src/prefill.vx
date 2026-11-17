@@ -22,13 +22,17 @@
 //   them all and two tokens. The matmuls skip the positions after the tokens of their tile.
 import core::convert;
 import core::num;
+import core::sync::atomic;
 import std::nn;
 import std::vec;
 import qwen::weights;
 import qwen::model;
 
-/// The most tokens of a chunk, unless the caller gives another number. A multiple of 16.
-const CHUNK : i32 = 512;
+/// The most tokens of a chunk, unless the caller gives another number. A multiple of 16. A bigger
+/// chunk gives each expert more tokens, so each expert reads its weights fewer times and its tiles
+/// of 16 tokens have less padding. Chunks of 2048 tokens make a prompt of 2000 to 8000 tokens 6 to
+/// 10% faster than chunks of 512 (#42), and need about 320 MB more for the tensors of a chunk.
+const CHUNK : i32 = 2048;
 
 /// The most tokens of a chunk that attention takes at a time. The scratch tensor of the scores
 /// has a row of positions for each of them, so it does not grow with the chunk.
@@ -36,9 +40,10 @@ const ATTENTION_TOKENS : i32 = 128;
 
 /// The tensors of a chunk, made once. `rows` is the list of input rows of the dense products:
 /// row t for a token of the chunk, and -1 after the last one. `zeros` gives the expert 0 to each
-/// tile of a dense product. The `e_` tensors are those of the experts, in the order of the CPU's
-/// sort: position p of `e_rows` is a token, or -1 for padding, and `slot[t][j]` is the position of
-/// expert j of token t.
+/// tile of a dense product. The `e_` tensors are those of the experts, in the order of the sort
+/// (`pf_sort_by_expert`): position p of `e_rows` is a token, or -1 for padding, and
+/// `slot[t * k + j]` is the position of expert j of token t. `e_counts[e]` is the number of choices
+/// of expert e, and `e_lane_counts[e * 32 + l]` those in the tokens of lane l of the sort.
 struct Prefill {
   chunk : i32,
   tokens : Tensor<i32, [?], Memory::HBM>,
@@ -60,7 +65,9 @@ struct Prefill {
   e_rows : Tensor<i32, [?], Memory::HBM>,
   e_ident : Tensor<i32, [?], Memory::HBM>,
   e_bases : Tensor<i32, [?], Memory::HBM>,
-  slot : Tensor<i32, [?, ?], Memory::HBM>,
+  slot : Tensor<i32, [?], Memory::HBM>,
+  e_counts : Tensor<i32, [?], Memory::HBM>,
+  e_lane_counts : Tensor<i32, [?], Memory::HBM>,
   e_gu : Tensor<f32, [?, ?], Memory::HBM>,
   e_h : Tensor<f32, [?, ?], Memory::HBM>,
   e_out : Tensor<f32, [?, ?], Memory::HBM>,
@@ -117,7 +124,9 @@ fn new_prefill(c : &Config, max_seq : i32, chunk : i32) -> Prefill {
     e_rows: transfer(Tensor<i32>([positions]), Memory::HBM),
     e_ident: transfer(ident, Memory::HBM),
     e_bases: transfer(Tensor<i32>([positions / 16]), Memory::HBM),
-    slot: transfer(Tensor<i32>([chunk, k]), Memory::HBM),
+    slot: transfer(Tensor<i32>([chunk * k]), Memory::HBM),
+    e_counts: transfer(Tensor<i32>([experts]), Memory::HBM),
+    e_lane_counts: transfer(Tensor<i32>([experts * 32]), Memory::HBM),
     e_gu: transfer(Tensor<f32>([moe_rows, 2 * moe_inter]), Memory::HBM),
     e_h: transfer(Tensor<f32>([moe_rows, moe_inter]), Memory::HBM),
     e_out: transfer(Tensor<f32>([moe_rows, c.hidden_size]), Memory::HBM),
@@ -153,7 +162,9 @@ fn pf_mm_bf16(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<bf16, [?], 
             }
           }
         }
-        for g in 0..groups {
+        // A tile after those of the last expert has the base -1, and only gets zeros.
+        let live = i32::min(bases[tb] + 1, 1);
+        for g in 0..groups * live {
           for sg in 0..4 across subgroups {
             for l in 0..32 across lanes(32) {
               let r = rb * 128 + sg * 32 + l;
@@ -241,7 +252,9 @@ fn pf_mm_fp8(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Me
             }
           }
         }
-        for g in 0..groups {
+        // A tile after those of the last expert has the base -1, and only gets zeros.
+        let live = i32::min(bases[tb] + 1, 1);
+        for g in 0..groups * live {
           for sg in 0..4 across subgroups {
             for l in 0..32 across lanes(32) {
               let r = rb * 128 + sg * 32 + l;
@@ -397,7 +410,9 @@ fn pf_mm_q4(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Mem
             }
           }
         }
-        for g in 0..groups {
+        // A tile after those of the last expert has the base -1, and only gets zeros.
+        let live = i32::min(bases[tb] + 1, 1);
+        for g in 0..groups * live {
           for sg in 0..4 across subgroups {
             for l in 0..32 across lanes(32) {
               let r = rb * 128 + sg * 32 + l;
@@ -912,9 +927,9 @@ fn pf_top_k(ids : &mut Tensor<i32, [?, ?], Memory::HBM>, weights : &mut Tensor<f
   return;
 }
 
-/// x[t] += the sum over j of weights[t][j] * out[slot[t][j]], for t below n: the experts of each
-/// token, each times its weight, in the order of j.
-fn pf_combine(x : &mut Tensor<f32, [?, ?], Memory::HBM>, out : &Tensor<f32, [?, ?], Memory::HBM>, weights : &Tensor<f32, [?, ?], Memory::HBM>, slot : &Tensor<i32, [?, ?], Memory::HBM>, n : i32, k : i32, dim : i32) -> void {
+/// x[t] += the sum over j of weights[t][j] * out[slot[t * k + j]], for t below n: the experts of
+/// each token, each times its weight, in the order of j.
+fn pf_combine(x : &mut Tensor<f32, [?, ?], Memory::HBM>, out : &Tensor<f32, [?, ?], Memory::HBM>, weights : &Tensor<f32, [?, ?], Memory::HBM>, slot : &Tensor<i32, [?], Memory::HBM>, n : i32, k : i32, dim : i32) -> void {
   spawn on(Topology::Device) {
     for t in 0..n across blocks {
       for b in 0..(dim + 255) / 256 across blocks {
@@ -923,7 +938,7 @@ fn pf_combine(x : &mut Tensor<f32, [?, ?], Memory::HBM>, out : &Tensor<f32, [?, 
           if i < dim {
             let mut s : f32 = 0.0;
             for j in 0..k {
-              s = s + weights[t][j] * out[slot[t][j]][i];
+              s = s + weights[t][j] * out[slot[t * k + j]][i];
             }
             x[t][i] = x[t][i] + s;
           }
@@ -951,42 +966,116 @@ fn pf_take_row(y : &mut Tensor<f32, [?], Memory::HBM>, x : &Tensor<f32, [?, ?], 
 
 // -------------------------------------------------------------------------- the chunk ---
 
-/// Sorts the choices of the chunk by expert, on the CPU: the tokens of expert e come after those
-/// of expert e - 1, in the order of the tokens, and padding with -1 makes each expert a whole
-/// number of tiles of 16. Gives the number of tiles.
-fn sort_by_expert(p : &mut Prefill, n : i32, k : i32, experts : i32) -> i32 {
-  let ids = transfer(&p.ids, Memory::CPU_DRAM);
-  let positions = p.e_rows.len();
-  let mut rows = Tensor<i32>([positions]);
-  let mut bases = Tensor<i32>([positions / 16]);
-  let mut slot = Tensor<i32>([p.chunk, k]);
-  let mut at = 0;
-  for e in 0..experts {
-    let first = at;
-    for t in 0..n {
-      for j in 0..k {
-        if ids[t][j] == e {
-          rows[at] = t;
-          slot[t][j] = at;
-          at = at + 1;
+/// For each expert e, the number of its choices among the n tokens of the chunk: e_counts[e], and
+/// e_lane_counts[e * 32 + l] for the tokens of lane l of the sort, l * span to l * span + span - 1.
+fn pf_count_experts(counts : &mut Tensor<i32, [?], Memory::HBM>, lane_counts : &mut Tensor<i32, [?], Memory::HBM>, ids : &Tensor<i32, [?, ?], Memory::HBM>, n : i32, k : i32, experts : i32) -> void {
+  let span = (n + 31) / 32;
+  spawn on(Topology::Device) {
+    for e in 0..experts across blocks {
+      let mut part = unsafe { Tensor<i32, [32], Memory::SMEM>::uninit() };
+      for l in 0..32 across lanes {
+        let mut c = 0;
+        for i in 0..span {
+          let t = l * span + i;
+          if t < n {
+            for j in 0..k {
+              if ids[t][j] == e {
+                c = c + 1;
+              }
+            }
+          }
+        }
+        lane_counts[e * 32 + l] = c;
+        part[l] = c;
+      }
+      for l in 0..32 across lanes {
+        if l == 0 {
+          let mut total = 0;
+          for i in 0..32 {
+            total = total + part[i];
+          }
+          counts[e] = total;
         }
       }
     }
-    while at % 16 != 0 {
-      rows[at] = -1;
-      at = at + 1;
-    }
-    let mut b = first / 16;
-    while b < at / 16 {
-      bases[b] = e;
-      b = b + 1;
+  }
+  return;
+}
+
+/// Places the choices of the chunk by expert: the tokens of expert e come after those of expert
+/// e - 1, in the order of the tokens, and padding with -1 makes each expert a whole number of tiles
+/// of 16. Each lane of the block of an expert places the choices of its tokens. The rows of
+/// different tokens go to positions that the race proof cannot follow, so the stores are atomic
+/// (vx-lang/Vx#3450).
+fn pf_place_experts(rows : &Tensor<i32, [?], Memory::HBM>, slot : &Tensor<i32, [?], Memory::HBM>, counts : &Tensor<i32, [?], Memory::HBM>, lane_counts : &Tensor<i32, [?], Memory::HBM>, ids : &Tensor<i32, [?, ?], Memory::HBM>, n : i32, k : i32, experts : i32) -> void {
+  let span = (n + 31) / 32;
+  spawn on(Topology::Device) {
+    for e in 0..experts across blocks {
+      for l in 0..32 across lanes {
+        let mut first = 0;
+        for f in 0..e {
+          first = first + (counts[f] + 15) / 16 * 16;
+        }
+        let mut at = first;
+        for i in 0..l {
+          at = at + lane_counts[e * 32 + i];
+        }
+        for i in 0..span {
+          let t = l * span + i;
+          if t < n {
+            for j in 0..k {
+              if ids[t][j] == e {
+                atomic_store_i32(rows, at, t, AtomicOrdering::Relaxed);
+                atomic_store_i32(slot, t * k + j, at, AtomicOrdering::Relaxed);
+                at = at + 1;
+              }
+            }
+          }
+        }
+        if l == 31 {
+          let end = first + (counts[e] + 15) / 16 * 16;
+          while at < end {
+            atomic_store_i32(rows, at, -1, AtomicOrdering::Relaxed);
+            at = at + 1;
+          }
+        }
+      }
     }
   }
-  assert(at <= positions, "sort_by_expert: more positions than the chunk has");
-  p.e_rows = transfer(rows, Memory::HBM);
-  p.e_bases = transfer(bases, Memory::HBM);
-  p.slot = transfer(slot, Memory::HBM);
-  return at / 16;
+  return;
+}
+
+/// bases[tb] = the expert of tile tb, for each of the `tiles` tiles of the positions. The tiles
+/// after those of the last expert get -1, and the products skip them.
+fn pf_expert_bases(bases : &mut Tensor<i32, [?], Memory::HBM>, counts : &Tensor<i32, [?], Memory::HBM>, experts : i32, tiles : i32) -> void {
+  spawn on(Topology::Device) {
+    for tb in 0..tiles across blocks {
+      for l in 0..1 across lanes {
+        let mut end = 0;
+        let mut base = -1;
+        for e in 0..experts {
+          end = end + (counts[e] + 15) / 16 * 16;
+          if base < 0 && tb * 16 < end {
+            base = e;
+          }
+        }
+        bases[tb + l] = base;
+      }
+    }
+  }
+  return;
+}
+
+/// Sorts the choices of the chunk by expert, on the GPU, so that the CPU does not wait for the
+/// router (#44). Gives the number of tiles of the products: all the tiles of the positions, because
+/// the CPU does not know how many the experts use. The products skip the tiles after those of the
+/// last expert.
+fn pf_sort_by_expert(p : &mut Prefill, n : i32, k : i32, experts : i32) -> i32 {
+  let tiles = p.e_rows.len() / 16;
+  pf_count_experts(&mut p.e_counts, &mut p.e_lane_counts, &p.ids, n, k, experts);
+  pf_place_experts(&p.e_rows, &p.slot, &p.e_counts, &p.e_lane_counts, &p.ids, n, k, experts);
+  pf_expert_bases(&mut p.e_bases, &p.e_counts, experts, tiles);
+  return tiles;
 }
 
 /// The mixture of experts of a layer, for the n tokens of the chunk: x += the experts of each
@@ -996,7 +1085,7 @@ fn pf_experts(p : &mut Prefill, layer : &Layer, c : &Config, n : i32, tiles : i3
   let inter = c.moe_intermediate_size;
   pf_mm_bf16(&mut p.router, &layer.router, &p.xn, &p.rows, &p.zeros, 0, &p.no_bias, false, false, c.num_experts, c.hidden_size, tiles);
   pf_top_k(&mut p.ids, &mut p.wts, &p.router, n, c.num_experts, k);
-  let e_tiles = sort_by_expert(p, n, k, c.num_experts);
+  let e_tiles = pf_sort_by_expert(p, n, k, c.num_experts);
   pf_mm(&mut p.e_gu, &layer.gate_up, &p.xn, &p.e_rows, &p.e_bases, 2 * inter, &p.no_bias, false, false, 2 * inter, c.hidden_size, e_tiles);
   pf_silu_mul(&mut p.e_h, &p.e_gu, e_tiles * 16, inter);
   pf_mm(&mut p.e_out, &layer.down, &p.e_h, &p.e_ident, &p.e_bases, c.hidden_size, &p.no_bias, false, false, c.hidden_size, inter, e_tiles);
