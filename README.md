@@ -208,6 +208,13 @@ the same prompt, after `convert_tokenizer.py ~/models/Qwen3-Coder-30B-A3B-Instru
 and an iterative `fibonacci` in the 64 steps. `reference.py` on the same file chose the same 64
 tokens, with each logit within 5.4e-05.
 
+The program gives the GPU the pages of the mapped weight file, with no copy. This needs the vxc of
+Vx `main` at c4e57fd7 or later ([vx-lang/Vx#3606](https://github.com/vx-lang/Vx/pull/3606)). On
+an M4 with 32 GB, the load takes about 10.5 s, and the program has 0.3 GB of private memory at
+a short context and 2.1 GB at 8,000 tokens of context. When it copied the weights, the load took
+29 to 38 s and 18.9 to 20.4 GB. The file cache keeps one copy of the weights for all the runs, and
+macOS can drop those pages when other programs need memory.
+
 An importance matrix makes the Q4_0 file closer to bf16. `importance.py` needs the bf16 file, and
 took 110 minutes for 150 chunks of 512 tokens on an M4 with 32 GB:
 

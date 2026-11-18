@@ -15,8 +15,8 @@ The question was why llama.cpp generated a token 1 ms faster at 2,000 tokens of 
   each command buffer. This alone saves 1.3 to 1.6 ms a token at 2,000 tokens of context and 1.6 to
   1.9 ms at 8,000. llama.cpp also uses a residency set.
 
-The analysis also found that the load copies the weights into private memory, which costs about
-30 s and 18 GB.
+The analysis also found that the load copied the weights into private memory, which cost about
+30 s and 18 GB. The app now reads the weights in place from the mapped file (see the end).
 
 ## The tools
 
@@ -120,12 +120,12 @@ context generate the same 64 tokens.
   compilers do not change the time.
 - The set saves nothing at short context. Its gain grows with the context. Why is not known yet.
 
-### The load copies the weights
+### The load copied the weights
 
-`load_weights` maps the 17.8 GB file. Then it copies each tensor into a host tensor, and
-`transfer(.., Memory::HBM)` copies the host tensor into memory from `vx_metal_alloc`. The 1.08M
-pageins are the file, read in 16 KB pages. At the end the app has a private copy of the weights:
-its footprint is 19.6 GB. llama.cpp gives Metal the mapped file itself, with
+`load_weights` mapped the 17.8 GB file. Then it copied each tensor into a host tensor, and
+`transfer(.., Memory::HBM)` copied the host tensor into memory from `vx_metal_alloc`. The 1.08M
+pageins are the file, read in 16 KB pages. At the end the app had a private copy of the weights:
+its footprint was 19.6 GB. llama.cpp gives Metal the mapped file itself, with
 `newBufferWithBytesNoCopy` over the `mmap` and a residency set ("use residency sets = true" in its
 log). Its footprint stays at 0.6 GB, and the 17.5 GB of the file is resident as pages of the file.
 
@@ -136,6 +136,20 @@ file cache, and the peak private memory is 1.3 GB. A token is a little slower: 2
 at 2,000 tokens of context, and 32.34 and 32.41 ms at 8,000. Without the residency set, the mapped
 weights are much slower: 30.58 and 30.10 ms at 2,000 tokens of context.
 
-Both runtime changes are in Vx PR #3606, which is not merged yet. When it is, the app can make
-views of the mapped file in `load_next`, `load_codes`, `load_f16` and `load_scales`, and drop
-`copy_out`.
+Both runtime changes are in Vx since vx-lang/Vx#3606 (c4e57fd7), and the app now makes views of the
+mapped file. With the vxc of c4e57fd7, 64 generated tokens after a prompt, two rounds:
+
+| Context | Load, copied | Load, mapped | Private memory, copied | Private memory, mapped | Token, copied | Token, mapped |
+| --- | --- | --- | --- | --- | --- | --- |
+| ~0 | 37.5, 32.2 s | 10.3, 10.3 s | 18.9 GB | 0.26 GB | 22.15, 22.20 ms | 22.19, 22.30 ms |
+| 2,000 | 31.3, 29.0 s | 10.4, 10.4 s | 19.6 GB | 1.27 GB | 24.66, 24.58 ms | 24.70, 24.66 ms |
+| 8,000 | 31.7, 31.0 s | 11.2, 11.2 s | 20.4 GB | 2.10 GB | 32.61, 31.89 ms | 32.00, 32.27 ms |
+
+The load is the time of the program less the time of its prompt and of its generated tokens.
+Private memory is the peak physical footprint. With mapped weights it holds the KV cache and the
+scratch, and the weights are pages of the file. A warm load, right after another mapped run, also
+took 10.6 to 10.9 s. llama.cpp gave 22.07 and 22.15 ms, 24.71 and 24.70 ms, and 32.04 and
+32.14 ms. All the runs at a context generate the same 64 tokens.
+
+The first measurement of the mapped app, with the vxc of the branch of #3606, was 0.1 to 0.5 ms
+slower than copied weights. This measurement shows no such cost.
