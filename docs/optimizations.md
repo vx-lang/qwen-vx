@@ -242,6 +242,37 @@ two runs of each in turn:
 | Edit a 60-line file | 24.30, 24.27 ms | 23.98, 23.99 ms |
 | Explain a function | 23.69, 23.76 ms | 23.45, 23.50 ms |
 
+### 13. Q4_0 products of a token: 2 SIMD groups of 4 rows in each block (#56)
+
+**Problem.** GPU timestamps of each kernel of a generated token (one encoder for each kernel)
+showed the products below the 104 GB/s of a plain read:
+
+| Product | Bytes a token | Time | Speed | At 104 GB/s |
+| --- | --- | --- | --- | --- |
+| Experts, gate and up | 680 MB | 7.52 ms | 90 GB/s | 6.53 ms |
+| Experts, down | 340 MB | 3.65 ms | 93 GB/s | 3.27 ms |
+| QKV | 283 MB | 3.09 ms | 92 GB/s | 2.72 ms |
+| Attention output | 227 MB | 2.65 ms | 86 GB/s | 2.18 ms |
+| lm_head, 6 bits | 253 MB | 2.40 ms | 105 GB/s | 2.43 ms |
+
+Each block of the std::nn kernels had one SIMD group of 8 rows: for the attention output, only 256
+blocks of 32 threads.
+
+**Change.** `src/products.vx` has copies of `nn_qkv_q4`, `nn_matvec_q4_heads_add`,
+`nn_moe_swiglu_q4` and `nn_moe_down_q4_add` with 2 SIMD groups of 4 rows in each block, as in
+llama.cpp's Q4_0 kernel. Each row has the same sum, so the results are the same bits.
+
+**Result.** The gate and up products of the experts alone, 48 layers: 6.95 ms in place of 7.3 ms
+(2 x 4 rows was about the same, and 8 x 1 row 8.5 ms). The down products gain less: 4.02 ms in
+place of 4.1 ms. A generated token, 256 tokens, two runs of each in turn:
+
+| Prompt | std::nn | 2 x 4 rows |
+| --- | --- | --- |
+| Write a module and its tests | 22.00, 21.80 ms | 21.34, 21.30 ms |
+| Edit a 60-line file | 23.85, 23.90 ms | 23.55, 23.48 ms |
+
+The text is the same, and `--lines` gives the same logits.
+
 ## What did not help
 
 - **Other tile shapes for the Q4_0 products of a chunk, in Vx v0.0.4** (#19). Tiles of 32 tokens,
@@ -275,8 +306,10 @@ two runs of each in turn:
   step (151).
 - **The start of a session** (#27): the load of the weights takes about 10.5 s since entry 11. The
   compile of the program at -O0 is the next part to measure.
-- **Small kernels** (#34): up to about 5 ms of a 23.4 ms token. Merge the norms into the products
-  after them, and the router into top-k, and measure each change with a Metal trace.
+- **Small kernels** (#34): the 336 kernels of a token other than the products (7 in each layer)
+  take about 2.5 ms for about 0.7 ms of bytes. Each one reads what the kernel before it wrote, so
+  running kernels at the same time does not help; fewer kernels do. Merge the norms into the
+  products after them, and the router into top-k.
 - **Fewer bytes for a token** (#33): lm_head in Q4_0 (#9) would save about 1.3 ms, after a check of
   the perplexity.
 - **Attention at a long context** (#38): about 4 ms of a token at 8,000 positions, above the
