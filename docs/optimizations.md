@@ -220,6 +220,28 @@ private copy of the weights: 18.9 GB.
 generated token takes the same time as with copied weights (within 0.1 ms at 0 and 2,000 tokens
 of context, and ±0.4 ms at 8,000), and the tokens are the same.
 
+### 12. Eight tokens before each read (#34)
+
+**Problem.** Text mode read each token on the CPU before it gave the GPU the next token. A read
+waits for all the work that the GPU was given, so the GPU then had nothing to do: about 0.37 ms of
+a 21.9 ms token. GPU timestamps of each command buffer split it into 0.17 ms until the CPU wakes
+up after the GPU ends, and 0.20 ms until the first command buffer of the next token starts on the
+GPU. The 34 command buffers of a token have only 0.03 ms between them.
+
+**Change.** The input of a token is the argmax of the token before it, in GPU memory, so the GPU
+can run several tokens without the CPU. Text mode runs 8 tokens and then reads them all. Up to 7
+tokens after the end of the text are run and thrown away. `--lines` prints the logit of each
+token, so it still reads each token before it runs the next.
+
+**Result.** 0.25 to 0.32 ms less a token, and the same text. 256 tokens of three chat prompts,
+two runs of each in turn:
+
+| Prompt | Read each token | 8 tokens before each read |
+| --- | --- | --- |
+| Write a module and its tests | 22.13, 22.19 ms | 21.85, 21.82 ms |
+| Edit a 60-line file | 24.30, 24.27 ms | 23.98, 23.99 ms |
+| Explain a function | 23.69, 23.76 ms | 23.45, 23.50 ms |
+
 ## What did not help
 
 - **Other tile shapes for the Q4_0 products of a chunk, in Vx v0.0.4** (#19). Tiles of 32 tokens,
