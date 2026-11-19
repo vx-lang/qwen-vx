@@ -202,6 +202,24 @@ The kernels that read the weights already run at 92% to 100% of the speed of mem
 about 1.9 GB, so its floor is 18.4 ms, and it takes 23.4 ms. The rest is small kernels and the time
 between about 530 kernels that each wait for the one before (#34).
 
+### 11. Weights read in place from the mapped file (#27)
+
+**Problem.** `load_weights` copied each of the 628 tensors from the mapped file into a host tensor,
+and the transfer to GPU memory copied it again. The load took 29 to 38 s, and the program had a
+private copy of the weights: 18.9 GB.
+
+**Change.**
+- In Vx: vx-lang/Vx#3606. A transfer to GPU memory of a view of a read-only, shared mapping of a
+  file makes no copy: the runtime maps the same pages of the file again, and a write changes only
+  the copy. A Metal residency set keeps all GPU memory resident. It also made a generated token
+  1.3 to 1.9 ms faster at 2,000 and 8,000 tokens of context (`decode/faults/`).
+- In the app: `load_next`, `load_codes`, `load_f16` and `load_scales` transfer a view of the
+  mapped file. `copy_out` and its `msync` are gone.
+
+**Result.** The load takes about 10.5 s, and private memory is 0.3 GB at a short context. A
+generated token takes the same time as with copied weights (within 0.1 ms at 0 and 2,000 tokens
+of context, and ±0.4 ms at 8,000), and the tokens are the same.
+
 ## What did not help
 
 - **Other tile shapes for the Q4_0 products of a chunk, in Vx v0.0.4** (#19). Tiles of 32 tokens,
@@ -233,10 +251,8 @@ between about 530 kernels that each wait for the one before (#34).
 
 - **The prompt**: 135 tokens a second at 2,000 tokens, against 361 for llama.cpp. #30 is a first
   step (151).
-- **The load of the weights** (#27): 51 s, because the program copies each tensor two times. A load
-  with no copy needs vx-lang/Vx#3498 (a tensor over memory that the program does not own) and
-  vx-lang/Vx#3499 (the Metal runtime gives a mapped file to the GPU once). It would also let macOS
-  drop the pages of the weights when other programs need memory.
+- **The start of a session** (#27): the load of the weights takes about 10.5 s since entry 11. The
+  compile of the program at -O0 is the next part to measure.
 - **Small kernels** (#34): up to about 5 ms of a 23.4 ms token. Merge the norms into the products
   after them, and the router into top-k, and measure each change with a Metal trace.
 - **Fewer bytes for a token** (#33): lm_head in Q4_0 (#9) would save about 1.3 ms, after a check of
