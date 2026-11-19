@@ -15,11 +15,13 @@
 //   has the tokens of one expert, and `bases` names that expert. A block of the product does 128
 //   rows of the matrix for one tile. For each 32 columns, its lanes decode the weights and copy the
 //   inputs into shared memory once, and each subgroup adds a matmul of tiles.
-// - Attention is three passes over a scratch tensor of scores, [chunk, kv_heads, 8, positions]:
-//   the scores, as a matmul of the queries and the keys of the cache; their softmax; and the sum
-//   of the values with those weights, as a matmul of the weights and the values. The query heads
-//   of a key-value head, at most 8, are the rows of the matmuls, so a tile of the cache serves
-//   them all and two tokens. The matmuls skip the positions after the tokens of their tile.
+// - Attention is three passes over scratch tensors of scores, with 1024 rows for each key-value
+//   head (8 for each of ATTENTION_TOKENS tokens) and a column for each position: the scores, as a
+//   matmul of the queries and the keys of the cache; their softmax; and the sum of the values with
+//   those weights, as a matmul of the weights and the values. The query heads of a key-value head,
+//   at most 8, are the rows of the matmuls, so a tile of the cache serves them all and four
+//   tokens. The matmuls keep their sums in registers, and skip the positions after the tokens of
+//   their tile. The queries and the weights stay f32; the keys and values are f16, as in the cache.
 import core::convert;
 import core::num;
 import core::sync::atomic;
@@ -34,8 +36,9 @@ import qwen::model;
 /// 10% faster than chunks of 512 (#42), and need about 320 MB more for the tensors of a chunk.
 const CHUNK : i32 = 2048;
 
-/// The most tokens of a chunk that attention takes at a time. The scratch tensor of the scores
-/// has a row of positions for each of them, so it does not grow with the chunk.
+/// The most tokens of a chunk that attention takes at a time. The scratch tensors of the scores
+/// have a row of positions for each query head of each of them, 1024 rows for each key-value head,
+/// so they do not grow with the chunk. The kernels take it as 32 tiles of 4 tokens.
 const ATTENTION_TOKENS : i32 = 128;
 
 /// The tensors of a chunk, made once. `rows` is the list of input rows of the dense products:
@@ -54,9 +57,10 @@ struct Prefill {
   xn : Tensor<f32, [?, ?], Memory::HBM>,
   qkv : Tensor<f32, [?, ?], Memory::HBM>,
   q : Tensor<f32, [?, ?, ?], Memory::HBM>,
-  heads : Tensor<f32, [?, ?, ?, ?], Memory::HBM>,
+  heads : Tensor<f32, [?, ?], Memory::HBM>,
   att : Tensor<f32, [?, ?], Memory::HBM>,
-  scores : Tensor<f32, [?, ?, ?, ?], Memory::HBM>,
+  scores : Tensor<f32, [?, ?], Memory::HBM>,
+  probs : Tensor<f32, [?, ?], Memory::HBM>,
   gu : Tensor<f32, [?, ?], Memory::HBM>,
   h : Tensor<f32, [?, ?], Memory::HBM>,
   router : Tensor<f32, [?, ?], Memory::HBM>,
@@ -113,9 +117,10 @@ fn new_prefill(c : &Config, max_seq : i32, chunk : i32) -> Prefill {
     xn: transfer(Tensor<f32>([chunk, c.hidden_size]), Memory::HBM),
     qkv: transfer(Tensor<f32>([chunk, qkv_rows]), Memory::HBM),
     q: transfer(Tensor<f32>([chunk, c.num_q_heads, c.head_dim]), Memory::HBM),
-    heads: transfer(Tensor<f32>([chunk, c.num_kv_heads, 8, c.head_dim]), Memory::HBM),
+    heads: transfer(Tensor<f32>([c.num_kv_heads * 1024, 128]), Memory::HBM),
     att: transfer(Tensor<f32>([chunk, c.num_q_heads * c.head_dim]), Memory::HBM),
-    scores: transfer(Tensor<f32>([i32::min(chunk, ATTENTION_TOKENS), c.num_kv_heads, 8, (max_seq + 31) / 32 * 32]), Memory::HBM),
+    scores: transfer(Tensor<f32>([c.num_kv_heads * 1024, (max_seq + 127) / 128 * 128]), Memory::HBM),
+    probs: transfer(Tensor<f32>([c.num_kv_heads * 1024, (max_seq + 127) / 128 * 128]), Memory::HBM),
     gu: transfer(Tensor<f32>([dense_rows, 2 * inter]), Memory::HBM),
     h: transfer(Tensor<f32>([dense_rows, inter]), Memory::HBM),
     router: transfer(Tensor<f32>([chunk, experts]), Memory::HBM),
@@ -312,12 +317,12 @@ fn pf_mm_fp8(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Me
   return;
 }
 
-/// y = the product of a Q4_0 matrix, as `pf_mm_q4` with no bias and no `add`. The tiles of the
-/// weights and the inputs are f16, half the shared memory of f32 tiles. `lanes::fill` starts the
-/// sums and `lanes::copy` writes them to `y`, and nothing else reads them, so on the Apple GPU they
-/// stay in the simdgroup matrices of the subgroups, with no tile in shared memory. A weight is
-/// (code - 8) times its scale, rounded to f16, and an input is rounded to f16: the products differ
-/// from those of f32 tiles by about 1e-3 of their size.
+/// y = the product of a Q4_0 matrix, as `pf_mm_q4` with no bias and no `add`. The tile of the
+/// weights is f16, half the shared memory of an f32 tile. `lanes::fill` starts the sums and
+/// `lanes::copy` writes them to `y`, and nothing else reads them, so on the Apple GPU they stay in
+/// the simdgroup matrices of the subgroups, with no tile in shared memory. A weight is (code - 8)
+/// times its scale, rounded to f16. The inputs stay f32: with f16 inputs, the logits of the tiny
+/// model of experts moved 20 times as much, for 2% less time.
 fn pf_mm_q4_set(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, list : &Tensor<i32, [?], Memory::HBM>, bases : &Tensor<i32, [?], Memory::HBM>, stride : i32, rows : i32, cols : i32, tiles : i32) -> void {
   assert(cols % 32 == 0 && tiles > 0 && list.len() >= tiles * 16 && bases.len() >= tiles, "pf_mm_q4_set: cols must be a multiple of 32, and list and bases need the tiles");
   let words = cols / 8;
@@ -326,7 +331,7 @@ fn pf_mm_q4_set(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?],
     for rb in 0..(rows + 127) / 128 across blocks {
       for tb in 0..tiles across blocks {
         let mut sw = unsafe { Tensor<f16, [4, 32, 32], Memory::SMEM>::uninit() };
-        let mut sx = unsafe { Tensor<f16, [1, 16, 32], Memory::SMEM>::uninit() };
+        let mut sx = unsafe { Tensor<f32, [1, 16, 32], Memory::SMEM>::uninit() };
         let mut acc = unsafe { Tensor<f32, [4, 16, 32], Memory::SMEM>::uninit() };
         for sg in 0..4 across subgroups {
           lanes::fill(&mut acc[sg], 0.0);
@@ -364,12 +369,12 @@ fn pf_mm_q4_set(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?],
                 if from >= 0 {
                   v = x[from][g * 32 + l];
                 }
-                sx[0][sg * 4 + q][l] = v as f16;
+                sx[0][sg * 4 + q][l] = v;
               }
             }
           }
           for sg in 0..4 across subgroups {
-            acc[sg] = acc[sg] + (sx[0] as f32) @ (sw[sg] as f32);
+            acc[sg] = acc[sg] + sx[0] @ (sw[sg] as f32);
           }
         }
         for sg in 0..4 across subgroups {
@@ -540,6 +545,39 @@ fn pf_rms_norm(y : &mut Tensor<f32, [?, ?], Memory::HBM>, x : &Tensor<f32, [?, ?
   return;
 }
 
+/// x[t] += y[t], and then y[t] = the RMSNorm of the new x[t] times w, for t below n: the sum of
+/// the residual and a product, and the norm of the next part of the layer, in one pass.
+fn pf_add_rms_norm(x : &mut Tensor<f32, [?, ?], Memory::HBM>, y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<bf16, [?], Memory::HBM>, n : i32, dim : i32, eps : f32) -> void {
+  spawn on(Topology::Device) {
+    for t in 0..n across blocks {
+      let mut part = unsafe { Tensor<f32, [1024], Memory::SMEM>::uninit() };
+      for l in 0..1024 across lanes {
+        let mut s : f32 = 0.0;
+        for j in 0..(dim + 1023) / 1024 {
+          let i = j * 1024 + l;
+          if i < dim {
+            let v = x[t][i] + y[t][i];
+            x[t][i] = v;
+            s = s + v * v;
+          }
+        }
+        part[l] = s;
+      }
+      let ss = lanes::sum(&part, 1024);
+      let inv = 1.0 / (ss / (dim as f32) + eps).sqrt();
+      for l in 0..1024 across lanes {
+        for j in 0..(dim + 1023) / 1024 {
+          let i = j * 1024 + l;
+          if i < dim {
+            y[t][i] = x[t][i] * inv * (w[i] as f32);
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
 /// RoPE for the tokens of the chunk, as `nn_rope_and_store`: token t is at position start + t.
 /// The heads of q, k and v are one after another in qkv[t].
 fn pf_rope_and_store(q_out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &mut Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &mut Tensor<f16, [?, ?, ?], Memory::HBM>, qkv : &Tensor<f32, [?, ?], Memory::HBM>, cos : &Tensor<f32, [?, ?], Memory::HBM>, sin : &Tensor<f32, [?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
@@ -626,37 +664,34 @@ fn pf_norm_rope_and_store(q_out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, k_ca
   return;
 }
 
-/// The scores of attention, for the n tokens of a chunk from token `first`, at positions start to
-/// start + n - 1: scores[t][g][j][p] = (query head g * group + j of token first + t) . (key p of
-/// head g) / sqrt(head_dim). A block does two tokens, the 16 rows of their query heads, against
-/// 128 positions, as a matmul of tiles. It skips the positions that neither token sees, and so
-/// writes the scores of p up to start + t + 1 at least, but not those of p at start + n or after.
-fn pf_scores(scores : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, first : i32, start : i32, n : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
-  assert(q_heads % kv_heads == 0 && q_heads / kv_heads <= 8 && head_dim <= 128, "pf_scores: q_heads must be a multiple of kv_heads, and at most 8 times it, and head_dim at most 128");
-  let group = q_heads / kv_heads;
+/// The scores of attention, for the n tokens of a slice from token `first` of the chunk, at
+/// positions start to start + n - 1: scores[g * 1024 + t * 8 + j][p] = (query head g * group + j
+/// of token first + t) . (key p of head g) / sqrt(head_dim), for n up to ATTENTION_TOKENS. A block
+/// does four tokens, the 32 rows of their query heads, against 128 positions, as a matmul of f16
+/// tiles with the sums in registers. It skips the positions that none of the four tokens sees,
+/// and the tokens after n, and writes zeros there.
+fn pf_scores(scores : &mut Tensor<f32, [?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, first : i32, start : i32, n : i32, group : i32, head_dim : i32) -> void {
+  assert(group <= 8 && head_dim <= 128, "pf_scores: at most 8 query heads for each key-value head, and head_dim at most 128");
+  let kv_heads = scores.extent(0) / 1024;
   let end = start + n;
-  assert(scores.extent(0) >= n && first + n <= q.extent(0), "pf_scores: `scores` needs n tokens, and q first + n");
-  assert(scores.extent(3) >= end && end <= k_cache.extent(0), "pf_scores: `scores` and the cache need start + n positions");
+  assert(n <= ATTENTION_TOKENS && first + n <= q.extent(0), "pf_scores: at most ATTENTION_TOKENS tokens, and q needs first + n");
+  assert(scores.extent(1) >= (end + 127) / 128 * 128 && end <= k_cache.extent(0), "pf_scores: `scores` needs start + n positions rounded up to 128, and the cache start + n");
   let scale = 1.0 / (head_dim as f32).sqrt();
   let dims = (head_dim + 31) / 32;
   spawn on(Topology::Device) {
     for g in 0..kv_heads across blocks {
-      for tp in 0..(n + 1) / 2 across blocks {
+      for tb in 0..32 across blocks {
         for pb in 0..(end + 127) / 128 across blocks {
-          let mut sk = unsafe { Tensor<f32, [4, 32, 32], Memory::SMEM>::uninit() };
-          let mut sq = unsafe { Tensor<f32, [1, 16, 32], Memory::SMEM>::uninit() };
-          let mut acc = unsafe { Tensor<f32, [4, 16, 32], Memory::SMEM>::uninit() };
+          let mut sk = unsafe { Tensor<f16, [4, 32, 32], Memory::SMEM>::uninit() };
+          let mut sq = unsafe { Tensor<f32, [1, 32, 32], Memory::SMEM>::uninit() };
+          let mut acc = unsafe { Tensor<f32, [4, 32, 32], Memory::SMEM>::uninit() };
           for sg in 0..4 across subgroups {
-            for l in 0..32 across lanes(32) {
-              for m in 0..16 {
-                acc[sg][m][l] = 0.0;
-              }
-            }
+            lanes::fill(&mut acc[sg], 0.0);
           }
-          // The second token of the pair sees the positions up to start + 2 tp + 1.
-          // 1 when the pair sees position pb * 128, else 0: (x + K) / (K + 1) is min(max(x, 0), 1)
-          // for |x| up to K.
-          let steps = dims * ((start + tp * 2 + 2 - pb * 128 + 1048576) / 1048577);
+          // The last token of the four is at most at start + 4 tb + 3. 1 when it sees position
+          // pb * 128 and the first token is below n, else 0: (x + K) / (K + 1) is
+          // min(max(x, 0), 1) for |x| up to K.
+          let steps = dims * ((start + tb * 4 + 4 - pb * 128 + 1048576) / 1048577) * ((n - tb * 4 + 1048576) / 1048577);
           for kc in 0..steps {
             for sg in 0..4 across subgroups {
               for l in 0..32 across lanes(32) {
@@ -667,39 +702,25 @@ fn pf_scores(scores : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, q : &Tensor<f
                   if p < end && d < head_dim {
                     v = k_cache[p][g][d] as f32;
                   }
-                  sk[sg][k][l] = v;
+                  sk[sg][k][l] = v as f16;
                 }
-                for i in 0..4 {
-                  let t = tp * 2 + sg / 2;
-                  let j = (sg % 2) * 4 + i;
+                let t = tb * 4 + sg;
+                for j in 0..8 {
                   let d = kc * 32 + l;
                   let mut v : f32 = 0.0;
                   if t < n && j < group && d < head_dim {
                     v = q[first + t][g * group + j][d] * scale;
                   }
-                  sq[0][sg * 4 + i][l] = v;
+                  sq[0][sg * 8 + j][l] = v;
                 }
               }
             }
             for sg in 0..4 across subgroups {
-              acc[sg] = acc[sg] + sq[0] @ sk[sg];
+              acc[sg] = acc[sg] + sq[0] @ (sk[sg] as f32);
             }
           }
-          if steps > 0 {
-            for sg in 0..4 across subgroups {
-              for l in 0..32 across lanes(32) {
-                let p = pb * 128 + sg * 32 + l;
-                if p < end {
-                  for m2 in 0..2 {
-                    for j in 0..8 {
-                      if tp * 2 + m2 < n && j < group {
-                        scores[tp * 2 + m2][g][j][p] = acc[sg][m2 * 8 + j][l];
-                      }
-                    }
-                  }
-                }
-              }
-            }
+          for sg in 0..4 across subgroups {
+            lanes::copy(scores, &acc[sg], [g * 1024 + tb * 32, pb * 128 + sg * 32]);
           }
         }
       }
@@ -708,12 +729,16 @@ fn pf_scores(scores : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, q : &Tensor<f
   return;
 }
 
-/// The softmax of the scores of each token t over the positions up to its own, start + t, in
-/// place. The positions after it, up to `width`, get 0, so that `pf_weigh_values` can read them.
-fn pf_softmax(scores : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, start : i32, n : i32, kv_heads : i32, group : i32, width : i32) -> void {
-  assert(scores.extent(3) >= width && width >= start + n, "pf_softmax: `scores` needs `width` positions");
+/// probs[g * 1024 + t * 8 + j][p] = the softmax of the scores of that row over the positions up to
+/// start + t, the position of token t, for j below group. The positions after it, up to `width`,
+/// get 0, so that `pf_weigh_values` can read them. One pass finds the largest score and the sum of
+/// the exponentials, and a second writes the weights. The blocks are those of ATTENTION_TOKENS
+/// tokens, so that the row of a token is known to fit an i32; those from n on do nothing.
+fn pf_softmax(probs : &mut Tensor<f32, [?, ?], Memory::HBM>, scores : &Tensor<f32, [?, ?], Memory::HBM>, start : i32, n : i32, group : i32, width : i32) -> void {
+  let kv_heads = scores.extent(0) / 1024;
+  assert(scores.extent(1) >= width && probs.extent(1) >= width && width >= start + n, "pf_softmax: `scores` and `probs` need `width` positions");
   spawn on(Topology::Device) {
-    for t in 0..n across blocks {
+    for t in 0..128 across blocks {
       for g in 0..kv_heads across blocks {
         let mut top = unsafe { Tensor<f32, [8, 32], Memory::SMEM>::uninit() };
         let mut sums = unsafe { Tensor<f32, [8, 32], Memory::SMEM>::uninit() };
@@ -721,41 +746,45 @@ fn pf_softmax(scores : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, start : i32,
         for j in 0..8 across subgroups {
           for l in 0..32 across lanes(32) {
             let mut m : f32 = -3.0e38;
-            if j < group {
+            let mut s : f32 = 0.0;
+            if j < group && t < n {
               for b in 0..(pos + 32) / 32 {
                 let p = b * 32 + l;
                 if p <= pos {
-                  m = m.max(scores[t][g][j][p]);
+                  let x = scores[g * 1024 + t * 8 + j][p];
+                  if s == 0.0 {
+                    m = x;
+                    s = 1.0;
+                  } else if x > m {
+                    s = s * (m - x).fast_exp() + 1.0;
+                    m = x;
+                  } else {
+                    s = s + (x - m).fast_exp();
+                  }
                 }
               }
             }
             top[j][l] = m;
+            sums[j][l] = s;
           }
           let big = lanes::max(&top[j], 32);
           for l in 0..32 across lanes(32) {
             let mut s : f32 = 0.0;
-            if j < group {
-              for b in 0..(pos + 32) / 32 {
-                let p = b * 32 + l;
-                if p <= pos {
-                  let e = (scores[t][g][j][p] - big).fast_exp();
-                  scores[t][g][j][p] = e;
-                  s = s + e;
-                }
-              }
+            if sums[j][l] > 0.0 {
+              s = sums[j][l] * (top[j][l] - big).fast_exp();
             }
             sums[j][l] = s;
           }
           let total = lanes::sum(&sums[j], 32);
           for l in 0..32 across lanes(32) {
-            if j < group {
+            if j < group && t < n {
               let inv = 1.0 / total;
               for b in 0..(width + 31) / 32 {
                 let p = b * 32 + l;
                 if p <= pos {
-                  scores[t][g][j][p] = scores[t][g][j][p] * inv;
+                  probs[g * 1024 + t * 8 + j][p] = (scores[g * 1024 + t * 8 + j][p] - big).fast_exp() * inv;
                 } else if p < width {
-                  scores[t][g][j][p] = 0.0;
+                  probs[g * 1024 + t * 8 + j][p] = 0.0;
                 }
               }
             }
@@ -767,31 +796,27 @@ fn pf_softmax(scores : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, start : i32,
   return;
 }
 
-/// out[first + t][g][j] = the sum of the rows p of V of head g, each times its weight
-/// scores[t][g][j][p], over the positions that token t sees, for t below n. Token t is at position
-/// start + t. A block does the 16 rows of two tokens, for all the
-/// values of a head, as a matmul of tiles. It reads the weights up to a multiple of 32, so those
-/// after start + t must be 0, as `pf_softmax` leaves them.
-fn pf_weigh_values(out : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, scores : &Tensor<f32, [?, ?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, first : i32, start : i32, n : i32, kv_heads : i32, group : i32, head_dim : i32) -> void {
+/// out[g * 1024 + t * 8 + j] = the sum of the rows p of V of head g, each times its weight
+/// probs[g * 1024 + t * 8 + j][p], over the positions that token t sees, for the n tokens of a
+/// slice. Token t is at position start + t. A block does the 32 rows of four tokens, for all the
+/// values of a head, as a matmul of f16 tiles with the sums in registers. It reads the weights
+/// below `width`, so those after start + t must be 0, as `pf_softmax` leaves them.
+fn pf_weigh_values(out : &mut Tensor<f32, [?, ?], Memory::HBM>, probs : &Tensor<f32, [?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, start : i32, n : i32, group : i32, head_dim : i32, width : i32) -> void {
+  let kv_heads = probs.extent(0) / 1024;
   let end = start + n;
-  assert(scores.extent(3) >= (end + 31) / 32 * 32 && head_dim <= 128, "pf_weigh_values: `scores` needs start + n positions, rounded up to 32");
-  assert(first + n <= out.extent(0), "pf_weigh_values: `out` needs first + n tokens");
+  assert(probs.extent(1) >= width && width >= end && head_dim <= 128 && out.extent(1) == 128 && out.extent(0) == probs.extent(0) && n <= ATTENTION_TOKENS, "pf_weigh_values: `probs` needs `width` positions, `out` the rows of `probs` of 128 values, and n at most ATTENTION_TOKENS");
   spawn on(Topology::Device) {
     for g in 0..kv_heads across blocks {
-      for tp in 0..(n + 1) / 2 across blocks {
-        let mut sv = unsafe { Tensor<f32, [4, 32, 32], Memory::SMEM>::uninit() };
-        let mut sp = unsafe { Tensor<f32, [1, 16, 32], Memory::SMEM>::uninit() };
-        let mut acc = unsafe { Tensor<f32, [4, 16, 32], Memory::SMEM>::uninit() };
+      for tb in 0..32 across blocks {
+        let mut sv = unsafe { Tensor<f16, [4, 32, 32], Memory::SMEM>::uninit() };
+        let mut sp = unsafe { Tensor<f32, [1, 32, 32], Memory::SMEM>::uninit() };
+        let mut acc = unsafe { Tensor<f32, [4, 32, 32], Memory::SMEM>::uninit() };
         for sg in 0..4 across subgroups {
-          for l in 0..32 across lanes(32) {
-            for m in 0..16 {
-              acc[sg][m][l] = 0.0;
-            }
-          }
+          lanes::fill(&mut acc[sg], 0.0);
         }
-        // The second token of the pair sees start + 2 tp + 2 positions.
-        // min(start + tp * 2 + 2, end), as tp * 2 + 2 is at most n + 1.
-        let seen = start + tp * 2 + 2 - (tp * 2 + 2) / (n + 1);
+        // The last token of the four sees at most start + 4 tb + 4 positions, and none when the
+        // first is not below n.
+        let seen = (start + tb * 4 + 4) * ((n - tb * 4 + 1048576) / 1048577);
         for kc in 0..(seen + 31) / 32 {
           for sg in 0..4 across subgroups {
             for l in 0..32 across lanes(32) {
@@ -802,36 +827,25 @@ fn pf_weigh_values(out : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, scores : &
                 if p < end && d < head_dim {
                   v = v_cache[p][g][d] as f32;
                 }
-                sv[sg][k][l] = v;
+                sv[sg][k][l] = v as f16;
               }
-              for i in 0..4 {
-                let t = tp * 2 + sg / 2;
-                let j = (sg % 2) * 4 + i;
+              let t = tb * 4 + sg;
+              let p = kc * 32 + l;
+              for j in 0..8 {
                 let mut v : f32 = 0.0;
-                if t < n && j < group {
-                  v = scores[t][g][j][kc * 32 + l];
+                if t < n && j < group && p < width {
+                  v = probs[g * 1024 + t * 8 + j][p];
                 }
-                sp[0][sg * 4 + i][l] = v;
+                sp[0][sg * 8 + j][l] = v;
               }
             }
           }
           for sg in 0..4 across subgroups {
-            acc[sg] = acc[sg] + sp[0] @ sv[sg];
+            acc[sg] = acc[sg] + sp[0] @ (sv[sg] as f32);
           }
         }
         for sg in 0..4 across subgroups {
-          for l in 0..32 across lanes(32) {
-            let d = sg * 32 + l;
-            if d < head_dim {
-              for m2 in 0..2 {
-                for j in 0..8 {
-                  if tp * 2 + m2 < n && j < group {
-                    out[first + tp * 2 + m2][g][j][d] = acc[sg][m2 * 8 + j][l];
-                  }
-                }
-              }
-            }
-          }
+          lanes::copy(out, &acc[sg], [g * 1024 + tb * 32, sg * 32]);
         }
       }
     }
@@ -839,36 +853,38 @@ fn pf_weigh_values(out : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, scores : &
   return;
 }
 
-/// Attention of each token of the chunk over the positions up to its own, as `nn_attention`. Token
-/// t is at position start + t. Query head g * group + j of token t goes to out[t][g][j]. The
-/// tokens go in slices of as many tokens as `scores` has rows for.
-fn pf_attention(out : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, scores : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+/// Attention of each token of the chunk over the positions up to its own, as `nn_attention`: att[t]
+/// = the query heads of token t one after another, the input of the output projection. Token t is
+/// at position start + t. The tokens go in slices of up to ATTENTION_TOKENS tokens.
+fn pf_attention(att : &mut Tensor<f32, [?, ?], Memory::HBM>, heads : &mut Tensor<f32, [?, ?], Memory::HBM>, scores : &mut Tensor<f32, [?, ?], Memory::HBM>, probs : &mut Tensor<f32, [?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+  assert(q_heads % kv_heads == 0 && scores.extent(0) == kv_heads * 1024, "pf_attention: q_heads must be a multiple of kv_heads, and `scores` needs 1024 rows for each key-value head");
   let group = q_heads / kv_heads;
-  let slice = scores.extent(0);
   let mut first = 0;
   while first < n {
-    let m = i32::min(slice, n - first);
+    let m = i32::min(ATTENTION_TOKENS, n - first);
     let at = start + first;
-    pf_scores(scores, q, k_cache, first, at, m, q_heads, kv_heads, head_dim);
-    pf_softmax(scores, at, m, kv_heads, group, (at + m + 31) / 32 * 32);
-    pf_weigh_values(out, scores, v_cache, first, at, m, kv_heads, group, head_dim);
+    let width = (at + m + 31) / 32 * 32;
+    pf_scores(scores, q, k_cache, first, at, m, group, head_dim);
+    pf_softmax(probs, scores, at, m, group, width);
+    pf_weigh_values(heads, probs, v_cache, at, m, group, head_dim, width);
+    pf_flatten_heads(att, heads, first, m, q_heads, group, head_dim);
     first = first + m;
   }
   return;
 }
 
-/// y[t] = the query heads of x[t] one after another, for t below n: the input of the output
-/// projection. Head g * group + j is x[t][g][j], as `pf_attention` writes it.
-fn pf_flatten_heads(y : &mut Tensor<f32, [?, ?], Memory::HBM>, x : &Tensor<f32, [?, ?, ?, ?], Memory::HBM>, n : i32, heads : i32, group : i32, head_dim : i32) -> void {
+/// y[first + t] = the query heads of token t of a slice one after another, for t below n. Head
+/// g * group + j is x[g * 1024 + t * 8 + j], as `pf_weigh_values` writes it.
+fn pf_flatten_heads(y : &mut Tensor<f32, [?, ?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, first : i32, n : i32, heads : i32, group : i32, head_dim : i32) -> void {
   let dim = heads * head_dim;
   spawn on(Topology::Device) {
-    for t in 0..n across blocks {
+    for t in 0..128 across blocks {
       for b in 0..(dim + 255) / 256 across blocks {
         for l in 0..256 across lanes {
           let i = b * 256 + l;
-          if i < dim {
+          if i < dim && t < n {
             let h = i / head_dim;
-            y[t][i] = x[t][h / group][h % group][i % head_dim];
+            y[first + t][i] = x[(h / group) * 1024 + t * 8 + h % group][i % head_dim];
           }
         }
       }
@@ -1107,16 +1123,17 @@ fn pf_chunk(w : &Weights, s : &mut State, p : &mut Prefill, start : i32, n : i32
   for cache in s.caches.iter_mut() {
     let layer = &w.layers[l];
     pf_rms_norm(&mut p.xn, &p.x, &layer.attn_norm, n, c.hidden_size, eps);
-    pf_mm(&mut p.qkv, &layer.qkv, &p.xn, &p.rows, &p.zeros, 0, &layer.qkv_bias, true, false, qkv_rows, c.hidden_size, tiles);
+    pf_mm(&mut p.qkv, &layer.qkv, &p.xn, &p.rows, &p.zeros, 0, &layer.qkv_bias, c.qkv_bias, false, qkv_rows, c.hidden_size, tiles);
     if c.qk_norm {
       pf_norm_rope_and_store(&mut p.q, &mut cache.k, &mut cache.v, &p.qkv, &layer.q_norm, &layer.k_norm, &s.cos, &s.sin, start, n, c.num_q_heads, c.num_kv_heads, c.head_dim, eps);
     } else {
       pf_rope_and_store(&mut p.q, &mut cache.k, &mut cache.v, &p.qkv, &s.cos, &s.sin, start, n, c.num_q_heads, c.num_kv_heads, c.head_dim);
     }
-    pf_attention(&mut p.heads, &mut p.scores, &p.q, &cache.k, &cache.v, start, n, c.num_q_heads, c.num_kv_heads, c.head_dim);
-    pf_flatten_heads(&mut p.att, &p.heads, n, c.num_q_heads, c.num_q_heads / c.num_kv_heads, c.head_dim);
-    pf_mm(&mut p.x, &layer.attn_out, &p.att, &p.rows, &p.zeros, 0, &p.no_bias, false, true, c.hidden_size, c.num_q_heads * c.head_dim, tiles);
-    pf_rms_norm(&mut p.xn, &p.x, &layer.mlp_norm, n, c.hidden_size, eps);
+    pf_attention(&mut p.att, &mut p.heads, &mut p.scores, &mut p.probs, &p.q, &cache.k, &cache.v, start, n, c.num_q_heads, c.num_kv_heads, c.head_dim);
+    // The product goes to xn, which is free until the norm, so that it is not an add: the kernel
+    // of a product with no add keeps its sums in registers.
+    pf_mm(&mut p.xn, &layer.attn_out, &p.att, &p.rows, &p.zeros, 0, &p.no_bias, false, false, c.hidden_size, c.num_q_heads * c.head_dim, tiles);
+    pf_add_rms_norm(&mut p.x, &mut p.xn, &layer.mlp_norm, n, c.hidden_size, eps);
     if c.num_experts > 0 {
       pf_experts(p, layer, c, n, tiles);
     } else {

@@ -9,10 +9,8 @@
 // and in chunks of 16 tokens with `prefill_in_chunks`. So the chunks have 16, 16 and 8 tokens,
 // and the last tile of the last chunk is half empty. Prints the largest difference between the
 // logits of the last token, and whether the next 8 greedy tokens are equal. The logits must be
-// within 0.0005, or 0.002 for Q4_0 weights. The two ways compute K and V in another order, and the
-// KV cache of f16 can round them to neighbouring values. The products of Q4_0 weights in chunks
-// also round the weights and the inputs to f16. Each group of RUN lines does this for another
-// weight file.
+// within 0.0005: the two ways compute K and V in another order, and the KV cache of f16 can round
+// them to neighbouring values. Each group of RUN lines does this for another weight file.
 //
 // RUN: python3 %S/../scripts/make_tiny_model.py %t.vxw > /dev/null
 // RUN: vxc %s --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t.vxw | FileCheck %s
@@ -25,7 +23,7 @@
 // RUN: python3 %S/../scripts/make_tiny_model.py --moe --q4 %t-moe-q4.vxw > /dev/null
 // RUN: vxc %s --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t-moe-q4.vxw | FileCheck %s
 //
-// CHECK: {{^}}logits within the tolerance: true{{$}}
+// CHECK: {{^}}logits within 0.0005: true{{$}}
 // CHECK: {{^}}tokens equal: true{{$}}
 import core::convert;
 import std::vec;
@@ -99,12 +97,8 @@ fn main(argc : i32, argv : *mut *mut i8) -> i32 {
   for i in 0..8 {
     same = same && one[i] == chunked[i];
   }
-  let mut tolerance : f32 = 0.0005;
-  if w.layers[0].qkv.dtype == U4 {
-    tolerance = 0.002;
-  }
   println!("largest logit difference: {}", diff);
-  println!("logits within the tolerance: {}", diff <= tolerance);
+  println!("logits within 0.0005: {}", diff <= 0.0005);
   println!("tokens equal: {}", same);
   return 0;
 }
