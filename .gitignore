@@ -2,3 +2,5 @@
 *.vxw
 __pycache__/
 .venv/
+# The sampler that decode/faults/run.sh builds
+*.dylib
