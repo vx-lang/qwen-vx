@@ -10,23 +10,38 @@ that uses 8 of its 128 experts in each layer for each token.
 
 ## The state now
 
-Measured on 2026-11-16 on a quiet Mac, with `main` at 5dd0e5c and the vxc of Vx `main` at
-32acbee0, next to llama.cpp 0.7.0 (`llama-bench`), one model at a time
-([#6](https://github.com/vx-lang/qwen-vx/issues/6#issuecomment-6914809508)). All the numbers are
-for one user and one sequence.
+Measured on 2026-11-18 and 2026-11-19 on a quiet Mac, with the drafts of entry 14 on top of
+entries 12 and 13, and the vxc of Vx `main` with vx-lang/Vx#3667 and #3673, next to llama.cpp 0.7.0
+(build 11669). All the numbers are for one user and one sequence, and greedy decoding.
+
+Generated tokens a second, 256 tokens after a prompt of text from this repository, no chat
+template, the best of two rounds in turn (three at 16,000):
+
+| Context | Qwen-vx | llama.cpp |
+| --- | --- | --- |
+| 60 tokens | 46.8 | 45.0 |
+| 2,014 tokens | 41.3 | 40.6 |
+| 8,005 tokens | 31.8 | 31.6 |
+| 16,026 tokens | 22.5 | 22.4 |
+
+The prompt itself, tokens a second: 113 against 224 at 60 tokens, 369 against 389 at 2,014, 264
+against 267 at 8,005, and 176 against 178 at 16,026.
+
+With drafts from the context (`--draft 7`, entry 14), 12 code prompts, 512 tokens each, ms a
+token (geometric mean of 3 prompts of each kind, two rounds):
+
+| Prompts | Qwen-vx | Qwen-vx `--draft 7` | llama.cpp | `llama-lookup` |
+| --- | --- | --- | --- | --- |
+| Edit a file | 24.09 | 13.09 | 25.50 | 12.55 |
+| Complete code | 23.61 | 23.77 | 25.57 | 26.24 |
+| Write new code | 21.91 | 22.32 (21.82 since the second change of entry 14) | 23.93 | 29.27 |
+| Explain code | 23.72 | 21.95 | 25.29 | 26.53 |
+| All 12 | 23.32 | 19.76 | 25.06 | 22.49 |
 
 | | Qwen-vx | llama.cpp | Notes |
 | --- | --- | --- | --- |
-| A generated token, 5 tokens of context | 24.6 ms (40.7 tokens a second) | 24.0 ms | The floor at the speed of memory is 18.4 ms |
-| A generated token, 2,000 tokens of context | 27.7 ms (36.2 tokens a second) | 26.3 ms | |
-| A generated token, 8,000 tokens of context | 37.7 ms (26.5 tokens a second) | 36.3 ms | |
-| The prompt, 2,000 tokens | 135 tokens a second (7.4 ms a token) | 361 tokens a second | 151 with #30, which waits for a Vx release |
-| The prompt, 8,000 tokens | 80 tokens a second (12.5 ms a token) | 237 tokens a second | 88 with #30 |
-| The start of a session | about 60 s | | 51 s of it is the load of the weights (#27) |
+| The start of a session | about 60 s | | The load of the weights is 10.5 s since #53 (#27) |
 | The KV cache | 98 KB a token | | f16 since #31; it was 196 KB |
-
-Generated tokens are within 5% of llama.cpp at all three lengths. The prompt is the large gap:
-llama.cpp reads it 2.4 to 2.9 times as fast.
 
 ## How to measure
 
@@ -273,6 +288,35 @@ place of 4.1 ms. A generated token, 256 tokens, two runs of each in turn:
 
 The text is the same, and `--lines` gives the same logits.
 
+### 14. Drafts from the context (#57)
+
+**Problem.** #18 found that a check of several tokens costs too much on the M4 for a draft model.
+But drafts from the context cost nothing: in an edit, most of the output is text of the prompt.
+llama.cpp has the same idea in `llama-lookup`.
+
+**Change.** `--draft K` finds the longest earlier match of the last tokens in the context, and
+takes the tokens after it as a draft. A round runs the kernels of n positions at once (the
+`_rows` kernels of std::nn, vx-lang/Vx#3673, and `matvec_q6_rows` for the 6-bit `lm_head`), and
+keeps each draft token that equals the choice of the model. The round kernels give the same bits
+as the kernels of one token (`tests/round.vx`), so the text is the same as without drafts. A round
+of n positions costs about 24 + 13 (n - 1) ms at a short context, so a draft must be long and
+likely to pay: no draft for a match under 6 tokens, 1 token for a match of 6 or 7, 4 for 8 to 11,
+and 7 from 12. After two rounds in a row that keep nothing, there are no drafts until a longer
+match comes up. Between rounds, plain steps run 1, 2, 4 and then up to 8 tokens before each read,
+as in entry 12.
+
+**Result.** Edits are 1.84 times as fast (24.09 to 13.09 ms a token), and the 12 code prompts of
+"The state now" are 1.18 times as fast (23.32 to 19.76 ms), 1.14 times as fast as `llama-lookup`.
+Before the plain runs between rounds, drafts on prompts that write new code cost 0.5 ms a token
+more than plain steps; with them, nothing (write prompts, two runs of each in turn):
+
+| Prompts | Plain | Drafts, one read for each plain step | Drafts, plain runs |
+| --- | --- | --- | --- |
+| Write new code | 21.81 ms | 22.36 ms | 21.82 ms |
+| Edit a file | 24.08 ms | 13.12 ms | 13.08 ms |
+
+The text is the same as without drafts in all 24 pairs of these runs.
+
 ## What did not help
 
 - **Other tile shapes for the Q4_0 products of a chunk, in Vx v0.0.4** (#19). Tiles of 32 tokens,
@@ -280,13 +324,11 @@ The text is the same, and `--lines` gives the same logits.
   32 x 32 tile of inputs took 4 times as long as two of 16 x 32, probably because 16
   `simdgroup_float8x8` sums leave the registers.
 - **Chunks of 1024 tokens.** 10.2 ms a prompt token, against 7.6 ms for 512.
-- **Speculative decoding** (#18). The check of several tokens in one pass costs too much on this
-  GPU:
+- **Speculative decoding with a draft model** (#18). The check of several tokens in one pass costs
+  too much on this GPU for a draft model. Drafts from the context do help: see entry 14.
   - A draft model (Qwen2.5-Coder-0.5B) takes about 11 ms a token, half the time of the 30B model,
     because the 30B model reads only 1.9 GB a token. A draft must be much faster than the model
     to help.
-  - Drafts from the context (prompt lookup) cost nothing. A check of up to 8 drafts kept 5.8
-    tokens on an edit of a script, but only 1.1 to 1.4 tokens on new programs.
   - The tokens of a check use different experts: 9 tokens in a row use about 35 experts of a
     layer, not 8.
   - The kernels of the prompt took 106 ms for a check of 1 token, and 207 ms for 9.
@@ -294,8 +336,10 @@ The text is the same, and `--lines` gives the same logits.
     as all other work. So each token of a check adds about one multiply-add for each weight. A
     Q4_0 product for 8 tokens took 0.24 ms in Vx v0.0.4 and 0.105 ms in Vx main with tiles of 8
     tokens, against 0.046 ms for one token.
-  - With those kernels, an edit would be about 1.3 times as fast, and new code slower. Look again
-    on a Mac with matrix units, or for a model where a token costs more.
+  - With those kernels, an edit would be about 1.3 times as fast, and new code slower. With the
+    round kernels of Vx main and drafts only when they pay, edits are 1.84 times as fast (entry
+    14). A draft model may still pay on a Mac with matrix units, or for a model where a token
+    costs more.
 - **Weights decoded once into registers for several tokens.** In Vx v0.0.4 these kernels were
   slower than the kernels that decode each weight with masks for each token. Their 64 to 128
   floats a lane likely leave the registers.
