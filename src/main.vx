@@ -146,6 +146,19 @@ fn parse_numbers(text : *const i8) -> Vec<i32> {
   return numbers;
 }
 
+/// The number of tokens that text mode runs through the model before it reads them. A read waits
+/// for all the work that the GPU was given, and then the GPU has nothing to do until the CPU gives
+/// it the next token: about 0.37 ms of a 21.9 ms token on the M4. The input of a token is the
+/// argmax of the token before it, in GPU memory, so the GPU can run several tokens without the
+/// CPU. Then the GPU waits only once for each AHEAD tokens. Up to AHEAD - 1 tokens after the end
+/// of the text are run and thrown away.
+const AHEAD : i32 = 8;
+
+/// The GPU tensor of one token.
+struct Slot {
+  next : Tensor<i32, [?], Memory::HBM>,
+}
+
 /// The token in `t`. Reading it waits for the GPU to finish the work before it.
 fn read_token(t : &Tensor<i32, [?], Memory::HBM>) -> i32 {
   let h = transfer(t, Memory::CPU_DRAM);
@@ -207,7 +220,19 @@ fn main(argc : i32, argv : *mut *mut i8) -> i32 {
   for i in 0..count {
     assert(prompt[i] < w.config.vocab_size, "a token of the prompt is not in the vocabulary");
   }
-  let mut next = transfer(Tensor<i32>([1]), Memory::HBM);
+  // Token i is in slots[i % (ahead + 1)]. Lines mode prints the logit of each token, so it reads
+  // each token before it runs the next.
+  let ahead = if text_mode {
+    AHEAD
+  } else {
+    1
+  };
+  let mut slots = Vec<Slot>::new();
+  for i in 0..ahead + 1 {
+    slots.push(Slot {
+      next: transfer(Tensor<i32>([1]), Memory::HBM)
+    });
+  }
 
   if text_mode {
     if !o.chat {
@@ -228,15 +253,17 @@ fn main(argc : i32, argv : *mut *mut i8) -> i32 {
 
   let prompt_start = Instant::now();
   prefill(&w, &mut s, &prompt);
-  predict(&w, &mut s, &mut next);
+  predict(&w, &mut s, &mut slots[0].next);
   // The first token waits for the whole prompt, so the clock of the decoder starts after it, and
   // its time covers only the tokens that the loop decodes.
-  let mut token = read_token(&next);
+  let mut tokens = Vec<i32>::new();
+  tokens.push(read_token(&slots[0].next));
   let prompt_ms = f64::from(prompt_start.elapsed().as_secs_f32()) * 1000.0;
   let start = Instant::now();
   // The number of tokens that the loop ran through the model.
   let mut decoded = 0;
   for step in 0..steps {
+    let token = tokens[step];
     if text_mode {
       if is_special(&t, token) || token == w.config.eos_token_id {
         break;
@@ -245,11 +272,22 @@ fn main(argc : i32, argv : *mut *mut i8) -> i32 {
     } else {
       println!("step={} token={} logit={};", step, token, read_logit(&s.logits, token));
     }
-    if step + 1 < steps {
-      run_layers(&w, &mut s, &next, count + step);
-      predict(&w, &mut s, &mut next);
-      token = read_token(&next);
-      decoded = decoded + 1;
+    if step + 1 < steps && tokens.len() == step + 1 {
+      // Run tokens step + 1 to step + n, and then read them all.
+      let mut n = steps - 1 - step;
+      if n > ahead {
+        n = ahead;
+      }
+      for j in 0..n {
+        let from = (step + j) % (ahead + 1);
+        let to = (step + j + 1) % (ahead + 1);
+        run_layers(&w, &mut s, &slots[from].next, count + step + j);
+        predict(&w, &mut s, &mut slots[to].next);
+      }
+      for j in 0..n {
+        tokens.push(read_token(&slots[(step + j + 1) % (ahead + 1)].next));
+      }
+      decoded = decoded + n;
     }
   }
   if text_mode {
