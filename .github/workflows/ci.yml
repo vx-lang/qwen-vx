@@ -13,9 +13,11 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-24.04
+    # A run takes 5 to 8 minutes. A test that hangs stops here, not at the limit of 6 hours.
+    timeout-minutes: 30
     env:
       # The oldest release that has every std::nn kernel that the program calls.
-      VX_VERSION: v0.0.4
+      VX_VERSION: v0.0.5
     steps:
       - uses: actions/checkout@v7
 
