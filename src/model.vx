@@ -13,6 +13,7 @@ import core::num;
 import std::nn;
 import std::vec;
 import qwen::attention;
+import qwen::products;
 import qwen::q6;
 import qwen::weights;
 
@@ -136,7 +137,7 @@ fn matvec_add(y : &mut Tensor<f32, [?], Memory::HBM>, m : &WeightMatrix, x : &Te
 /// y += m x, for x of [heads, head_dim].
 fn matvec_heads_add(y : &mut Tensor<f32, [?], Memory::HBM>, m : &WeightMatrix, x : &Tensor<f32, [?, ?], Memory::HBM>, rows : i32, heads : i32, head_dim : i32) -> void {
   if m.dtype == U4 {
-    nn_matvec_q4_heads_add(y, &m.codes, &m.group_scales, x, rows, heads, head_dim);
+    matvec_q4_heads_add_blocks(y, &m.codes, &m.group_scales, x, rows, heads, head_dim);
   } else if m.dtype == F8E4M3 {
     nn_matvec_fp8_heads_add(y, &m.codes, &m.scales, x, rows, heads, head_dim);
   } else {
@@ -148,7 +149,7 @@ fn matvec_heads_add(y : &mut Tensor<f32, [?], Memory::HBM>, m : &WeightMatrix, x
 /// The Q, K and V of x: m x + b, split by heads.
 fn qkv(q : &mut Tensor<f32, [?, ?], Memory::HBM>, k : &mut Tensor<f32, [?, ?], Memory::HBM>, v : &mut Tensor<f32, [?, ?], Memory::HBM>, m : &WeightMatrix, b : &Tensor<bf16, [?], Memory::HBM>, x : &Tensor<f32, [?], Memory::HBM>, c : &Config) -> void {
   if m.dtype == U4 {
-    nn_qkv_q4(q, k, v, &m.codes, &m.group_scales, b, x, c.num_q_heads, c.num_kv_heads, c.head_dim, c.hidden_size);
+    qkv_q4_blocks(q, k, v, &m.codes, &m.group_scales, b, x, c.num_q_heads, c.num_kv_heads, c.head_dim, c.hidden_size);
   } else if m.dtype == F8E4M3 {
     nn_qkv_fp8(q, k, v, &m.codes, &m.scales, b, x, c.num_q_heads, c.num_kv_heads, c.head_dim, c.hidden_size);
   } else {
@@ -179,8 +180,8 @@ fn add_experts(e : &mut Experts, x : &mut Tensor<f32, [?], Memory::HBM>, xn : &T
   let gate_up = &layer.gate_up;
   let down = &layer.down;
   if gate_up.dtype == U4 {
-    nn_moe_swiglu_q4(&mut e.mlp, &gate_up.codes, &gate_up.group_scales, &e.ids, xn, k, inter, c.hidden_size, c.num_experts);
-    nn_moe_down_q4_add(x, &down.codes, &down.group_scales, &e.ids, &e.weights, &e.mlp, k, c.hidden_size, inter, c.num_experts);
+    moe_swiglu_q4_blocks(&mut e.mlp, &gate_up.codes, &gate_up.group_scales, &e.ids, xn, k, inter, c.hidden_size, c.num_experts);
+    moe_down_q4_add_blocks(x, &down.codes, &down.group_scales, &e.ids, &e.weights, &e.mlp, k, c.hidden_size, inter, c.num_experts);
   } else {
     assert(gate_up.dtype == BF16, "the experts of a mixture-of-experts model must be bf16 or Q4_0");
     nn_moe_swiglu(&mut e.mlp, &gate_up.bf16, &e.ids, xn, k, inter, c.hidden_size, c.num_experts);
