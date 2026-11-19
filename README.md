@@ -134,7 +134,7 @@ of Qwen3-Coder-30B-A3B.
 | `scripts/compare.py` | Compares the output of the Vx program with the output of `reference.py`. |
 | `scripts/make_tiny_model.py` | Writes a tiny model with random weights. |
 | `scripts/qwen_weights.py` | Reads and writes the weight file. Its first comment describes the format. |
-| `scripts/test_qwen_weights.py` | Tests the f8e4m3 and Q4_0 codes, their scales and the quantized weight files. |
+| `scripts/test_qwen_weights.py` | Tests the f8e4m3, Q4_0 and 6-bit codes, their scales and the quantized weight files. |
 | `scripts/importance.py` | Measures the importance matrix of a bf16 model, for `convert.py --importance`. |
 | `scripts/test_importance.py` | Tests `importance.py`. |
 | `scripts/convert_tokenizer.py` | Converts a tokenizer.json into a tokenizer file. Its first comment describes the format. |
@@ -180,6 +180,12 @@ llama.cpp does with one. `importance.py` measures it: the mean square of each in
 matrix over a sample text, for each expert on its own tokens. The converter then tries 19 scales
 for each group, and keeps the one with the smallest error, where the error of a weight counts as
 much as its input matters. A test checks the codes and scales against the loops of llama.cpp.
+
+`convert.py --q4 --q6-lm-head` stores `lm_head` in 6 bits in place of fp8: a code from 0 to 63 for
+each weight, and an f16 scale for each 32 weights of a row. The weight is (code - 32) times its
+scale. That is 6.5 bits for each weight, as in the Q6_K of llama.cpp, and the codes round as its
+`make_qx_quants` rounds them. The `lm_head` of Qwen3-Coder-30B-A3B is then 253 MB in place of
+311 MB, and `src/q6.vx` reads it. See [the MoE model](#the-moe-model) for its cost in perplexity.
 
 The Vx program reads a Q4_0 file like the others, and runs the Q4_0 kernels of `std::nn` for it.
 Of four 4-bit formats, Q4_0 was the closest to bf16 on the 7B model. The measurement is in
@@ -240,6 +246,20 @@ vx-lang/Vx@4df81bf6, and `docs/parallel_compiler_architecture.md` at vx-lang/Vx@
 
 The importance matrix removed 86% of the gap to bf16 on `MetalImage.cpp`, 46% on `calls.rs` and
 23% on the architecture document.
+
+`lm_head` in 6 bits (`--q6-lm-head`) costs 0 to 0.25% of perplexity. This table has the Q4_0 file of
+`convert.py --q4` with three forms of `lm_head`, all measured again with `reference.py` on
+2026-11-17. For the bf16 row, the script took `lm_head` from the bf16 file.
+
+| `lm_head` | Bytes a token | MetalImage.cpp | calls.rs |
+| --- | --- | --- | --- |
+| bf16 | 622 MB | 3.7395 | 6.0024 |
+| fp8 | 311 MB | 3.7283 | 6.0032 |
+| 6 bits | 253 MB | 3.7392 | 6.0177 |
+
+On `MetalImage.cpp`, fp8 happens to score below bf16, and 6 bits scores the same as bf16.
+A scale for each 16 weights in place of 32 gave 3.7393 on `MetalImage.cpp`, and rounding to the
+largest weight of each group, without the search of `make_qx_quants`, gave 3.7392, so neither helps.
 
 The fourth file has the codes and scales of the unsloth file for each matrix that is Q4_0 there.
 The `experts_down` of the first 6 layers are Q4_1 there, so they stay ours. The unsloth file also

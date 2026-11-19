@@ -222,6 +222,102 @@ class Q4_0(unittest.TestCase):
         self.assertLess(weighted, 0.9 * error(*q.quantize_q4_0(matrix)))
 
 
+def q6_0_one_row(row):
+    """The 6-bit codes (0 to 63) and scales of one row, with the loop of make_qx_quants(32, 32, x,
+    L, 1, NULL) of llama.cpp, in float32 scalars. A group of zeros gets code 32."""
+    f = np.float32
+    codes, scales = [], []
+    for start in range(0, len(row), 32):
+        x = row[start : start + 32]
+        largest, extreme = f(0), f(0)
+        for v in x:
+            if largest < abs(v):
+                largest, extreme = abs(v), v
+        if largest == 0:
+            codes += [32] * 32
+            scales.append(np.float16(0))
+            continue
+
+        def round_all(iscale):
+            sumlx, suml2, levels = f(0), f(0), []
+            for j in range(32):
+                level = max(-32, min(31, int(np.rint(f(iscale * x[j])))))
+                levels.append(level + 32)
+                w = f(x[j] * x[j])
+                sumlx = f(sumlx + f(f(w * x[j]) * f(level)))
+                suml2 = f(suml2 + f(f(w * f(level)) * f(level)))
+            return sumlx, suml2, levels
+
+        sumlx, suml2, chosen = round_all(f(f(-32) / extreme))
+        scale = f(sumlx / suml2) if suml2 else f(0)
+        best = f(scale * sumlx)
+        for i in [i for i in range(-9, 10) if i != 0]:
+            sumlx, suml2, levels = round_all(f(-f(f(32) + f(f(0.1) * f(i))) / extreme))
+            if suml2 > 0 and f(sumlx * sumlx) > f(best * suml2):
+                chosen, scale = levels, f(sumlx / suml2)
+                best = f(scale * sumlx)
+        codes += chosen
+        scales.append(np.float16(scale))
+    return codes, scales
+
+
+class Q6_0(unittest.TestCase):
+    def setUp(self):
+        rng = np.random.default_rng(11)
+        self.matrix = (rng.standard_normal((48, 96)) * rng.uniform(0.01, 3, (48, 1))).astype(np.float32)
+        self.matrix[5, 32:64] = 0
+        self.low, self.high, self.scales = q.quantize_q6_0(self.matrix)
+
+    def codes(self):
+        return q.unpack_u4(self.low) | (q.unpack_u2(self.high) << 4)
+
+    def test_codes_and_scales_equal_those_of_the_llama_cpp_loop(self):
+        # Two tries can have errors that differ only in the order of the float sums, which differs
+        # from llama.cpp in NumPy. So a group may keep another try than the loop, but only one whose
+        # error is the same up to that rounding, and most groups keep the same one.
+        codes, same, groups = self.codes(), 0, 0
+        for r in range(len(self.matrix)):
+            expected_codes, expected_scales = q6_0_one_row(self.matrix[r])
+            for g in range(len(expected_scales)):
+                at = slice(32 * g, 32 * g + 32)
+                x = self.matrix[r, at]
+                ours = (codes[r, at].astype(np.float32) - 32) * np.float32(self.scales[r, g])
+                theirs = (np.array(expected_codes[at], dtype=np.float32) - 32) * np.float32(expected_scales[g])
+                if codes[r, at].tolist() == expected_codes[at] and self.scales[r, g] == expected_scales[g]:
+                    same += 1
+                else:
+                    self.assertAlmostEqual(float(np.sum(x**2 * (ours - x) ** 2)), float(np.sum(x**2 * (theirs - x) ** 2)), delta=1e-3 * float(np.sum(x**4)) / 32 ** 2, msg=f"row {r} group {g}")
+                groups += 1
+        self.assertGreater(same, 0.9 * groups)
+
+    def test_codes_fill_each_byte_from_its_low_bits(self):
+        codes = self.codes()
+        np.testing.assert_array_equal(self.low[:, 0] & 15, codes[:, 0] & 15)
+        np.testing.assert_array_equal(self.low[:, 0] >> 4, codes[:, 1] & 15)
+        np.testing.assert_array_equal((self.high[:, 0] >> 2) & 3, codes[:, 1] >> 4)
+        np.testing.assert_array_equal(self.high[:, 0] >> 6, codes[:, 3] >> 4)
+
+    def test_each_weight_is_within_three_quarters_of_a_step(self):
+        tensors = {"m": ("u4", self.low), "m.high": ("u2", self.high), "m.scale": ("f16", self.scales)}
+        widened = q.widen(tensors, "m")
+        step = np.repeat(np.abs(self.scales.astype(np.float32)), 32, axis=1)
+        error = np.abs(widened - self.matrix)
+        # The codes round to the step of the best try, and then get the scale of the smallest
+        # error for them, which differs from that step by a few percent. So a weight is a little
+        # more than half a step away.
+        self.assertTrue(np.all(error <= 0.75 * step))
+        np.testing.assert_array_equal(widened[5, 32:64], 0)
+
+    def test_the_search_lowers_the_error_of_the_large_weights(self):
+        tensors = {"m": ("u4", self.low), "m.high": ("u2", self.high), "m.scale": ("f16", self.scales)}
+        searched = np.sum(self.matrix**2 * (q.widen(tensors, "m") - self.matrix) ** 2)
+        groups = self.matrix.reshape(48, -1, 32)
+        largest = np.take_along_axis(groups, np.abs(groups).argmax(axis=-1)[..., None], axis=-1)
+        d = largest / np.float32(-32)
+        plain = np.clip(np.rint(groups / np.where(d == 0, 1, d)), -32, 31) * d
+        self.assertLess(searched, 0.95 * np.sum(self.matrix**2 * (plain.reshape(48, -1) - self.matrix) ** 2))
+
+
 class QuantizedFiles(unittest.TestCase):
     def test_the_tiny_model_in_fp8_reads_back(self):
         config, tensors = q.quantize(make_tiny_model.CONFIG, make_tiny_model.tiny_model(), "fp8")
@@ -265,6 +361,24 @@ class QuantizedFiles(unittest.TestCase):
         codes, scales = q.quantize_q4_0(expected)
         widened = q.widen(read, "layers.1.experts_gate_up", rows=(3 * 512, 4 * 512))
         np.testing.assert_array_equal(widened, q.widen({"m": ("u4", codes), "m.scale": ("f16", scales)}, "m"))
+
+    def test_the_tiny_moe_model_with_a_6_bit_lm_head_reads_back(self):
+        hf = make_tiny_model.tiny_moe_model()
+        config, tensors = convert.convert_tensors(q.config_from_json(make_tiny_model.MOE_CONFIG), hf)
+        config, tensors = q.quantize(config, tensors, "q4_0_q6")
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "tiny-moe-q4-q6.vxw")
+            q.write_weight_file(path, config, tensors)
+            read_config, read = q.read_weight_file(path)
+        self.assertEqual(read_config["weight_format"], 3)
+        self.assertEqual(list(read), q.tensor_names(read_config))
+        self.assertEqual(list(read)[-3:], ["lm_head", "lm_head.high", "lm_head.scale"])
+        self.assertEqual([read[n][0] for n in list(read)[-3:]], ["u4", "u2", "f16"])
+        self.assertEqual(read["layers.1.experts_gate_up"][0], "u4")
+        low, high, scales = q.quantize_q6_0(q.as_f32(hf["lm_head.weight"]))
+        np.testing.assert_array_equal(read["lm_head"][1], low)
+        np.testing.assert_array_equal(read["lm_head.high"][1], high)
+        np.testing.assert_array_equal(read["lm_head.scale"][1], scales)
 
     def test_each_expert_of_the_tiny_moe_model_gets_its_own_importance(self):
         hf = make_tiny_model.tiny_moe_model()

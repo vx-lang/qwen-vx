@@ -26,6 +26,11 @@ bf16 in every format.
                in the low 4 bits. Its `<name>.scale` has one f16 scale for each 32 weights of a
                row. A weight is (code - 8) times its scale, as in the Q4_0 of llama.cpp. lm_head
                is f8e4m3, as in an fp8 file.
+    3, q4_0_q6 as q4_0, but lm_head has 6-bit codes, as `quantize_q6_0` makes them: its low 4 bits
+               in `lm_head`, u4 as in q4_0, its high 2 bits in `lm_head.high`, u2, four in each
+               byte, the first weight in the low 2 bits, and one f16 scale for each 32 weights of a
+               row in `lm_head.scale`. A weight is (code - 32) times its scale. That is 6.5 bits for
+               each weight, as the Q6_K of llama.cpp has.
 
 A file in fp8 or q4_0 always has `lm_head`, also for a model whose output projection is its
 embedding table.
@@ -76,18 +81,21 @@ CONFIG_INTS = [
 # The header has room for 16 integers.
 CONFIG_INT_SLOTS = 16
 assert len(CONFIG_INTS) <= CONFIG_INT_SLOTS
-WEIGHT_FORMATS = {"bf16": 0, "fp8": 1, "q4_0": 2}
+WEIGHT_FORMATS = {"bf16": 0, "fp8": 1, "q4_0": 2, "q4_0_q6": 3}
 
-DTYPE_CODES = {"f32": 0, "bf16": 1, "f8e4m3": 2, "f16": 3, "u4": 4}
+DTYPE_CODES = {"f32": 0, "bf16": 1, "f8e4m3": 2, "f16": 3, "u4": 4, "u2": 5}
 DTYPE_NAMES = {code: name for name, code in DTYPE_CODES.items()}
-DTYPE_BITS = {"f32": 32, "bf16": 16, "f8e4m3": 8, "f16": 16, "u4": 4}
-# The NumPy array of a u4 tensor holds two codes in each uint8, so its last axis is half as long.
-STORAGE = {"f32": np.float32, "bf16": np.uint16, "f8e4m3": np.uint8, "f16": np.float16, "u4": np.uint8}
+DTYPE_BITS = {"f32": 32, "bf16": 16, "f8e4m3": 8, "f16": 16, "u4": 4, "u2": 2}
+# The NumPy array of a u4 tensor holds two codes in each uint8, so its last axis is half as long,
+# and that of a u2 tensor four, so its last axis is a quarter as long.
+STORAGE = {"f32": np.float32, "bf16": np.uint16, "f8e4m3": np.uint8, "f16": np.float16, "u4": np.uint8, "u2": np.uint8}
 
 # The weight matrices that an fp8 or q4_0 file quantizes. The kinds of a layer end the name.
 MATRICES = ("qkv", "attn_out", "gate_up", "down", "experts_gate_up", "experts_down", "lm_head")
 BLOCK = 128
 Q4_GROUP = 32
+# A 6-bit matrix has one f16 scale for each Q6_GROUP weights of a row.
+Q6_GROUP = 32
 
 
 def bf16_to_f32(bits):
@@ -109,9 +117,18 @@ def is_matrix(name):
     return name.rsplit(".", 1)[-1] in MATRICES
 
 
+def is_six_bit(config, name):
+    """Whether the matrix `name` has 6-bit codes in a file with this config: its low 4 bits in
+    `name`, its high 2 bits in `<name>.high`, and its scales in `<name>.scale`."""
+    return config["weight_format"] == WEIGHT_FORMATS["q4_0_q6"] and name == "lm_head"
+
+
 def matrix_dtype(config, name):
-    """The dtype of the weight matrix `name` in a file with this config."""
+    """The dtype of the weight matrix `name` in a file with this config. A 6-bit matrix is u4, the
+    dtype of its low 4 bits."""
     weight_format = config["weight_format"]
+    if weight_format == WEIGHT_FORMATS["q4_0_q6"]:
+        return "u4"
     if weight_format == WEIGHT_FORMATS["q4_0"] and name != "lm_head":
         return "u4"
     return "f8e4m3" if weight_format else "bf16"
@@ -138,7 +155,12 @@ def tensor_names(config):
     if not config["tied_embeddings"]:
         names.append("lm_head")
     if config["weight_format"]:
-        names = [n for name in names for n in ([name, name + ".scale"] if is_matrix(name) else [name])]
+        def parts(name):
+            if is_six_bit(config, name):
+                return [name, name + ".high", name + ".scale"]
+            return [name, name + ".scale"] if is_matrix(name) else [name]
+
+        names = [n for name in names for n in parts(name)]
     return names
 
 
@@ -174,7 +196,11 @@ def tensor_shapes(config):
     if config["weight_format"]:
         for name in [n for n in shapes if is_matrix(n)]:
             rows, cols = shapes[name]
-            if matrix_dtype(config, name) == "u4":
+            if is_six_bit(config, name):
+                assert cols % Q6_GROUP == 0, f"{name}: {cols} columns are not groups of {Q6_GROUP}"
+                shapes[name + ".high"] = (rows, cols)
+                shapes[name + ".scale"] = (rows, cols // Q6_GROUP)
+            elif matrix_dtype(config, name) == "u4":
                 assert cols % Q4_GROUP == 0, f"{name}: {cols} columns are not groups of {Q4_GROUP}"
                 shapes[name + ".scale"] = (rows, cols // Q4_GROUP)
             else:
@@ -184,10 +210,9 @@ def tensor_shapes(config):
 
 def storage_shape(dtype, shape):
     """The shape of the NumPy array that holds a tensor of this dtype and shape."""
-    if dtype != "u4":
-        return tuple(shape)
-    assert shape[-1] % 2 == 0, f"u4 rows of {shape[-1]} codes do not fill whole bytes"
-    return (*shape[:-1], shape[-1] // 2)
+    per_byte = {"u4": 2, "u2": 4}.get(dtype, 1)
+    assert shape[-1] % per_byte == 0, f"{dtype} rows of {shape[-1]} codes do not fill whole bytes"
+    return (*shape[:-1], shape[-1] // per_byte)
 
 
 def resolve(entry):
@@ -403,6 +428,71 @@ def _q4_0_search(rows, groups, importance):
     return (codes + 8).astype(np.uint8), np.where(zero, np.float32(0), scale)
 
 
+def quantize_q6_0(matrix):
+    """6-bit codes and f16 scales for a float32 matrix: the low 4 bits of the codes as u4, two in
+    each byte, their high 2 bits as u2, four in each byte, and one scale for each 32 weights of a
+    row. A weight is (code - 32) times its scale, and the code is 0 to 63. Each group of 32 weights
+    gets the codes and the scale that `make_qx_quants(32, 32, x, L, 1, NULL)` of llama.cpp chooses,
+    as its Q6_K does for groups of 16. See `_q6_0_search`."""
+    rows, cols = matrix.shape
+    assert cols % Q6_GROUP == 0, f"{cols} columns are not groups of {Q6_GROUP}"
+    low = np.empty((rows, cols // 2), dtype=np.uint8)
+    high = np.empty((rows, cols // 4), dtype=np.uint8)
+    scales = np.empty((rows, cols // Q6_GROUP), dtype=np.float16)
+    # About 1M weights at a time on each of several threads, as the Q4_0 search.
+    step = max(1, (1 << 20) // cols)
+
+    def rows_from(start):
+        chunk = np.asarray(matrix[start : start + step], dtype=np.float32)
+        assert np.all(np.isfinite(chunk)), "only finite values round to 6 bits here"
+        q, d = _q6_0_search(chunk.reshape(len(chunk), -1, Q6_GROUP))
+        q = q.reshape(len(chunk), cols)
+        low[start : start + step] = (q[:, 0::2] & 15) | ((q[:, 1::2] & 15) << 4)
+        hi = q >> 4
+        high[start : start + step] = hi[:, 0::4] | (hi[:, 1::4] << 2) | (hi[:, 2::4] << 4) | (hi[:, 3::4] << 6)
+        scales[start : start + step] = d.reshape(len(chunk), -1).astype(np.float16)
+
+    with concurrent.futures.ThreadPoolExecutor(max(1, (os.cpu_count() or 1) - 2)) as pool:
+        list(pool.map(rows_from, range(0, rows, step)))
+    return low, high, scales
+
+
+# The sizes in steps that the 6-bit search tries for the largest weight of a group: 32 first, then
+# 31.1 to 32.9 in tenths, as `make_qx_quants` of llama.cpp tries them, in float32.
+Q6_TRIES = [np.float32(32)] + [np.float32(32) + np.float32(0.1) * np.float32(i) for i in range(-9, 10) if i != 0]
+
+
+def _q6_0_search(groups):
+    """The codes (0 to 63) and float32 scales of `make_qx_quants(32, 32, x, L, 1, NULL)` of
+    llama.cpp, for groups of shape [rows, n, 32]. The error of weight x counts x * x times. For each
+    size of `Q6_TRIES`, the largest weight of the group sets the step, each weight rounds to a code
+    from -32 to 31, and the codes get the scale of the smallest weighted square error. The group
+    keeps the try of the smallest error."""
+    weight = groups * groups
+    largest = np.take_along_axis(groups, np.abs(groups).argmax(axis=-1)[..., None], axis=-1)[..., 0]
+    zero = largest == 0
+    largest = np.where(zero, np.float32(1), largest)
+    best = np.zeros(largest.shape, dtype=np.float32)
+    scale = np.zeros(largest.shape, dtype=np.float32)
+    codes = np.zeros(groups.shape, dtype=np.float32)
+    for index, size in enumerate(Q6_TRIES):
+        q = np.clip(np.rint(groups * (-size / largest)[..., None]), -32, 31)
+        sumlx = (weight * groups * q).sum(axis=-1)
+        suml2 = (weight * q * q).sum(axis=-1)
+        d = np.divide(sumlx, suml2, out=np.zeros_like(sumlx), where=suml2 > 0)
+        better = ((suml2 > 0) & (sumlx * sumlx > best * suml2)) | (index == 0)
+        best = np.where(better, d * sumlx, best)
+        scale = np.where(better, d, scale)
+        codes = np.where(better[..., None], q, codes)
+    codes = np.where(zero[..., None], 0, codes)
+    return (codes + 32).astype(np.uint8), np.where(zero, np.float32(0), scale)
+
+
+def unpack_u2(packed):
+    """The codes of a u2 array, one in each uint8: bits 0-1 of a byte, then 2-3, 4-5 and 6-7."""
+    return np.stack([(packed >> s) & 3 for s in (0, 2, 4, 6)], axis=-1).reshape(*packed.shape[:-1], -1)
+
+
 def unpack_u4(packed):
     """The codes of a u4 array, one in each uint8: the low 4 bits of a byte, then the high 4."""
     return np.stack([packed & 15, packed >> 4], axis=-1).reshape(*packed.shape[:-1], -1)
@@ -417,6 +507,10 @@ def widen(tensors, name, rows=None):
     if dtype in ("bf16", "f32"):
         return as_f32((dtype, array))
     scales = tensors[name + ".scale"][1]
+    if dtype == "u4" and name + ".high" in tensors:
+        group_scales = np.repeat(scales[start:stop].astype(np.float32), Q6_GROUP, axis=1)
+        codes = unpack_u4(array) | (unpack_u2(tensors[name + ".high"][1][start:stop]) << 4)
+        return (codes.astype(np.float32) - 32) * group_scales
     if dtype == "u4":
         group_scales = np.repeat(scales[start:stop].astype(np.float32), Q4_GROUP, axis=1)
         return (unpack_u4(array).astype(np.float32) - 8) * group_scales
@@ -425,9 +519,9 @@ def widen(tensors, name, rows=None):
     return E4M3[array] * blocks
 
 
-def _lazy_pair(compute):
-    """Two functions that return the two parts of `compute()`. It runs once for both, and its
-    result is freed when both functions have returned their part."""
+def _lazy_parts(compute, count):
+    """`count` functions that return the parts of `compute()`. It runs once for all of them, and its
+    result is freed when each function has returned its part."""
     result, taken = [], set()
 
     def part(index):
@@ -436,18 +530,23 @@ def _lazy_pair(compute):
                 result.append(compute())
             value = result[0][index]
             taken.add(index)
-            if len(taken) == 2:
+            if len(taken) == count:
                 result.clear()
                 taken.clear()
             return value
 
         return get
 
-    return part(0), part(1)
+    return tuple(part(i) for i in range(count))
+
+
+def _lazy_pair(compute):
+    """Two functions that return the two parts of `compute()`, as `_lazy_parts`."""
+    return _lazy_parts(compute, 2)
 
 
 def quantize(config, tensors, weight_format, importance=None):
-    """The config and tensors of the fp8 or q4_0 file for a bf16 model. A model with tied
+    """The config and tensors of the fp8, q4_0 or q4_0_q6 file for a bf16 model. A model with tied
     embeddings gets a copy of its embedding table as `lm_head`. Each quantized matrix and its
     scales are functions, which quantize it when `write_weight_file` gets to it. `importance`, a
     dict from matrix name to the array of importance.py, guides the rounding of each Q4_0 matrix."""
@@ -458,6 +557,12 @@ def quantize(config, tensors, weight_format, importance=None):
     config = dict(config, weight_format=WEIGHT_FORMATS[weight_format], tied_embeddings=0)
     for name in [n for n in tensors if is_matrix(n)]:
         dtype = matrix_dtype(config, name)
+        if is_six_bit(config, name):
+            parts = _lazy_parts(lambda entry=tensors[name]: quantize_q6_0(as_f32(resolve(entry))), 3)
+            tensors[name] = lambda part=parts[0]: ("u4", part())
+            tensors[name + ".high"] = lambda part=parts[1]: ("u2", part())
+            tensors[name + ".scale"] = lambda part=parts[2]: ("f16", part())
+            continue
         if dtype == "u4":
             assert importance is None or name in importance, f"the importance file has no {name}"
             weights = None if importance is None else importance[name]

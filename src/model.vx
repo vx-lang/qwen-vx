@@ -13,6 +13,7 @@ import core::num;
 import std::nn;
 import std::vec;
 import qwen::attention;
+import qwen::q6;
 import qwen::weights;
 
 /// The keys and the values of every position so far, for one layer: [max_seq, kv_heads, head_dim].
@@ -108,7 +109,9 @@ fn new_state(c : &Config, max_seq : i32) -> State {
 
 /// y = m x, with the kernel for the dtype of `m`, which has `rows` x `cols` weights.
 fn matvec(y : &mut Tensor<f32, [?], Memory::HBM>, m : &WeightMatrix, x : &Tensor<f32, [?], Memory::HBM>, rows : i32, cols : i32) -> void {
-  if m.dtype == U4 {
+  if m.dtype == U6 {
+    matvec_q6(y, &m.codes, &m.high, &m.group_scales, x, rows, cols);
+  } else if m.dtype == U4 {
     nn_matvec_q4(y, &m.codes, &m.group_scales, x, rows, cols);
   } else if m.dtype == F8E4M3 {
     nn_matvec_fp8(y, &m.codes, &m.scales, x, rows, cols);
