@@ -32,11 +32,11 @@ token (geometric mean of 3 prompts of each kind, two rounds):
 
 | Prompts | Qwen-vx | Qwen-vx `--draft 7` | llama.cpp | `llama-lookup` |
 | --- | --- | --- | --- | --- |
-| Edit a file | 24.09 | 13.09 | 25.50 | 12.55 |
-| Complete code | 23.61 | 23.77 | 25.57 | 26.24 |
-| Write new code | 21.91 | 22.32 (21.82 since the second change of entry 14) | 23.93 | 29.27 |
-| Explain code | 23.72 | 21.95 | 25.29 | 26.53 |
-| All 12 | 23.32 | 19.76 | 25.06 | 22.49 |
+| Edit a file | 24.06 | 13.13 | 25.12 | 12.52 |
+| Complete code | 23.64 | 23.62 | 25.33 | 26.27 |
+| Write new code | 21.78 | 21.82 | 23.38 | 29.30 |
+| Explain code | 23.69 | 21.71 | 25.09 | 26.15 |
+| All 12 | 23.27 | 19.58 | 24.72 | 22.41 |
 
 | | Qwen-vx | llama.cpp | Notes |
 | --- | --- | --- | --- |
@@ -305,8 +305,8 @@ and 7 from 12. After two rounds in a row that keep nothing, there are no drafts 
 match comes up. Between rounds, plain steps run 1, 2, 4 and then up to 8 tokens before each read,
 as in entry 12.
 
-**Result.** Edits are 1.84 times as fast (24.09 to 13.09 ms a token), and the 12 code prompts of
-"The state now" are 1.18 times as fast (23.32 to 19.76 ms), 1.14 times as fast as `llama-lookup`.
+**Result.** Edits are 1.83 times as fast (24.06 to 13.13 ms a token), and the 12 code prompts of
+"The state now" are 1.19 times as fast (23.27 to 19.58 ms), 1.14 times as fast as `llama-lookup`.
 Before the plain runs between rounds, drafts on prompts that write new code cost 0.5 ms a token
 more than plain steps; with them, nothing (write prompts, two runs of each in turn):
 
