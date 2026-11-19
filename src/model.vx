@@ -71,11 +71,13 @@ fn new_state(c : &Config, max_seq : i32) -> State {
   let experts = i32::max(c.num_experts, 1);
   let chosen = i32::max(c.experts_per_token, 1);
   let moe_inter = i32::max(c.moe_intermediate_size, 1);
+  // The flash attention of a prompt reads the cache in blocks of 64 positions.
+  let rows = (max_seq + 63) / 64 * 64;
   let mut caches = Vec<Cache>::new();
   for l in 0..c.num_layers {
     caches.push(Cache {
-      k: transfer(Tensor<f16>([max_seq, c.num_kv_heads, c.head_dim]), Memory::HBM),
-      v: transfer(Tensor<f16>([max_seq, c.num_kv_heads, c.head_dim]), Memory::HBM),
+      k: transfer(Tensor<f16>([rows, c.num_kv_heads, c.head_dim]), Memory::HBM),
+      v: transfer(Tensor<f16>([rows, c.num_kv_heads, c.head_dim]), Memory::HBM),
     });
   }
   return State {
