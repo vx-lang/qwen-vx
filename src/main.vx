@@ -27,6 +27,8 @@ import qwen::weights;
 import qwen::model;
 import qwen::prefill;
 import qwen::session;
+import qwen::speculate;
+import qwen::round;
 import qwen::tokenizer;
 
 /// The options of the command line.
@@ -51,6 +53,8 @@ struct Options {
   session : bool,
   chat : bool,
   lines : bool,
+  draft : *const i8,
+  has_draft : bool,
 }
 
 /// The options of `argv`. Asserts that they are complete and that they fit together.
@@ -60,7 +64,7 @@ fn parse_options(argc : i32, argv : *mut *mut i8) -> Options {
   let mut o = Options {
     weights: unsafe { argv[1] }, tokens: empty, tokenizer: empty, prompt: empty, prompt_file: empty,
     steps: empty, has_tokens: false, has_tokenizer: false, has_prompt: false, has_prompt_file: false,
-    has_steps: false, context: empty, has_context: false, requests: empty, has_requests: false, replies: empty, has_replies: false, session: false, chat: false, lines: false,
+    has_steps: false, context: empty, has_context: false, requests: empty, has_requests: false, replies: empty, has_replies: false, session: false, chat: false, lines: false, draft: empty, has_draft: false,
   };
   let mut i = 2;
   while i < argc {
@@ -98,6 +102,9 @@ fn parse_options(argc : i32, argv : *mut *mut i8) -> Options {
       } else if same(name, "--replies") {
         o.replies = value;
         o.has_replies = true;
+      } else if same(name, "--draft") {
+        o.draft = value;
+        o.has_draft = true;
       } else {
         assert(same(name, "--steps"), "give: WEIGHTS --tokens 1,2,3 --steps N, or WEIGHTS --tokenizer FILE (--prompt TEXT | --prompt-file FILE) [--chat] [--lines] --steps N");
         o.steps = value;
@@ -196,6 +203,157 @@ fn prompt_ids(o : &Options, t : &Tokenizer) -> Vec<i32> {
   return ids;
 }
 
+/// Shows token number `step`, as the loop of `main` does: its text, or a line with its logit.
+/// Gives false at the end of the text, where the loop stops.
+fn show(t : &Tokenizer, w : &Weights, text_mode : bool, step : i32, token : i32, logit : f32) -> bool {
+  if text_mode {
+    if is_special(t, token) || token == w.config.eos_token_id {
+      return false;
+    }
+    write_token(t, token);
+  } else {
+    println!("step={} token={} logit={};", step, token, logit);
+  }
+  return true;
+}
+
+/// The logit `token` of position j of a round.
+fn round_logit(r : &Round, j : i32, token : i32) -> f32 {
+  let h = transfer(&r.logits, Memory::CPU_DRAM);
+  return h[j][token];
+}
+
+/// The loop of `main` with speculative decoding (src/speculate.vx). Each step is a round of the
+/// last token and a draft from the context, or a plain step when the draft would not pay: when the
+/// longest earlier match of the end of the context is shorter than 6 tokens, or after 2 rounds in a
+/// row that accepted nothing, until a longer match than theirs appears. A draft has up to `max`
+/// tokens. `first` is the first generated token, from the logits in `s.logits`. Shows the same
+/// `steps` tokens as the loop of `main`, and gives the number of tokens after the first.
+fn generate_with_drafts(w : &Weights, s : &mut State, t : &Tokenizer, text_mode : bool, prompt : &Vec<i32>, first : i32, steps : i32, max : i32, start : &mut Instant) -> i32 {
+  assert(can_round(w), "--draft needs a model of Q4_0 experts with QK norms, head_dim 128 and a 6-bit lm_head");
+  assert(max >= 1 && max < ROUND_MAX, "--draft must be 1 to ROUND_MAX - 1");
+  assert(steps >= ROUND_MAX, "--draft needs --steps of at least ROUND_MAX");
+  let mut r = new_round(&w.config);
+  // One run of the round kernels for each n to 8, so that their compile time is not in the time
+  // of a token: it restarts the clock. Larger rounds use the same kernels. The rounds write rows of
+  // the KV cache that the steps write again before they read them.
+  let mut warm = Vec<i32>::new();
+  for n in 1..9 {
+    warm.push(first);
+    run_round(w, s, &mut r, &warm, prompt.len(), n);
+  }
+  let _ready = transfer(&r.next, Memory::CPU_DRAM);
+  *start = Instant::now();
+  // The tokens of a run of plain steps: token j is in ring[j].
+  let mut ring = Vec<Slot>::new();
+  for j in 0..AHEAD {
+    ring.push(Slot {
+      next: transfer(Tensor<i32>([1]), Memory::HBM),
+    });
+  }
+  // The length of the next run of plain steps: 1 after a round, then 2, 4 and up to AHEAD while
+  // no draft comes up. The GPU runs the tokens of a run before the CPU reads them. Lines mode
+  // prints the logit of each token, so it reads each one.
+  let mut run = 1;
+  let mut context = Vec<i32>::new();
+  for i in 0..prompt.len() {
+    context.push(prompt[i]);
+  }
+  let mut token = first;
+  context.push(token);
+  // The position of `token`, which is not in the KV cache yet.
+  let mut pos = prompt.len();
+  let mut step = 0;
+  let mut rounds = 0;
+  let mut drafted = 0;
+  let mut accepted = 0;
+  // Rounds in a row that accepted nothing, and the length of the match of the last of them.
+  let mut misses = 0;
+  let mut missed_length = 0;
+  let mut going = show(t, w, text_mode, 0, token, read_logit(&s.logits, token));
+  while going && step + 1 < steps {
+    let room = steps - step - 1;
+    let m = longest_match(&context);
+    if misses >= 2 && m.length > missed_length {
+      misses = 0;
+    }
+    let mut k = i32::min(i32::min(draft_length(m.length), max), room - 1);
+    if misses >= 2 {
+      k = 0;
+    }
+    let draft = tokens_after(&context, m.end, k);
+    k = draft.len();
+    if k == 0 {
+      // Plain steps, with the kernels of one token each.
+      let mut n = 1;
+      if text_mode {
+        n = i32::min(run, room);
+      }
+      let mut h = Tensor<i32>([1]);
+      h[0] = token;
+      let input = transfer(h, Memory::HBM);
+      run_layers(w, s, &input, pos);
+      predict(w, s, &mut ring[0].next);
+      for j in 1..n {
+        run_layers(w, s, &ring[j - 1].next, pos + j);
+        predict(w, s, &mut ring[j].next);
+      }
+      let mut j = 0;
+      while j < n && going {
+        token = read_token(&ring[j].next);
+        context.push(token);
+        step = step + 1;
+        pos = pos + 1;
+        let mut logit : f32 = 0.0;
+        if !text_mode {
+          logit = read_logit(&s.logits, token);
+        }
+        going = show(t, w, text_mode, step, token, logit);
+        j = j + 1;
+      }
+      run = i32::min(run * 2, AHEAD);
+    } else {
+      run = 1;
+      let mut inputs = Vec<i32>::new();
+      inputs.push(token);
+      for i in 0..k {
+        inputs.push(draft[i]);
+      }
+      run_round(w, s, &mut r, &inputs, pos, k + 1);
+      let choice = transfer(&r.next, Memory::CPU_DRAM);
+      rounds = rounds + 1;
+      drafted = drafted + k;
+      // c0 is the next token; each draft token that equals the choice before it adds the next one.
+      let mut j = 0;
+      let mut more = true;
+      while more && going {
+        token = choice[j];
+        context.push(token);
+        step = step + 1;
+        let mut logit : f32 = 0.0;
+        if !text_mode {
+          logit = round_logit(&r, j, token);
+        }
+        going = show(t, w, text_mode, step, token, logit);
+        more = j < k && draft[j] == token;
+        if more {
+          accepted = accepted + 1;
+          j = j + 1;
+        }
+      }
+      pos = pos + j + 1;
+      if j == 0 {
+        misses = misses + 1;
+        missed_length = m.length;
+      } else {
+        misses = 0;
+      }
+    }
+  }
+  println!("rounds={} drafted={} accepted={};", rounds, drafted, accepted);
+  return step;
+}
+
 fn main(argc : i32, argv : *mut *mut i8) -> i32 {
   let o = parse_options(argc, argv);
   if o.session {
@@ -259,10 +417,20 @@ fn main(argc : i32, argv : *mut *mut i8) -> i32 {
   let mut tokens = Vec<i32>::new();
   tokens.push(read_token(&slots[0].next));
   let prompt_ms = f64::from(prompt_start.elapsed().as_secs_f32()) * 1000.0;
-  let start = Instant::now();
+  // The first run of a kernel compiles it, so the clock starts after one run of the kernels of a
+  // token. This run writes the row of position `count` of the KV cache, as the first step does.
+  run_layers(&w, &mut s, &slots[0].next, count);
+  read_token(&slots[0].next);
+  let mut start = Instant::now();
   // The number of tokens that the loop ran through the model.
   let mut decoded = 0;
+  if o.has_draft {
+    decoded = generate_with_drafts(&w, &mut s, &t, text_mode, &prompt, tokens[0], steps, parse_numbers(o.draft)[0], &mut start);
+  }
   for step in 0..steps {
+    if o.has_draft {
+      break;
+    }
     let token = tokens[step];
     if text_mode {
       if is_special(&t, token) || token == w.config.eos_token_id {

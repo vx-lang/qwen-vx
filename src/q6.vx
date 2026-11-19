@@ -120,3 +120,199 @@ fn matvec_q6(y : &mut Tensor<f32, [?], Memory::HBM>, codes : &Tensor<u32, [?], M
   }
   return;
 }
+
+/// `matvec_q6` for n vectors: y[p][r] = (row r of the matrix) . x[p], for p below n and r below `rows`.
+/// Each y[p] is the y of `matvec_q6` for x[p] bit for bit. A block does two vectors, p0 and
+/// p1 = p0 + 1, or p0 again when p0 is the last one, and takes the bits of each weight once for
+/// both. The blocks of a block of rows come one after the other, so the later ones read the weights
+/// from the cache. Each sum has the lanes and the order of `matvec_q6`.
+fn matvec_q6_rows(y : &mut Tensor<f32, [?, ?], Memory::HBM>, codes : &Tensor<u32, [?], Memory::HBM>, high : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, n : i32, rows : i32, cols : i32) -> void {
+  assert(cols % 32 == 0 && rows % 8 == 0 && n >= 1 && y.extent(0) >= n && x.extent(0) >= n && y.extent(1) >= rows && x.extent(1) >= cols, "matvec_q6_rows: cols must be a multiple of 32 and rows of 8, and y and x need n rows of rows and cols values");
+  assert(codes.len() / rows >= cols / 8 && high.len() / rows >= cols / 16 && scales.len() / rows >= cols / 32, "matvec_q6_rows: the matrix has too few words or scales for rows x cols");
+  let words = cols / 8;
+  let hwords = cols / 16;
+  let groups = cols / 32;
+  spawn on(Topology::Device) {
+    for rb in 0..rows / 8 across blocks {
+      for pp in 0..(n + 1) / 2 across blocks {
+        let mut part = unsafe {
+          Tensor<f32, [2, 8, 32], Memory::SMEM>::uninit()
+        };
+        let p0 = pp * 2;
+        let p1 = p0 + 1 - (p0 + 2) / (n + 1);
+        for s in 0..1 across subgroups {
+          for l in 0..32 across lanes(32) {
+            let mut a0 = unsafe { Tensor<f32, [8]>::uninit() };
+            let mut a1 = unsafe { Tensor<f32, [8]>::uninit() };
+            for j in 0..8 {
+              a0[j] = 0.0;
+              a1[j] = 0.0;
+            }
+            let mut i = l * 2;
+            while i < words {
+              let c = i * 8;
+              let mut xa = unsafe { Tensor<f32, [16]>::uninit() };
+              let mut ha = unsafe { Tensor<f32, [16]>::uninit() };
+              for t in 0..16 {
+                xa[t] = x[p0][c + t];
+              }
+              let sa = 32.0 * (xa[0] + xa[1] + xa[2] + xa[3] + xa[4] + xa[5] + xa[6] + xa[7] + xa[8] + xa[9] + xa[10] + xa[11] + xa[12] + xa[13] + xa[14] + xa[15]);
+              ha[0] = xa[0] * 16.0;
+              ha[1] = xa[1] * 4.0;
+              ha[2] = xa[2] * 1.0;
+              ha[3] = xa[3] * 0.25;
+              ha[4] = xa[4] * 0.0625;
+              ha[5] = xa[5] * 0.015625;
+              ha[6] = xa[6] * 0.00390625;
+              ha[7] = xa[7] * 0.0009765625;
+              ha[8] = xa[8] * 0.000244140625;
+              ha[9] = xa[9] * 0.00006103515625;
+              ha[10] = xa[10] * 0.0000152587890625;
+              ha[11] = xa[11] * 0.000003814697265625;
+              ha[12] = xa[12] * 0.00000095367431640625;
+              ha[13] = xa[13] * 0.0000002384185791015625;
+              ha[14] = xa[14] * 0.000000059604644775390625;
+              ha[15] = xa[15] * 0.00000001490116119384765625;
+              xa[1] = xa[1] * 0.0625;
+              xa[2] = xa[2] * 0.00390625;
+              xa[3] = xa[3] * 0.000244140625;
+              xa[4] = xa[4] * 0.0000152587890625;
+              xa[5] = xa[5] * 0.00000095367431640625;
+              xa[6] = xa[6] * 0.000000059604644775390625;
+              xa[7] = xa[7] * 0.0000000037252902984619140625;
+              xa[9] = xa[9] * 0.0625;
+              xa[10] = xa[10] * 0.00390625;
+              xa[11] = xa[11] * 0.000244140625;
+              xa[12] = xa[12] * 0.0000152587890625;
+              xa[13] = xa[13] * 0.00000095367431640625;
+              xa[14] = xa[14] * 0.000000059604644775390625;
+              xa[15] = xa[15] * 0.0000000037252902984619140625;
+              let mut xb = unsafe { Tensor<f32, [16]>::uninit() };
+              let mut hb = unsafe { Tensor<f32, [16]>::uninit() };
+              for t in 0..16 {
+                xb[t] = x[p1][c + t];
+              }
+              let sb = 32.0 * (xb[0] + xb[1] + xb[2] + xb[3] + xb[4] + xb[5] + xb[6] + xb[7] + xb[8] + xb[9] + xb[10] + xb[11] + xb[12] + xb[13] + xb[14] + xb[15]);
+              hb[0] = xb[0] * 16.0;
+              hb[1] = xb[1] * 4.0;
+              hb[2] = xb[2] * 1.0;
+              hb[3] = xb[3] * 0.25;
+              hb[4] = xb[4] * 0.0625;
+              hb[5] = xb[5] * 0.015625;
+              hb[6] = xb[6] * 0.00390625;
+              hb[7] = xb[7] * 0.0009765625;
+              hb[8] = xb[8] * 0.000244140625;
+              hb[9] = xb[9] * 0.00006103515625;
+              hb[10] = xb[10] * 0.0000152587890625;
+              hb[11] = xb[11] * 0.000003814697265625;
+              hb[12] = xb[12] * 0.00000095367431640625;
+              hb[13] = xb[13] * 0.0000002384185791015625;
+              hb[14] = xb[14] * 0.000000059604644775390625;
+              hb[15] = xb[15] * 0.00000001490116119384765625;
+              xb[1] = xb[1] * 0.0625;
+              xb[2] = xb[2] * 0.00390625;
+              xb[3] = xb[3] * 0.000244140625;
+              xb[4] = xb[4] * 0.0000152587890625;
+              xb[5] = xb[5] * 0.00000095367431640625;
+              xb[6] = xb[6] * 0.000000059604644775390625;
+              xb[7] = xb[7] * 0.0000000037252902984619140625;
+              xb[9] = xb[9] * 0.0625;
+              xb[10] = xb[10] * 0.00390625;
+              xb[11] = xb[11] * 0.000244140625;
+              xb[12] = xb[12] * 0.0000152587890625;
+              xb[13] = xb[13] * 0.00000095367431640625;
+              xb[14] = xb[14] * 0.000000059604644775390625;
+              xb[15] = xb[15] * 0.0000000037252902984619140625;
+              for j in 0..8 {
+                let row = rb * 8 + j;
+                let at = row * words + i;
+                let w0 = codes[at];
+                let w1 = codes[at + 1];
+                let h = high[row * hwords + i / 2];
+                let sc = scales[row * groups + i / 4] as f32;
+                let f0 = (w0 & 15u32) as f32;
+                let f1 = (w0 & 240u32) as f32;
+                let f2 = (w0 & 3840u32) as f32;
+                let f3 = (w0 & 61440u32) as f32;
+                let f4 = (w0 & 983040u32) as f32;
+                let f5 = (w0 & 15728640u32) as f32;
+                let f6 = (w0 & 251658240u32) as f32;
+                let f7 = (w0 & 4026531840u32) as f32;
+                let f8 = (w1 & 15u32) as f32;
+                let f9 = (w1 & 240u32) as f32;
+                let f10 = (w1 & 3840u32) as f32;
+                let f11 = (w1 & 61440u32) as f32;
+                let f12 = (w1 & 983040u32) as f32;
+                let f13 = (w1 & 15728640u32) as f32;
+                let f14 = (w1 & 251658240u32) as f32;
+                let f15 = (w1 & 4026531840u32) as f32;
+                let g0 = (h & 3u32) as f32;
+                let g1 = (h & 12u32) as f32;
+                let g2 = (h & 48u32) as f32;
+                let g3 = (h & 192u32) as f32;
+                let g4 = (h & 768u32) as f32;
+                let g5 = (h & 3072u32) as f32;
+                let g6 = (h & 12288u32) as f32;
+                let g7 = (h & 49152u32) as f32;
+                let g8 = (h & 196608u32) as f32;
+                let g9 = (h & 786432u32) as f32;
+                let g10 = (h & 3145728u32) as f32;
+                let g11 = (h & 12582912u32) as f32;
+                let g12 = (h & 50331648u32) as f32;
+                let g13 = (h & 201326592u32) as f32;
+                let g14 = (h & 805306368u32) as f32;
+                let g15 = (h & 3221225472u32) as f32;
+                let lowa = f0 * xa[0] + f1 * xa[1] + f2 * xa[2] + f3 * xa[3] + f4 * xa[4] + f5 * xa[5] + f6 * xa[6] + f7 * xa[7] + f8 * xa[8] + f9 * xa[9] + f10 * xa[10] + f11 * xa[11] + f12 * xa[12] + f13 * xa[13] + f14 * xa[14] + f15 * xa[15];
+                let topa = g0 * ha[0] + g1 * ha[1] + g2 * ha[2] + g3 * ha[3] + g4 * ha[4] + g5 * ha[5] + g6 * ha[6] + g7 * ha[7] + g8 * ha[8] + g9 * ha[9] + g10 * ha[10] + g11 * ha[11] + g12 * ha[12] + g13 * ha[13] + g14 * ha[14] + g15 * ha[15];
+                a0[j] = a0[j] + (lowa + topa - sa) * sc;
+                let lowb = f0 * xb[0] + f1 * xb[1] + f2 * xb[2] + f3 * xb[3] + f4 * xb[4] + f5 * xb[5] + f6 * xb[6] + f7 * xb[7] + f8 * xb[8] + f9 * xb[9] + f10 * xb[10] + f11 * xb[11] + f12 * xb[12] + f13 * xb[13] + f14 * xb[14] + f15 * xb[15];
+                let topb = g0 * hb[0] + g1 * hb[1] + g2 * hb[2] + g3 * hb[3] + g4 * hb[4] + g5 * hb[5] + g6 * hb[6] + g7 * hb[7] + g8 * hb[8] + g9 * hb[9] + g10 * hb[10] + g11 * hb[11] + g12 * hb[12] + g13 * hb[13] + g14 * hb[14] + g15 * hb[15];
+                a1[j] = a1[j] + (lowb + topb - sb) * sc;
+              }
+              i = i + 64;
+            }
+            for j in 0..8 {
+              part[0][j][l] = a0[j];
+              part[1][j][l] = a1[j];
+            }
+          }
+          let u0 = lanes::sum(&part[0][0], 32);
+          let u1 = lanes::sum(&part[0][1], 32);
+          let u2 = lanes::sum(&part[0][2], 32);
+          let u3 = lanes::sum(&part[0][3], 32);
+          let u4 = lanes::sum(&part[0][4], 32);
+          let u5 = lanes::sum(&part[0][5], 32);
+          let u6 = lanes::sum(&part[0][6], 32);
+          let u7 = lanes::sum(&part[0][7], 32);
+          let v0 = lanes::sum(&part[1][0], 32);
+          let v1 = lanes::sum(&part[1][1], 32);
+          let v2 = lanes::sum(&part[1][2], 32);
+          let v3 = lanes::sum(&part[1][3], 32);
+          let v4 = lanes::sum(&part[1][4], 32);
+          let v5 = lanes::sum(&part[1][5], 32);
+          let v6 = lanes::sum(&part[1][6], 32);
+          let v7 = lanes::sum(&part[1][7], 32);
+          y[pp * 2][rb * 8 + s * 8 + 0] = u0;
+          y[pp * 2][rb * 8 + s * 8 + 1] = u1;
+          y[pp * 2][rb * 8 + s * 8 + 2] = u2;
+          y[pp * 2][rb * 8 + s * 8 + 3] = u3;
+          y[pp * 2][rb * 8 + s * 8 + 4] = u4;
+          y[pp * 2][rb * 8 + s * 8 + 5] = u5;
+          y[pp * 2][rb * 8 + s * 8 + 6] = u6;
+          y[pp * 2][rb * 8 + s * 8 + 7] = u7;
+          if pp * 2 + 1 < n {
+            y[pp * 2 + 1][rb * 8 + s * 8 + 0] = v0;
+            y[pp * 2 + 1][rb * 8 + s * 8 + 1] = v1;
+            y[pp * 2 + 1][rb * 8 + s * 8 + 2] = v2;
+            y[pp * 2 + 1][rb * 8 + s * 8 + 3] = v3;
+            y[pp * 2 + 1][rb * 8 + s * 8 + 4] = v4;
+            y[pp * 2 + 1][rb * 8 + s * 8 + 5] = v5;
+            y[pp * 2 + 1][rb * 8 + s * 8 + 6] = v6;
+            y[pp * 2 + 1][rb * 8 + s * 8 + 7] = v7;
+          }
+        }
+      }
+    }
+  }
+  return;
+}

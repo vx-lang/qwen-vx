@@ -1,0 +1,170 @@
+//===- speculate.vx - Qwen app ----------------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// Speculative decoding with a draft from the context. Not for GitHub yet: keep it local.
+//
+// A round: the CPU makes a draft d1 ... dk of the next tokens from the context. The GPU runs the
+// last accepted token a and the draft, n = k + 1 positions, through the model with one read of
+// the weights, and gives the greedy choice c0 ... ck after each of them. c0 is the next token. A
+// draft token di is accepted while it equals c(i-1), and each accepted di adds the token ci. So a
+// round gives 1 to n tokens. The KV cache keeps the rows of the accepted inputs; the next round
+// writes over the others.
+//
+// The kernels of a round give each position the result of the kernels of a generated token bit
+// for bit (src/round.vx and the `_rows` kernels of std::nn). So the tokens are those of plain
+// greedy decoding.
+import core::convert;
+import std::nn;
+import std::vec;
+import qwen::weights;
+import qwen::model;
+import qwen::round;
+import qwen::q6;
+
+/// The tensors of a round of up to ROUND_MAX positions, in GPU memory.
+struct Round {
+  tokens : Tensor<i32, [?], Memory::HBM>,
+  x : Tensor<f32, [?, ?], Memory::HBM>,
+  xn : Tensor<f32, [?, ?], Memory::HBM>,
+  q : Tensor<f32, [?, ?, ?], Memory::HBM>,
+  k : Tensor<f32, [?, ?, ?], Memory::HBM>,
+  v : Tensor<f32, [?, ?, ?], Memory::HBM>,
+  q_turned : Tensor<f32, [?, ?, ?], Memory::HBM>,
+  attended : Tensor<f32, [?, ?, ?], Memory::HBM>,
+  parts : Tensor<f32, [?, ?, ?], Memory::HBM>,
+  router : Tensor<f32, [?, ?], Memory::HBM>,
+  ids : Tensor<i32, [?, ?], Memory::HBM>,
+  weights : Tensor<f32, [?, ?], Memory::HBM>,
+  mlp : Tensor<f32, [?, ?], Memory::HBM>,
+  logits : Tensor<f32, [?, ?], Memory::HBM>,
+  next : Tensor<i32, [?], Memory::HBM>,
+}
+
+/// The tensors of a round, for a model of Q4_0 layers with experts, QK norms, head_dim 128, and
+/// a 6-bit lm_head.
+fn new_round(c : &Config) -> Round {
+  let n = ROUND_MAX;
+  return Round {
+    tokens: transfer(Tensor<i32>([n]), Memory::HBM),
+    x: transfer(Tensor<f32>([n, c.hidden_size]), Memory::HBM),
+    xn: transfer(Tensor<f32>([n, c.hidden_size]), Memory::HBM),
+    q: transfer(Tensor<f32>([n, c.num_q_heads, c.head_dim]), Memory::HBM),
+    k: transfer(Tensor<f32>([n, c.num_kv_heads, c.head_dim]), Memory::HBM),
+    v: transfer(Tensor<f32>([n, c.num_kv_heads, c.head_dim]), Memory::HBM),
+    q_turned: transfer(Tensor<f32>([n, c.num_q_heads, c.head_dim]), Memory::HBM),
+    attended: transfer(Tensor<f32>([n, c.num_q_heads, c.head_dim]), Memory::HBM),
+    parts: transfer(round_attention_scratch(c.num_q_heads), Memory::HBM),
+    router: transfer(Tensor<f32>([n, c.num_experts]), Memory::HBM),
+    ids: transfer(Tensor<i32>([n, c.experts_per_token]), Memory::HBM),
+    weights: transfer(Tensor<f32>([n, c.experts_per_token]), Memory::HBM),
+    mlp: transfer(Tensor<f32>([n * c.experts_per_token, c.moe_intermediate_size]), Memory::HBM),
+    logits: transfer(Tensor<f32>([n, c.vocab_size]), Memory::HBM),
+    next: transfer(Tensor<i32>([n]), Memory::HBM),
+  };
+}
+
+/// Whether the round kernels can run model `w`.
+fn can_round(w : &Weights) -> bool {
+  let c = &w.config;
+  return c.num_experts > 0 && c.qk_norm && c.head_dim == 128 && !c.tied_embeddings && w.lm_head.dtype == U6 && w.layers[0].qkv.dtype == U4 && w.layers[0].gate_up.dtype == U4 && !c.qkv_bias;
+}
+
+/// Runs the n tokens of `tokens` at positions start to start + n - 1 through the model. Their
+/// rows go to the KV caches, and r.next[t] gets the greedy token after token t. As `run_layers`
+/// and then `predict` for each token in turn.
+fn run_round(w : &Weights, s : &mut State, r : &mut Round, tokens : &Vec<i32>, start : i32, n : i32) -> void {
+  let c = &w.config;
+  let eps = c.rms_norm_eps as f32;
+  let k = c.experts_per_token;
+  let inter = c.moe_intermediate_size;
+  assert(n >= 1 && n <= ROUND_MAX && start + n <= s.max_seq, "run_round: n must be 1 to ROUND_MAX, and the positions must fit in the KV cache");
+  let mut h = Tensor<i32>([ROUND_MAX]);
+  for t in 0..ROUND_MAX {
+    h[t] = 0;
+    if t < n {
+      h[t] = tokens[t];
+    }
+  }
+  r.tokens = transfer(h, Memory::HBM);
+  nn_embed_rows(&mut r.x, &w.embed, &r.tokens, n, c.hidden_size);
+  let mut l = 0;
+  for cache in s.caches.iter_mut() {
+    let layer = &w.layers[l];
+    nn_rms_norm_rows(&mut r.xn, &r.x, &layer.attn_norm, n, c.hidden_size, eps);
+    nn_qkv_q4_rows(&mut r.q, &mut r.k, &mut r.v, &layer.qkv.codes, &layer.qkv.group_scales, &layer.qkv_bias, &r.xn, n, c.num_q_heads, c.num_kv_heads, c.head_dim, c.hidden_size);
+    round_norm_rope_and_store(&mut r.q_turned, &mut cache.k, &mut cache.v, &r.q, &r.k, &r.v, &layer.q_norm, &layer.k_norm, &s.cos, &s.sin, start, n, c.num_q_heads, c.num_kv_heads, c.head_dim, eps);
+    round_attention(&mut r.attended, &mut r.parts, &r.q_turned, &cache.k, &cache.v, start, n, c.num_q_heads, c.num_kv_heads, c.head_dim);
+    nn_matvec_q4_heads_add_rows(&mut r.x, &layer.attn_out.codes, &layer.attn_out.group_scales, &r.attended, n, c.hidden_size, c.num_q_heads, c.head_dim);
+    nn_rms_norm_rows(&mut r.xn, &r.x, &layer.mlp_norm, n, c.hidden_size, eps);
+    nn_matvec_rows(&mut r.router, &layer.router, &r.xn, n, c.num_experts, c.hidden_size);
+    nn_top_k_rows(&mut r.ids, &mut r.weights, &r.router, n, c.num_experts, k);
+    nn_moe_swiglu_q4_rows(&mut r.mlp, &layer.gate_up.codes, &layer.gate_up.group_scales, &r.ids, &r.xn, n, k, inter, c.hidden_size, c.num_experts);
+    nn_moe_down_q4_add_rows(&mut r.x, &layer.down.codes, &layer.down.group_scales, &r.ids, &r.weights, &r.mlp, n, k, c.hidden_size, inter, c.num_experts);
+    l = l + 1;
+  }
+  nn_rms_norm_rows(&mut r.xn, &r.x, &w.final_norm, n, c.hidden_size, eps);
+  matvec_q6_rows(&mut r.logits, &w.lm_head.codes, &w.lm_head.high, &w.lm_head.group_scales, &r.xn, n, c.vocab_size, c.hidden_size);
+  nn_argmax_rows(&mut r.next, &r.logits, n, c.vocab_size);
+  return;
+}
+
+/// The longest earlier match of the end of the context: `length` tokens, up to MATCH_MAX, end at
+/// position `end` (the latest such position), and `end` is before the last position. No match has
+/// length 0.
+struct Match {
+  length : i32,
+  end : i32,
+}
+
+const MATCH_MAX : i32 = 16;
+
+fn longest_match(context : &Vec<i32>) -> Match {
+  let count = context.len();
+  let mut best = Match {
+    length: 0, end: -1
+  };
+  let mut e = count - 2;
+  while e >= 0 {
+    let mut m = 0;
+    while m < MATCH_MAX && e - m >= 0 && context[e - m] == context[count - 1 - m] {
+      m = m + 1;
+    }
+    if m > best.length {
+      best.length = m;
+      best.end = e;
+    }
+    e = e - 1;
+  }
+  return best;
+}
+
+/// The number of draft tokens for a match of `length` tokens: none below 6, 1 for 6 or 7, 4 for 8
+/// to 11, and 7 from 12 on. The simulator of the design found this rule best on 12 code prompts,
+/// with the measured cost of a round, about 24 + 13 (n - 1) ms for n positions at short context.
+fn draft_length(length : i32) -> i32 {
+  if length < 6 {
+    return 0;
+  }
+  if length < 8 {
+    return 1;
+  }
+  if length < 12 {
+    return 4;
+  }
+  return 7;
+}
+
+/// Up to `k` tokens of the context after position `end`.
+fn tokens_after(context : &Vec<i32>, end : i32, k : i32) -> Vec<i32> {
+  let mut draft = Vec<i32>::new();
+  let mut t = end + 1;
+  while t < context.len() && draft.len() < k {
+    draft.push(context[t]);
+    t = t + 1;
+  }
+  return draft;
+}

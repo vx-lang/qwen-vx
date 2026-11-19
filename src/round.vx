@@ -1,0 +1,2300 @@
+//===- round.vx - Qwen app --------------------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// The kernels of a round: n positions in a row, start to start + n - 1, with one read of the
+// weights. Each position gets the result of the kernel of a generated token bit for bit, so that a
+// round gives the tokens that plain decoding gives. Tensors of a round have the position first:
+// q of [n, q_heads, head_dim].
+//
+// scripts/mlir_kernels/round_attention.py writes the kernels of `round_attention`: change that
+// script, not the MLIR.
+import core::num;
+import std::nn;
+
+/// The largest n of a round.
+const ROUND_MAX : i32 = 16;
+
+/// The number of SIMD groups of `vec_attention` for each head of Q, for the token at `pos`.
+fn vec_attention_groups(pos : i32) -> i32 {
+  let mut nwg = 32;
+  if 2 * nwg * 32 < pos + 1 {
+    nwg = nwg * 2;
+  }
+  return nwg;
+}
+
+/// The scratch space of `round_attention`, on the CPU.
+fn round_attention_scratch(q_heads : i32) -> Tensor<f32, [?, ?, ?]> {
+  return Tensor<f32>([q_heads, 128, ROUND_MAX * 132]);
+}
+
+/// `vec_attention` for the n queries in q, for the tokens at positions start to start + n - 1:
+/// out[t] gets the attention of the token at start + t, over rows 0 to start + t of the KV cache.
+/// The rows of all n tokens must be in the cache. `part` is scratch space from
+/// `round_attention_scratch`. Up to 4 queries that use the same number of SIMD groups share one
+/// kernel: for 8 queries, pieces of 4 are about 20% faster than one kernel at position 2,000, and 7%
+/// at 8,000, since each query costs the same work in a kernel for more queries.
+fn round_attention(out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+  assert(n >= 1 && n <= ROUND_MAX && q.extent(0) >= n && out.extent(0) >= n, "round_attention: n must be 1 to ROUND_MAX, and q and out need n rows");
+  nn_check_heads(q.extent(1), q.extent(2), q_heads, head_dim);
+  nn_check_heads(out.extent(1), out.extent(2), q_heads, head_dim);
+  nn_check_cache(k_cache.extent(0), k_cache.extent(1), k_cache.extent(2), start + n - 1, kv_heads, head_dim);
+  nn_check_cache(v_cache.extent(0), v_cache.extent(1), v_cache.extent(2), start + n - 1, kv_heads, head_dim);
+  assert(q_heads % kv_heads == 0 && head_dim == 128, "round_attention: q_heads must be a multiple of kv_heads, and head_dim 128");
+  assert(part.extent(0) >= q_heads && part.extent(1) >= 128 && part.extent(2) == ROUND_MAX * 132, "round_attention: `part` is too small. Make it with round_attention_scratch");
+  let scale = 1.0 / (head_dim as f32).sqrt();
+  let mut t0 = 0;
+  while t0 < n {
+    let nwg = vec_attention_groups(start + t0);
+    let mut t1 = t0 + 1;
+    while t1 < n && t1 - t0 < 4 && vec_attention_groups(start + t1) == nwg {
+      t1 = t1 + 1;
+    }
+    round_attention_parts(part, q, k_cache, v_cache, start + t0, t0, t1 - t0, q_heads, q_heads / kv_heads, nwg, scale);
+    round_attention_merge(out, part, nwg, t0, t1 - t0, q_heads);
+    t0 = t1;
+  }
+  return;
+}
+
+/// `norm_rope_and_store` of src/attention.vx for n tokens at positions start to start + n - 1: q,
+/// k and v are [n, heads, head_dim], and q_out gets [n, q_heads, head_dim].
+fn round_norm_rope_and_store(q_out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &mut Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &mut Tensor<f16, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k : &Tensor<f32, [?, ?, ?], Memory::HBM>, v : &Tensor<f32, [?, ?, ?], Memory::HBM>, q_norm : &Tensor<bf16, [?], Memory::HBM>, k_norm : &Tensor<bf16, [?], Memory::HBM>, cos : &Tensor<f32, [?, ?], Memory::HBM>, sin : &Tensor<f32, [?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32, head_dim : i32, eps : f32) -> void {
+  let half = head_dim / 2;
+  assert(n >= 1 && q.extent(0) >= n && k.extent(0) >= n && v.extent(0) >= n && q_out.extent(0) >= n, "round_norm_rope_and_store: q, k, v and q_out need n rows");
+  nn_check_heads(q.extent(1), q.extent(2), q_heads, head_dim);
+  nn_check_heads(q_out.extent(1), q_out.extent(2), q_heads, head_dim);
+  nn_check_heads(k.extent(1), k.extent(2), kv_heads, head_dim);
+  nn_check_heads(v.extent(1), v.extent(2), kv_heads, head_dim);
+  nn_check_cache(k_cache.extent(0), k_cache.extent(1), k_cache.extent(2), start + n - 1, kv_heads, head_dim);
+  nn_check_cache(v_cache.extent(0), v_cache.extent(1), v_cache.extent(2), start + n - 1, kv_heads, head_dim);
+  assert(head_dim <= 128 && q_norm.len() >= head_dim && k_norm.len() >= head_dim, "round_norm_rope_and_store: head_dim must be at most 128, and `q_norm` and `k_norm` need head_dim values");
+  assert(start + n - 1 < cos.extent(0) && start + n - 1 < sin.extent(0) && half <= cos.extent(1) && half <= sin.extent(1), "round_norm_rope_and_store: `cos` and `sin` need a row for each position with head_dim / 2 values");
+  spawn on(Topology::Device) {
+    for t in 0..n across blocks {
+      for h in 0..q_heads + kv_heads across blocks {
+        let pos = start + t;
+        let mut x = unsafe { Tensor<f32, [128], Memory::SMEM>::uninit() };
+        let mut part = unsafe { Tensor<f32, [128], Memory::SMEM>::uninit() };
+        for i in 0..128 across lanes {
+          let mut a : f32 = 0.0;
+          if i < head_dim {
+            if h < q_heads {
+              a = q[t][h][i];
+            } else {
+              a = k[t][h - q_heads][i];
+            }
+          }
+          x[i] = a;
+          part[i] = a * a;
+        }
+        let ss = lanes::sum(&part, 128);
+        let inv = 1.0 / (ss / (head_dim as f32) + eps).sqrt();
+        for i in 0..128 across lanes {
+          if i < head_dim {
+            // Value i of the head, its partner, and the angle that they share.
+            let mut j = i;
+            let mut sign : f32 = -1.0;
+            let mut partner = i + half;
+            if i >= half {
+              j = i - half;
+              sign = 1.0;
+              partner = i - half;
+            }
+            let c = cos[pos][j];
+            let s = sin[pos][j];
+            if h < q_heads {
+              let a = x[i] * inv * (q_norm[i] as f32);
+              let b = x[partner] * inv * (q_norm[partner] as f32);
+              q_out[t][h][i] = a * c + sign * b * s;
+            } else {
+              let a = x[i] * inv * (k_norm[i] as f32);
+              let b = x[partner] * inv * (k_norm[partner] as f32);
+              k_cache[pos][h - q_heads][i] = (a * c + sign * b * s) as f16;
+              v_cache[pos][h - q_heads][i] = v[t][h - q_heads][i] as f16;
+            }
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// The parts of queries t0 to t0 + n - 1, with the kernel for n queries. n is 1 to 8.
+fn round_attention_parts(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, pos : i32, t0 : i32, n : i32, q_heads : i32, group : i32, nwg : i32, scale : f32) -> void {
+  assert(n >= 1 && n <= 8, "round_attention_parts: n must be 1 to 8");
+  if n == 1 {
+    round_attention_parts_1(part, q, k_cache, v_cache, pos, t0, q_heads, group, nwg, scale);
+  } else if n == 2 {
+    round_attention_parts_2(part, q, k_cache, v_cache, pos, t0, q_heads, group, nwg, scale);
+  } else if n == 3 {
+    round_attention_parts_3(part, q, k_cache, v_cache, pos, t0, q_heads, group, nwg, scale);
+  } else if n == 4 {
+    round_attention_parts_4(part, q, k_cache, v_cache, pos, t0, q_heads, group, nwg, scale);
+  } else if n == 5 {
+    round_attention_parts_5(part, q, k_cache, v_cache, pos, t0, q_heads, group, nwg, scale);
+  } else if n == 6 {
+    round_attention_parts_6(part, q, k_cache, v_cache, pos, t0, q_heads, group, nwg, scale);
+  } else if n == 7 {
+    round_attention_parts_7(part, q, k_cache, v_cache, pos, t0, q_heads, group, nwg, scale);
+  } else {
+    round_attention_parts_8(part, q, k_cache, v_cache, pos, t0, q_heads, group, nwg, scale);
+  }
+  return;
+}
+
+/// `vec_attention_parts` for 1 queries in a row: query t is at position pos + t, in q[t0 + t], and its part
+/// w goes to part[h][w][132 (t0 + t) ..].
+fn round_attention_parts_1(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, pos : i32, t0 : i32, q_heads : i32, group : i32, nwg : i32, scale : f32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..q_heads across blocks {
+      for w in 0..nwg across blocks {
+        let g = h / group;
+        let _d = mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %t0 = t0 : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
+          %c0 = arith.constant 0 : index
+          %c1 = arith.constant 1 : index
+          %c4 = arith.constant 4 : index
+          %c32 = arith.constant 32 : index
+          %c128 = arith.constant 128 : index
+          %c129 = arith.constant 129 : index
+          %c132 = arith.constant 132 : index
+          %c32i = arith.constant 32 : i32
+          %neg = arith.constant -3.0e38 : f32
+          %zero = arith.constant 0.0 : f32
+          %vz4 = arith.constant dense<0.0> : vector<4xf32>
+          %l = gpu.thread_id x
+          %l4 = arith.muli %l, %c4 : index
+          %hi = arith.index_cast %h : i32 to index
+          %wi = arith.index_cast %w : i32 to index
+          %gi = arith.index_cast %g : i32 to index
+          %posi = arith.index_cast %pos : i32 to index
+          %nwgi = arith.index_cast %nwg : i32 to index
+          %t0i = arith.index_cast %t0 : i32 to index
+          %g128 = arith.muli %gi, %c128 : index
+          %kd = arith.addi %g128, %l4 : index
+          %P = memref.dim %k3, %c0 : memref<?x?x?xf16>
+          %KH = memref.dim %k3, %c1 : memref<?x?x?xf16>
+          %Wd = arith.muli %KH, %c128 : index
+          %k = memref.reinterpret_cast %k3 to offset: [0], sizes: [%P, %Wd], strides: [%Wd, 1] : memref<?x?x?xf16> to memref<?x?xf16, strided<[?, 1]>>
+          %v = memref.reinterpret_cast %v3 to offset: [0], sizes: [%P, %Wd], strides: [%Wd, 1] : memref<?x?x?xf16> to memref<?x?xf16, strided<[?, 1]>>
+          %scv = vector.broadcast %scale : f32 to vector<4xf32>
+          %ct0 = arith.constant 0 : index
+          %pos0 = arith.addi %posi, %ct0 : index
+          %n0 = arith.addi %pos0, %c32 : index
+          %chunks0 = arith.divui %n0, %c32 : index
+          %qt0 = arith.addi %t0i, %ct0 : index
+          %qv0 = vector.load %q[%qt0, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs0 = arith.mulf %qv0, %scv : vector<4xf32>
+          %st:3 = scf.for %ic = %wi to %chunks0 step %nwgi iter_args(%M0 = %neg, %S0 = %zero, %o0 = %vz4) -> (f32, f32, vector<4xf32>) {
+            %r0 = arith.muli %ic, %c32 : index
+            %my:1 = scf.for %cc = %c0 to %c32 step %c1 iter_args(%m0 = %neg) -> (f32) {
+              %row = arith.addi %r0, %cc : index
+              %rowc = arith.minui %row, %pos0 : index
+              %kh = vector.load %k[%rowc, %kd] {alignment = 8} : memref<?x?xf16, strided<[?, 1]>>, vector<4xf16>
+              %kf = arith.extf %kh : vector<4xf16> to vector<4xf32>
+              %mine = arith.cmpi eq, %cc, %l : index
+              %pr0 = arith.mulf %kf, %qs0 : vector<4xf32>
+              %pl0 = vector.reduction <add>, %pr0 : vector<4xf32> into f32
+              %sc0 = gpu.subgroup_reduce add %pl0 : (f32) -> f32
+              %live0 = arith.cmpi ule, %row, %pos0 : index
+              %scm0 = arith.select %live0, %sc0, %neg : f32
+              %mm0 = arith.select %mine, %scm0, %m0 : f32
+              scf.yield %mm0 : f32
+            }
+            %act0 = arith.cmpi ult, %ic, %chunks0 : index
+            %u0:4 = scf.if %act0 -> (f32, f32, vector<4xf32>, f32) {
+              %bm0 = gpu.subgroup_reduce maxnumf %my#0 : (f32) -> f32
+              %Mn0 = arith.maxnumf %M0, %bm0 : f32
+              %dm0 = arith.subf %M0, %Mn0 : f32
+              %ms0 = math.exp %dm0 : f32
+              %dp0 = arith.subf %my#0, %Mn0 : f32
+              %p0 = math.exp %dp0 : f32
+              %bs0 = gpu.subgroup_reduce add %p0 : (f32) -> f32
+              %Ss0 = arith.mulf %S0, %ms0 : f32
+              %Sn0 = arith.addf %Ss0, %bs0 : f32
+              %msv0 = vector.broadcast %ms0 : f32 to vector<4xf32>
+              %ox0 = arith.mulf %o0, %msv0 : vector<4xf32>
+              scf.yield %Mn0, %Sn0, %ox0, %p0 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M0, %S0, %o0, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %ov:1 = scf.for %cc = %c0 to %c32 step %c1 iter_args(%oa0 = %u0#2) -> (vector<4xf32>) {
+              %row = arith.addi %r0, %cc : index
+              %rowc = arith.minui %row, %pos0 : index
+              %vh = vector.load %v[%rowc, %kd] {alignment = 8} : memref<?x?xf16, strided<[?, 1]>>, vector<4xf16>
+              %vf = arith.extf %vh : vector<4xf16> to vector<4xf32>
+              %cci = arith.index_cast %cc : index to i32
+              %pc0, %pv0 = gpu.shuffle idx %u0#3, %cci, %c32i : f32
+              %pcv0 = vector.broadcast %pc0 : f32 to vector<4xf32>
+              %on0 = vector.fma %vf, %pcv0, %oa0 : vector<4xf32>
+              scf.yield %on0 : vector<4xf32>
+            }
+            scf.yield %u0#0, %u0#1, %ov#0 : f32, f32, vector<4xf32>
+          }
+          %lane0 = arith.cmpi eq, %l, %c0 : index
+          %base0 = arith.muli %qt0, %c132 : index
+          %at0 = arith.addi %base0, %l4 : index
+          vector.store %st#2, %part[%hi, %wi, %at0] : memref<?x?x?xf32>, vector<4xf32>
+          %am0 = arith.addi %base0, %c128 : index
+          %as0 = arith.addi %base0, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#0, %part[%hi, %wi, %am0] : memref<?x?x?xf32>
+            memref.store %st#1, %part[%hi, %wi, %as0] : memref<?x?x?xf32>
+          }
+          macro.yield %h : i32
+        };
+      }
+    }
+  }
+  return;
+}
+
+/// `vec_attention_parts` for 2 queries in a row: query t is at position pos + t, in q[t0 + t], and its part
+/// w goes to part[h][w][132 (t0 + t) ..].
+fn round_attention_parts_2(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, pos : i32, t0 : i32, q_heads : i32, group : i32, nwg : i32, scale : f32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..q_heads across blocks {
+      for w in 0..nwg across blocks {
+        let g = h / group;
+        let _d = mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %t0 = t0 : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
+          %c0 = arith.constant 0 : index
+          %c1 = arith.constant 1 : index
+          %c4 = arith.constant 4 : index
+          %c32 = arith.constant 32 : index
+          %c128 = arith.constant 128 : index
+          %c129 = arith.constant 129 : index
+          %c132 = arith.constant 132 : index
+          %c32i = arith.constant 32 : i32
+          %neg = arith.constant -3.0e38 : f32
+          %zero = arith.constant 0.0 : f32
+          %vz4 = arith.constant dense<0.0> : vector<4xf32>
+          %l = gpu.thread_id x
+          %l4 = arith.muli %l, %c4 : index
+          %hi = arith.index_cast %h : i32 to index
+          %wi = arith.index_cast %w : i32 to index
+          %gi = arith.index_cast %g : i32 to index
+          %posi = arith.index_cast %pos : i32 to index
+          %nwgi = arith.index_cast %nwg : i32 to index
+          %t0i = arith.index_cast %t0 : i32 to index
+          %g128 = arith.muli %gi, %c128 : index
+          %kd = arith.addi %g128, %l4 : index
+          %P = memref.dim %k3, %c0 : memref<?x?x?xf16>
+          %KH = memref.dim %k3, %c1 : memref<?x?x?xf16>
+          %Wd = arith.muli %KH, %c128 : index
+          %k = memref.reinterpret_cast %k3 to offset: [0], sizes: [%P, %Wd], strides: [%Wd, 1] : memref<?x?x?xf16> to memref<?x?xf16, strided<[?, 1]>>
+          %v = memref.reinterpret_cast %v3 to offset: [0], sizes: [%P, %Wd], strides: [%Wd, 1] : memref<?x?x?xf16> to memref<?x?xf16, strided<[?, 1]>>
+          %scv = vector.broadcast %scale : f32 to vector<4xf32>
+          %ct0 = arith.constant 0 : index
+          %pos0 = arith.addi %posi, %ct0 : index
+          %n0 = arith.addi %pos0, %c32 : index
+          %chunks0 = arith.divui %n0, %c32 : index
+          %qt0 = arith.addi %t0i, %ct0 : index
+          %qv0 = vector.load %q[%qt0, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs0 = arith.mulf %qv0, %scv : vector<4xf32>
+          %ct1 = arith.constant 1 : index
+          %pos1 = arith.addi %posi, %ct1 : index
+          %n1 = arith.addi %pos1, %c32 : index
+          %chunks1 = arith.divui %n1, %c32 : index
+          %qt1 = arith.addi %t0i, %ct1 : index
+          %qv1 = vector.load %q[%qt1, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs1 = arith.mulf %qv1, %scv : vector<4xf32>
+          %st:6 = scf.for %ic = %wi to %chunks1 step %nwgi iter_args(%M0 = %neg, %S0 = %zero, %o0 = %vz4, %M1 = %neg, %S1 = %zero, %o1 = %vz4) -> (f32, f32, vector<4xf32>, f32, f32, vector<4xf32>) {
+            %r0 = arith.muli %ic, %c32 : index
+            %my:2 = scf.for %cc = %c0 to %c32 step %c1 iter_args(%m0 = %neg, %m1 = %neg) -> (f32, f32) {
+              %row = arith.addi %r0, %cc : index
+              %rowc = arith.minui %row, %pos1 : index
+              %kh = vector.load %k[%rowc, %kd] {alignment = 8} : memref<?x?xf16, strided<[?, 1]>>, vector<4xf16>
+              %kf = arith.extf %kh : vector<4xf16> to vector<4xf32>
+              %mine = arith.cmpi eq, %cc, %l : index
+              %pr0 = arith.mulf %kf, %qs0 : vector<4xf32>
+              %pl0 = vector.reduction <add>, %pr0 : vector<4xf32> into f32
+              %sc0 = gpu.subgroup_reduce add %pl0 : (f32) -> f32
+              %live0 = arith.cmpi ule, %row, %pos0 : index
+              %scm0 = arith.select %live0, %sc0, %neg : f32
+              %mm0 = arith.select %mine, %scm0, %m0 : f32
+              %pr1 = arith.mulf %kf, %qs1 : vector<4xf32>
+              %pl1 = vector.reduction <add>, %pr1 : vector<4xf32> into f32
+              %sc1 = gpu.subgroup_reduce add %pl1 : (f32) -> f32
+              %live1 = arith.cmpi ule, %row, %pos1 : index
+              %scm1 = arith.select %live1, %sc1, %neg : f32
+              %mm1 = arith.select %mine, %scm1, %m1 : f32
+              scf.yield %mm0, %mm1 : f32, f32
+            }
+            %act0 = arith.cmpi ult, %ic, %chunks0 : index
+            %u0:4 = scf.if %act0 -> (f32, f32, vector<4xf32>, f32) {
+              %bm0 = gpu.subgroup_reduce maxnumf %my#0 : (f32) -> f32
+              %Mn0 = arith.maxnumf %M0, %bm0 : f32
+              %dm0 = arith.subf %M0, %Mn0 : f32
+              %ms0 = math.exp %dm0 : f32
+              %dp0 = arith.subf %my#0, %Mn0 : f32
+              %p0 = math.exp %dp0 : f32
+              %bs0 = gpu.subgroup_reduce add %p0 : (f32) -> f32
+              %Ss0 = arith.mulf %S0, %ms0 : f32
+              %Sn0 = arith.addf %Ss0, %bs0 : f32
+              %msv0 = vector.broadcast %ms0 : f32 to vector<4xf32>
+              %ox0 = arith.mulf %o0, %msv0 : vector<4xf32>
+              scf.yield %Mn0, %Sn0, %ox0, %p0 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M0, %S0, %o0, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act1 = arith.cmpi ult, %ic, %chunks1 : index
+            %u1:4 = scf.if %act1 -> (f32, f32, vector<4xf32>, f32) {
+              %bm1 = gpu.subgroup_reduce maxnumf %my#1 : (f32) -> f32
+              %Mn1 = arith.maxnumf %M1, %bm1 : f32
+              %dm1 = arith.subf %M1, %Mn1 : f32
+              %ms1 = math.exp %dm1 : f32
+              %dp1 = arith.subf %my#1, %Mn1 : f32
+              %p1 = math.exp %dp1 : f32
+              %bs1 = gpu.subgroup_reduce add %p1 : (f32) -> f32
+              %Ss1 = arith.mulf %S1, %ms1 : f32
+              %Sn1 = arith.addf %Ss1, %bs1 : f32
+              %msv1 = vector.broadcast %ms1 : f32 to vector<4xf32>
+              %ox1 = arith.mulf %o1, %msv1 : vector<4xf32>
+              scf.yield %Mn1, %Sn1, %ox1, %p1 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M1, %S1, %o1, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %ov:2 = scf.for %cc = %c0 to %c32 step %c1 iter_args(%oa0 = %u0#2, %oa1 = %u1#2) -> (vector<4xf32>, vector<4xf32>) {
+              %row = arith.addi %r0, %cc : index
+              %rowc = arith.minui %row, %pos1 : index
+              %vh = vector.load %v[%rowc, %kd] {alignment = 8} : memref<?x?xf16, strided<[?, 1]>>, vector<4xf16>
+              %vf = arith.extf %vh : vector<4xf16> to vector<4xf32>
+              %cci = arith.index_cast %cc : index to i32
+              %pc0, %pv0 = gpu.shuffle idx %u0#3, %cci, %c32i : f32
+              %pcv0 = vector.broadcast %pc0 : f32 to vector<4xf32>
+              %on0 = vector.fma %vf, %pcv0, %oa0 : vector<4xf32>
+              %pc1, %pv1 = gpu.shuffle idx %u1#3, %cci, %c32i : f32
+              %pcv1 = vector.broadcast %pc1 : f32 to vector<4xf32>
+              %on1 = vector.fma %vf, %pcv1, %oa1 : vector<4xf32>
+              scf.yield %on0, %on1 : vector<4xf32>, vector<4xf32>
+            }
+            scf.yield %u0#0, %u0#1, %ov#0, %u1#0, %u1#1, %ov#1 : f32, f32, vector<4xf32>, f32, f32, vector<4xf32>
+          }
+          %lane0 = arith.cmpi eq, %l, %c0 : index
+          %base0 = arith.muli %qt0, %c132 : index
+          %at0 = arith.addi %base0, %l4 : index
+          vector.store %st#2, %part[%hi, %wi, %at0] : memref<?x?x?xf32>, vector<4xf32>
+          %am0 = arith.addi %base0, %c128 : index
+          %as0 = arith.addi %base0, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#0, %part[%hi, %wi, %am0] : memref<?x?x?xf32>
+            memref.store %st#1, %part[%hi, %wi, %as0] : memref<?x?x?xf32>
+          }
+          %base1 = arith.muli %qt1, %c132 : index
+          %at1 = arith.addi %base1, %l4 : index
+          vector.store %st#5, %part[%hi, %wi, %at1] : memref<?x?x?xf32>, vector<4xf32>
+          %am1 = arith.addi %base1, %c128 : index
+          %as1 = arith.addi %base1, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#3, %part[%hi, %wi, %am1] : memref<?x?x?xf32>
+            memref.store %st#4, %part[%hi, %wi, %as1] : memref<?x?x?xf32>
+          }
+          macro.yield %h : i32
+        };
+      }
+    }
+  }
+  return;
+}
+
+/// `vec_attention_parts` for 3 queries in a row: query t is at position pos + t, in q[t0 + t], and its part
+/// w goes to part[h][w][132 (t0 + t) ..].
+fn round_attention_parts_3(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, pos : i32, t0 : i32, q_heads : i32, group : i32, nwg : i32, scale : f32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..q_heads across blocks {
+      for w in 0..nwg across blocks {
+        let g = h / group;
+        let _d = mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %t0 = t0 : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
+          %c0 = arith.constant 0 : index
+          %c1 = arith.constant 1 : index
+          %c4 = arith.constant 4 : index
+          %c32 = arith.constant 32 : index
+          %c128 = arith.constant 128 : index
+          %c129 = arith.constant 129 : index
+          %c132 = arith.constant 132 : index
+          %c32i = arith.constant 32 : i32
+          %neg = arith.constant -3.0e38 : f32
+          %zero = arith.constant 0.0 : f32
+          %vz4 = arith.constant dense<0.0> : vector<4xf32>
+          %l = gpu.thread_id x
+          %l4 = arith.muli %l, %c4 : index
+          %hi = arith.index_cast %h : i32 to index
+          %wi = arith.index_cast %w : i32 to index
+          %gi = arith.index_cast %g : i32 to index
+          %posi = arith.index_cast %pos : i32 to index
+          %nwgi = arith.index_cast %nwg : i32 to index
+          %t0i = arith.index_cast %t0 : i32 to index
+          %g128 = arith.muli %gi, %c128 : index
+          %kd = arith.addi %g128, %l4 : index
+          %P = memref.dim %k3, %c0 : memref<?x?x?xf16>
+          %KH = memref.dim %k3, %c1 : memref<?x?x?xf16>
+          %Wd = arith.muli %KH, %c128 : index
+          %k = memref.reinterpret_cast %k3 to offset: [0], sizes: [%P, %Wd], strides: [%Wd, 1] : memref<?x?x?xf16> to memref<?x?xf16, strided<[?, 1]>>
+          %v = memref.reinterpret_cast %v3 to offset: [0], sizes: [%P, %Wd], strides: [%Wd, 1] : memref<?x?x?xf16> to memref<?x?xf16, strided<[?, 1]>>
+          %scv = vector.broadcast %scale : f32 to vector<4xf32>
+          %ct0 = arith.constant 0 : index
+          %pos0 = arith.addi %posi, %ct0 : index
+          %n0 = arith.addi %pos0, %c32 : index
+          %chunks0 = arith.divui %n0, %c32 : index
+          %qt0 = arith.addi %t0i, %ct0 : index
+          %qv0 = vector.load %q[%qt0, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs0 = arith.mulf %qv0, %scv : vector<4xf32>
+          %ct1 = arith.constant 1 : index
+          %pos1 = arith.addi %posi, %ct1 : index
+          %n1 = arith.addi %pos1, %c32 : index
+          %chunks1 = arith.divui %n1, %c32 : index
+          %qt1 = arith.addi %t0i, %ct1 : index
+          %qv1 = vector.load %q[%qt1, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs1 = arith.mulf %qv1, %scv : vector<4xf32>
+          %ct2 = arith.constant 2 : index
+          %pos2 = arith.addi %posi, %ct2 : index
+          %n2 = arith.addi %pos2, %c32 : index
+          %chunks2 = arith.divui %n2, %c32 : index
+          %qt2 = arith.addi %t0i, %ct2 : index
+          %qv2 = vector.load %q[%qt2, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs2 = arith.mulf %qv2, %scv : vector<4xf32>
+          %st:9 = scf.for %ic = %wi to %chunks2 step %nwgi iter_args(%M0 = %neg, %S0 = %zero, %o0 = %vz4, %M1 = %neg, %S1 = %zero, %o1 = %vz4, %M2 = %neg, %S2 = %zero, %o2 = %vz4) -> (f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>) {
+            %r0 = arith.muli %ic, %c32 : index
+            %my:3 = scf.for %cc = %c0 to %c32 step %c1 iter_args(%m0 = %neg, %m1 = %neg, %m2 = %neg) -> (f32, f32, f32) {
+              %row = arith.addi %r0, %cc : index
+              %rowc = arith.minui %row, %pos2 : index
+              %kh = vector.load %k[%rowc, %kd] {alignment = 8} : memref<?x?xf16, strided<[?, 1]>>, vector<4xf16>
+              %kf = arith.extf %kh : vector<4xf16> to vector<4xf32>
+              %mine = arith.cmpi eq, %cc, %l : index
+              %pr0 = arith.mulf %kf, %qs0 : vector<4xf32>
+              %pl0 = vector.reduction <add>, %pr0 : vector<4xf32> into f32
+              %sc0 = gpu.subgroup_reduce add %pl0 : (f32) -> f32
+              %live0 = arith.cmpi ule, %row, %pos0 : index
+              %scm0 = arith.select %live0, %sc0, %neg : f32
+              %mm0 = arith.select %mine, %scm0, %m0 : f32
+              %pr1 = arith.mulf %kf, %qs1 : vector<4xf32>
+              %pl1 = vector.reduction <add>, %pr1 : vector<4xf32> into f32
+              %sc1 = gpu.subgroup_reduce add %pl1 : (f32) -> f32
+              %live1 = arith.cmpi ule, %row, %pos1 : index
+              %scm1 = arith.select %live1, %sc1, %neg : f32
+              %mm1 = arith.select %mine, %scm1, %m1 : f32
+              %pr2 = arith.mulf %kf, %qs2 : vector<4xf32>
+              %pl2 = vector.reduction <add>, %pr2 : vector<4xf32> into f32
+              %sc2 = gpu.subgroup_reduce add %pl2 : (f32) -> f32
+              %live2 = arith.cmpi ule, %row, %pos2 : index
+              %scm2 = arith.select %live2, %sc2, %neg : f32
+              %mm2 = arith.select %mine, %scm2, %m2 : f32
+              scf.yield %mm0, %mm1, %mm2 : f32, f32, f32
+            }
+            %act0 = arith.cmpi ult, %ic, %chunks0 : index
+            %u0:4 = scf.if %act0 -> (f32, f32, vector<4xf32>, f32) {
+              %bm0 = gpu.subgroup_reduce maxnumf %my#0 : (f32) -> f32
+              %Mn0 = arith.maxnumf %M0, %bm0 : f32
+              %dm0 = arith.subf %M0, %Mn0 : f32
+              %ms0 = math.exp %dm0 : f32
+              %dp0 = arith.subf %my#0, %Mn0 : f32
+              %p0 = math.exp %dp0 : f32
+              %bs0 = gpu.subgroup_reduce add %p0 : (f32) -> f32
+              %Ss0 = arith.mulf %S0, %ms0 : f32
+              %Sn0 = arith.addf %Ss0, %bs0 : f32
+              %msv0 = vector.broadcast %ms0 : f32 to vector<4xf32>
+              %ox0 = arith.mulf %o0, %msv0 : vector<4xf32>
+              scf.yield %Mn0, %Sn0, %ox0, %p0 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M0, %S0, %o0, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act1 = arith.cmpi ult, %ic, %chunks1 : index
+            %u1:4 = scf.if %act1 -> (f32, f32, vector<4xf32>, f32) {
+              %bm1 = gpu.subgroup_reduce maxnumf %my#1 : (f32) -> f32
+              %Mn1 = arith.maxnumf %M1, %bm1 : f32
+              %dm1 = arith.subf %M1, %Mn1 : f32
+              %ms1 = math.exp %dm1 : f32
+              %dp1 = arith.subf %my#1, %Mn1 : f32
+              %p1 = math.exp %dp1 : f32
+              %bs1 = gpu.subgroup_reduce add %p1 : (f32) -> f32
+              %Ss1 = arith.mulf %S1, %ms1 : f32
+              %Sn1 = arith.addf %Ss1, %bs1 : f32
+              %msv1 = vector.broadcast %ms1 : f32 to vector<4xf32>
+              %ox1 = arith.mulf %o1, %msv1 : vector<4xf32>
+              scf.yield %Mn1, %Sn1, %ox1, %p1 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M1, %S1, %o1, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act2 = arith.cmpi ult, %ic, %chunks2 : index
+            %u2:4 = scf.if %act2 -> (f32, f32, vector<4xf32>, f32) {
+              %bm2 = gpu.subgroup_reduce maxnumf %my#2 : (f32) -> f32
+              %Mn2 = arith.maxnumf %M2, %bm2 : f32
+              %dm2 = arith.subf %M2, %Mn2 : f32
+              %ms2 = math.exp %dm2 : f32
+              %dp2 = arith.subf %my#2, %Mn2 : f32
+              %p2 = math.exp %dp2 : f32
+              %bs2 = gpu.subgroup_reduce add %p2 : (f32) -> f32
+              %Ss2 = arith.mulf %S2, %ms2 : f32
+              %Sn2 = arith.addf %Ss2, %bs2 : f32
+              %msv2 = vector.broadcast %ms2 : f32 to vector<4xf32>
+              %ox2 = arith.mulf %o2, %msv2 : vector<4xf32>
+              scf.yield %Mn2, %Sn2, %ox2, %p2 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M2, %S2, %o2, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %ov:3 = scf.for %cc = %c0 to %c32 step %c1 iter_args(%oa0 = %u0#2, %oa1 = %u1#2, %oa2 = %u2#2) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>) {
+              %row = arith.addi %r0, %cc : index
+              %rowc = arith.minui %row, %pos2 : index
+              %vh = vector.load %v[%rowc, %kd] {alignment = 8} : memref<?x?xf16, strided<[?, 1]>>, vector<4xf16>
+              %vf = arith.extf %vh : vector<4xf16> to vector<4xf32>
+              %cci = arith.index_cast %cc : index to i32
+              %pc0, %pv0 = gpu.shuffle idx %u0#3, %cci, %c32i : f32
+              %pcv0 = vector.broadcast %pc0 : f32 to vector<4xf32>
+              %on0 = vector.fma %vf, %pcv0, %oa0 : vector<4xf32>
+              %pc1, %pv1 = gpu.shuffle idx %u1#3, %cci, %c32i : f32
+              %pcv1 = vector.broadcast %pc1 : f32 to vector<4xf32>
+              %on1 = vector.fma %vf, %pcv1, %oa1 : vector<4xf32>
+              %pc2, %pv2 = gpu.shuffle idx %u2#3, %cci, %c32i : f32
+              %pcv2 = vector.broadcast %pc2 : f32 to vector<4xf32>
+              %on2 = vector.fma %vf, %pcv2, %oa2 : vector<4xf32>
+              scf.yield %on0, %on1, %on2 : vector<4xf32>, vector<4xf32>, vector<4xf32>
+            }
+            scf.yield %u0#0, %u0#1, %ov#0, %u1#0, %u1#1, %ov#1, %u2#0, %u2#1, %ov#2 : f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>
+          }
+          %lane0 = arith.cmpi eq, %l, %c0 : index
+          %base0 = arith.muli %qt0, %c132 : index
+          %at0 = arith.addi %base0, %l4 : index
+          vector.store %st#2, %part[%hi, %wi, %at0] : memref<?x?x?xf32>, vector<4xf32>
+          %am0 = arith.addi %base0, %c128 : index
+          %as0 = arith.addi %base0, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#0, %part[%hi, %wi, %am0] : memref<?x?x?xf32>
+            memref.store %st#1, %part[%hi, %wi, %as0] : memref<?x?x?xf32>
+          }
+          %base1 = arith.muli %qt1, %c132 : index
+          %at1 = arith.addi %base1, %l4 : index
+          vector.store %st#5, %part[%hi, %wi, %at1] : memref<?x?x?xf32>, vector<4xf32>
+          %am1 = arith.addi %base1, %c128 : index
+          %as1 = arith.addi %base1, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#3, %part[%hi, %wi, %am1] : memref<?x?x?xf32>
+            memref.store %st#4, %part[%hi, %wi, %as1] : memref<?x?x?xf32>
+          }
+          %base2 = arith.muli %qt2, %c132 : index
+          %at2 = arith.addi %base2, %l4 : index
+          vector.store %st#8, %part[%hi, %wi, %at2] : memref<?x?x?xf32>, vector<4xf32>
+          %am2 = arith.addi %base2, %c128 : index
+          %as2 = arith.addi %base2, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#6, %part[%hi, %wi, %am2] : memref<?x?x?xf32>
+            memref.store %st#7, %part[%hi, %wi, %as2] : memref<?x?x?xf32>
+          }
+          macro.yield %h : i32
+        };
+      }
+    }
+  }
+  return;
+}
+
+/// `vec_attention_parts` for 4 queries in a row: query t is at position pos + t, in q[t0 + t], and its part
+/// w goes to part[h][w][132 (t0 + t) ..].
+fn round_attention_parts_4(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, pos : i32, t0 : i32, q_heads : i32, group : i32, nwg : i32, scale : f32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..q_heads across blocks {
+      for w in 0..nwg across blocks {
+        let g = h / group;
+        let _d = mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %t0 = t0 : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
+          %c0 = arith.constant 0 : index
+          %c1 = arith.constant 1 : index
+          %c4 = arith.constant 4 : index
+          %c32 = arith.constant 32 : index
+          %c128 = arith.constant 128 : index
+          %c129 = arith.constant 129 : index
+          %c132 = arith.constant 132 : index
+          %c32i = arith.constant 32 : i32
+          %neg = arith.constant -3.0e38 : f32
+          %zero = arith.constant 0.0 : f32
+          %vz4 = arith.constant dense<0.0> : vector<4xf32>
+          %l = gpu.thread_id x
+          %l4 = arith.muli %l, %c4 : index
+          %hi = arith.index_cast %h : i32 to index
+          %wi = arith.index_cast %w : i32 to index
+          %gi = arith.index_cast %g : i32 to index
+          %posi = arith.index_cast %pos : i32 to index
+          %nwgi = arith.index_cast %nwg : i32 to index
+          %t0i = arith.index_cast %t0 : i32 to index
+          %g128 = arith.muli %gi, %c128 : index
+          %kd = arith.addi %g128, %l4 : index
+          %P = memref.dim %k3, %c0 : memref<?x?x?xf16>
+          %KH = memref.dim %k3, %c1 : memref<?x?x?xf16>
+          %Wd = arith.muli %KH, %c128 : index
+          %k = memref.reinterpret_cast %k3 to offset: [0], sizes: [%P, %Wd], strides: [%Wd, 1] : memref<?x?x?xf16> to memref<?x?xf16, strided<[?, 1]>>
+          %v = memref.reinterpret_cast %v3 to offset: [0], sizes: [%P, %Wd], strides: [%Wd, 1] : memref<?x?x?xf16> to memref<?x?xf16, strided<[?, 1]>>
+          %scv = vector.broadcast %scale : f32 to vector<4xf32>
+          %ct0 = arith.constant 0 : index
+          %pos0 = arith.addi %posi, %ct0 : index
+          %n0 = arith.addi %pos0, %c32 : index
+          %chunks0 = arith.divui %n0, %c32 : index
+          %qt0 = arith.addi %t0i, %ct0 : index
+          %qv0 = vector.load %q[%qt0, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs0 = arith.mulf %qv0, %scv : vector<4xf32>
+          %ct1 = arith.constant 1 : index
+          %pos1 = arith.addi %posi, %ct1 : index
+          %n1 = arith.addi %pos1, %c32 : index
+          %chunks1 = arith.divui %n1, %c32 : index
+          %qt1 = arith.addi %t0i, %ct1 : index
+          %qv1 = vector.load %q[%qt1, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs1 = arith.mulf %qv1, %scv : vector<4xf32>
+          %ct2 = arith.constant 2 : index
+          %pos2 = arith.addi %posi, %ct2 : index
+          %n2 = arith.addi %pos2, %c32 : index
+          %chunks2 = arith.divui %n2, %c32 : index
+          %qt2 = arith.addi %t0i, %ct2 : index
+          %qv2 = vector.load %q[%qt2, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs2 = arith.mulf %qv2, %scv : vector<4xf32>
+          %ct3 = arith.constant 3 : index
+          %pos3 = arith.addi %posi, %ct3 : index
+          %n3 = arith.addi %pos3, %c32 : index
+          %chunks3 = arith.divui %n3, %c32 : index
+          %qt3 = arith.addi %t0i, %ct3 : index
+          %qv3 = vector.load %q[%qt3, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs3 = arith.mulf %qv3, %scv : vector<4xf32>
+          %st:12 = scf.for %ic = %wi to %chunks3 step %nwgi iter_args(%M0 = %neg, %S0 = %zero, %o0 = %vz4, %M1 = %neg, %S1 = %zero, %o1 = %vz4, %M2 = %neg, %S2 = %zero, %o2 = %vz4, %M3 = %neg, %S3 = %zero, %o3 = %vz4) -> (f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>) {
+            %r0 = arith.muli %ic, %c32 : index
+            %my:4 = scf.for %cc = %c0 to %c32 step %c1 iter_args(%m0 = %neg, %m1 = %neg, %m2 = %neg, %m3 = %neg) -> (f32, f32, f32, f32) {
+              %row = arith.addi %r0, %cc : index
+              %rowc = arith.minui %row, %pos3 : index
+              %kh = vector.load %k[%rowc, %kd] {alignment = 8} : memref<?x?xf16, strided<[?, 1]>>, vector<4xf16>
+              %kf = arith.extf %kh : vector<4xf16> to vector<4xf32>
+              %mine = arith.cmpi eq, %cc, %l : index
+              %pr0 = arith.mulf %kf, %qs0 : vector<4xf32>
+              %pl0 = vector.reduction <add>, %pr0 : vector<4xf32> into f32
+              %sc0 = gpu.subgroup_reduce add %pl0 : (f32) -> f32
+              %live0 = arith.cmpi ule, %row, %pos0 : index
+              %scm0 = arith.select %live0, %sc0, %neg : f32
+              %mm0 = arith.select %mine, %scm0, %m0 : f32
+              %pr1 = arith.mulf %kf, %qs1 : vector<4xf32>
+              %pl1 = vector.reduction <add>, %pr1 : vector<4xf32> into f32
+              %sc1 = gpu.subgroup_reduce add %pl1 : (f32) -> f32
+              %live1 = arith.cmpi ule, %row, %pos1 : index
+              %scm1 = arith.select %live1, %sc1, %neg : f32
+              %mm1 = arith.select %mine, %scm1, %m1 : f32
+              %pr2 = arith.mulf %kf, %qs2 : vector<4xf32>
+              %pl2 = vector.reduction <add>, %pr2 : vector<4xf32> into f32
+              %sc2 = gpu.subgroup_reduce add %pl2 : (f32) -> f32
+              %live2 = arith.cmpi ule, %row, %pos2 : index
+              %scm2 = arith.select %live2, %sc2, %neg : f32
+              %mm2 = arith.select %mine, %scm2, %m2 : f32
+              %pr3 = arith.mulf %kf, %qs3 : vector<4xf32>
+              %pl3 = vector.reduction <add>, %pr3 : vector<4xf32> into f32
+              %sc3 = gpu.subgroup_reduce add %pl3 : (f32) -> f32
+              %live3 = arith.cmpi ule, %row, %pos3 : index
+              %scm3 = arith.select %live3, %sc3, %neg : f32
+              %mm3 = arith.select %mine, %scm3, %m3 : f32
+              scf.yield %mm0, %mm1, %mm2, %mm3 : f32, f32, f32, f32
+            }
+            %act0 = arith.cmpi ult, %ic, %chunks0 : index
+            %u0:4 = scf.if %act0 -> (f32, f32, vector<4xf32>, f32) {
+              %bm0 = gpu.subgroup_reduce maxnumf %my#0 : (f32) -> f32
+              %Mn0 = arith.maxnumf %M0, %bm0 : f32
+              %dm0 = arith.subf %M0, %Mn0 : f32
+              %ms0 = math.exp %dm0 : f32
+              %dp0 = arith.subf %my#0, %Mn0 : f32
+              %p0 = math.exp %dp0 : f32
+              %bs0 = gpu.subgroup_reduce add %p0 : (f32) -> f32
+              %Ss0 = arith.mulf %S0, %ms0 : f32
+              %Sn0 = arith.addf %Ss0, %bs0 : f32
+              %msv0 = vector.broadcast %ms0 : f32 to vector<4xf32>
+              %ox0 = arith.mulf %o0, %msv0 : vector<4xf32>
+              scf.yield %Mn0, %Sn0, %ox0, %p0 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M0, %S0, %o0, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act1 = arith.cmpi ult, %ic, %chunks1 : index
+            %u1:4 = scf.if %act1 -> (f32, f32, vector<4xf32>, f32) {
+              %bm1 = gpu.subgroup_reduce maxnumf %my#1 : (f32) -> f32
+              %Mn1 = arith.maxnumf %M1, %bm1 : f32
+              %dm1 = arith.subf %M1, %Mn1 : f32
+              %ms1 = math.exp %dm1 : f32
+              %dp1 = arith.subf %my#1, %Mn1 : f32
+              %p1 = math.exp %dp1 : f32
+              %bs1 = gpu.subgroup_reduce add %p1 : (f32) -> f32
+              %Ss1 = arith.mulf %S1, %ms1 : f32
+              %Sn1 = arith.addf %Ss1, %bs1 : f32
+              %msv1 = vector.broadcast %ms1 : f32 to vector<4xf32>
+              %ox1 = arith.mulf %o1, %msv1 : vector<4xf32>
+              scf.yield %Mn1, %Sn1, %ox1, %p1 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M1, %S1, %o1, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act2 = arith.cmpi ult, %ic, %chunks2 : index
+            %u2:4 = scf.if %act2 -> (f32, f32, vector<4xf32>, f32) {
+              %bm2 = gpu.subgroup_reduce maxnumf %my#2 : (f32) -> f32
+              %Mn2 = arith.maxnumf %M2, %bm2 : f32
+              %dm2 = arith.subf %M2, %Mn2 : f32
+              %ms2 = math.exp %dm2 : f32
+              %dp2 = arith.subf %my#2, %Mn2 : f32
+              %p2 = math.exp %dp2 : f32
+              %bs2 = gpu.subgroup_reduce add %p2 : (f32) -> f32
+              %Ss2 = arith.mulf %S2, %ms2 : f32
+              %Sn2 = arith.addf %Ss2, %bs2 : f32
+              %msv2 = vector.broadcast %ms2 : f32 to vector<4xf32>
+              %ox2 = arith.mulf %o2, %msv2 : vector<4xf32>
+              scf.yield %Mn2, %Sn2, %ox2, %p2 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M2, %S2, %o2, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act3 = arith.cmpi ult, %ic, %chunks3 : index
+            %u3:4 = scf.if %act3 -> (f32, f32, vector<4xf32>, f32) {
+              %bm3 = gpu.subgroup_reduce maxnumf %my#3 : (f32) -> f32
+              %Mn3 = arith.maxnumf %M3, %bm3 : f32
+              %dm3 = arith.subf %M3, %Mn3 : f32
+              %ms3 = math.exp %dm3 : f32
+              %dp3 = arith.subf %my#3, %Mn3 : f32
+              %p3 = math.exp %dp3 : f32
+              %bs3 = gpu.subgroup_reduce add %p3 : (f32) -> f32
+              %Ss3 = arith.mulf %S3, %ms3 : f32
+              %Sn3 = arith.addf %Ss3, %bs3 : f32
+              %msv3 = vector.broadcast %ms3 : f32 to vector<4xf32>
+              %ox3 = arith.mulf %o3, %msv3 : vector<4xf32>
+              scf.yield %Mn3, %Sn3, %ox3, %p3 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M3, %S3, %o3, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %ov:4 = scf.for %cc = %c0 to %c32 step %c1 iter_args(%oa0 = %u0#2, %oa1 = %u1#2, %oa2 = %u2#2, %oa3 = %u3#2) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>) {
+              %row = arith.addi %r0, %cc : index
+              %rowc = arith.minui %row, %pos3 : index
+              %vh = vector.load %v[%rowc, %kd] {alignment = 8} : memref<?x?xf16, strided<[?, 1]>>, vector<4xf16>
+              %vf = arith.extf %vh : vector<4xf16> to vector<4xf32>
+              %cci = arith.index_cast %cc : index to i32
+              %pc0, %pv0 = gpu.shuffle idx %u0#3, %cci, %c32i : f32
+              %pcv0 = vector.broadcast %pc0 : f32 to vector<4xf32>
+              %on0 = vector.fma %vf, %pcv0, %oa0 : vector<4xf32>
+              %pc1, %pv1 = gpu.shuffle idx %u1#3, %cci, %c32i : f32
+              %pcv1 = vector.broadcast %pc1 : f32 to vector<4xf32>
+              %on1 = vector.fma %vf, %pcv1, %oa1 : vector<4xf32>
+              %pc2, %pv2 = gpu.shuffle idx %u2#3, %cci, %c32i : f32
+              %pcv2 = vector.broadcast %pc2 : f32 to vector<4xf32>
+              %on2 = vector.fma %vf, %pcv2, %oa2 : vector<4xf32>
+              %pc3, %pv3 = gpu.shuffle idx %u3#3, %cci, %c32i : f32
+              %pcv3 = vector.broadcast %pc3 : f32 to vector<4xf32>
+              %on3 = vector.fma %vf, %pcv3, %oa3 : vector<4xf32>
+              scf.yield %on0, %on1, %on2, %on3 : vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>
+            }
+            scf.yield %u0#0, %u0#1, %ov#0, %u1#0, %u1#1, %ov#1, %u2#0, %u2#1, %ov#2, %u3#0, %u3#1, %ov#3 : f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>
+          }
+          %lane0 = arith.cmpi eq, %l, %c0 : index
+          %base0 = arith.muli %qt0, %c132 : index
+          %at0 = arith.addi %base0, %l4 : index
+          vector.store %st#2, %part[%hi, %wi, %at0] : memref<?x?x?xf32>, vector<4xf32>
+          %am0 = arith.addi %base0, %c128 : index
+          %as0 = arith.addi %base0, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#0, %part[%hi, %wi, %am0] : memref<?x?x?xf32>
+            memref.store %st#1, %part[%hi, %wi, %as0] : memref<?x?x?xf32>
+          }
+          %base1 = arith.muli %qt1, %c132 : index
+          %at1 = arith.addi %base1, %l4 : index
+          vector.store %st#5, %part[%hi, %wi, %at1] : memref<?x?x?xf32>, vector<4xf32>
+          %am1 = arith.addi %base1, %c128 : index
+          %as1 = arith.addi %base1, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#3, %part[%hi, %wi, %am1] : memref<?x?x?xf32>
+            memref.store %st#4, %part[%hi, %wi, %as1] : memref<?x?x?xf32>
+          }
+          %base2 = arith.muli %qt2, %c132 : index
+          %at2 = arith.addi %base2, %l4 : index
+          vector.store %st#8, %part[%hi, %wi, %at2] : memref<?x?x?xf32>, vector<4xf32>
+          %am2 = arith.addi %base2, %c128 : index
+          %as2 = arith.addi %base2, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#6, %part[%hi, %wi, %am2] : memref<?x?x?xf32>
+            memref.store %st#7, %part[%hi, %wi, %as2] : memref<?x?x?xf32>
+          }
+          %base3 = arith.muli %qt3, %c132 : index
+          %at3 = arith.addi %base3, %l4 : index
+          vector.store %st#11, %part[%hi, %wi, %at3] : memref<?x?x?xf32>, vector<4xf32>
+          %am3 = arith.addi %base3, %c128 : index
+          %as3 = arith.addi %base3, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#9, %part[%hi, %wi, %am3] : memref<?x?x?xf32>
+            memref.store %st#10, %part[%hi, %wi, %as3] : memref<?x?x?xf32>
+          }
+          macro.yield %h : i32
+        };
+      }
+    }
+  }
+  return;
+}
+
+/// `vec_attention_parts` for 5 queries in a row: query t is at position pos + t, in q[t0 + t], and its part
+/// w goes to part[h][w][132 (t0 + t) ..].
+fn round_attention_parts_5(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, pos : i32, t0 : i32, q_heads : i32, group : i32, nwg : i32, scale : f32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..q_heads across blocks {
+      for w in 0..nwg across blocks {
+        let g = h / group;
+        let _d = mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %t0 = t0 : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
+          %c0 = arith.constant 0 : index
+          %c1 = arith.constant 1 : index
+          %c4 = arith.constant 4 : index
+          %c32 = arith.constant 32 : index
+          %c128 = arith.constant 128 : index
+          %c129 = arith.constant 129 : index
+          %c132 = arith.constant 132 : index
+          %c32i = arith.constant 32 : i32
+          %neg = arith.constant -3.0e38 : f32
+          %zero = arith.constant 0.0 : f32
+          %vz4 = arith.constant dense<0.0> : vector<4xf32>
+          %l = gpu.thread_id x
+          %l4 = arith.muli %l, %c4 : index
+          %hi = arith.index_cast %h : i32 to index
+          %wi = arith.index_cast %w : i32 to index
+          %gi = arith.index_cast %g : i32 to index
+          %posi = arith.index_cast %pos : i32 to index
+          %nwgi = arith.index_cast %nwg : i32 to index
+          %t0i = arith.index_cast %t0 : i32 to index
+          %g128 = arith.muli %gi, %c128 : index
+          %kd = arith.addi %g128, %l4 : index
+          %P = memref.dim %k3, %c0 : memref<?x?x?xf16>
+          %KH = memref.dim %k3, %c1 : memref<?x?x?xf16>
+          %Wd = arith.muli %KH, %c128 : index
+          %k = memref.reinterpret_cast %k3 to offset: [0], sizes: [%P, %Wd], strides: [%Wd, 1] : memref<?x?x?xf16> to memref<?x?xf16, strided<[?, 1]>>
+          %v = memref.reinterpret_cast %v3 to offset: [0], sizes: [%P, %Wd], strides: [%Wd, 1] : memref<?x?x?xf16> to memref<?x?xf16, strided<[?, 1]>>
+          %scv = vector.broadcast %scale : f32 to vector<4xf32>
+          %ct0 = arith.constant 0 : index
+          %pos0 = arith.addi %posi, %ct0 : index
+          %n0 = arith.addi %pos0, %c32 : index
+          %chunks0 = arith.divui %n0, %c32 : index
+          %qt0 = arith.addi %t0i, %ct0 : index
+          %qv0 = vector.load %q[%qt0, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs0 = arith.mulf %qv0, %scv : vector<4xf32>
+          %ct1 = arith.constant 1 : index
+          %pos1 = arith.addi %posi, %ct1 : index
+          %n1 = arith.addi %pos1, %c32 : index
+          %chunks1 = arith.divui %n1, %c32 : index
+          %qt1 = arith.addi %t0i, %ct1 : index
+          %qv1 = vector.load %q[%qt1, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs1 = arith.mulf %qv1, %scv : vector<4xf32>
+          %ct2 = arith.constant 2 : index
+          %pos2 = arith.addi %posi, %ct2 : index
+          %n2 = arith.addi %pos2, %c32 : index
+          %chunks2 = arith.divui %n2, %c32 : index
+          %qt2 = arith.addi %t0i, %ct2 : index
+          %qv2 = vector.load %q[%qt2, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs2 = arith.mulf %qv2, %scv : vector<4xf32>
+          %ct3 = arith.constant 3 : index
+          %pos3 = arith.addi %posi, %ct3 : index
+          %n3 = arith.addi %pos3, %c32 : index
+          %chunks3 = arith.divui %n3, %c32 : index
+          %qt3 = arith.addi %t0i, %ct3 : index
+          %qv3 = vector.load %q[%qt3, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs3 = arith.mulf %qv3, %scv : vector<4xf32>
+          %ct4 = arith.constant 4 : index
+          %pos4 = arith.addi %posi, %ct4 : index
+          %n4 = arith.addi %pos4, %c32 : index
+          %chunks4 = arith.divui %n4, %c32 : index
+          %qt4 = arith.addi %t0i, %ct4 : index
+          %qv4 = vector.load %q[%qt4, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs4 = arith.mulf %qv4, %scv : vector<4xf32>
+          %st:15 = scf.for %ic = %wi to %chunks4 step %nwgi iter_args(%M0 = %neg, %S0 = %zero, %o0 = %vz4, %M1 = %neg, %S1 = %zero, %o1 = %vz4, %M2 = %neg, %S2 = %zero, %o2 = %vz4, %M3 = %neg, %S3 = %zero, %o3 = %vz4, %M4 = %neg, %S4 = %zero, %o4 = %vz4) -> (f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>) {
+            %r0 = arith.muli %ic, %c32 : index
+            %my:5 = scf.for %cc = %c0 to %c32 step %c1 iter_args(%m0 = %neg, %m1 = %neg, %m2 = %neg, %m3 = %neg, %m4 = %neg) -> (f32, f32, f32, f32, f32) {
+              %row = arith.addi %r0, %cc : index
+              %rowc = arith.minui %row, %pos4 : index
+              %kh = vector.load %k[%rowc, %kd] {alignment = 8} : memref<?x?xf16, strided<[?, 1]>>, vector<4xf16>
+              %kf = arith.extf %kh : vector<4xf16> to vector<4xf32>
+              %mine = arith.cmpi eq, %cc, %l : index
+              %pr0 = arith.mulf %kf, %qs0 : vector<4xf32>
+              %pl0 = vector.reduction <add>, %pr0 : vector<4xf32> into f32
+              %sc0 = gpu.subgroup_reduce add %pl0 : (f32) -> f32
+              %live0 = arith.cmpi ule, %row, %pos0 : index
+              %scm0 = arith.select %live0, %sc0, %neg : f32
+              %mm0 = arith.select %mine, %scm0, %m0 : f32
+              %pr1 = arith.mulf %kf, %qs1 : vector<4xf32>
+              %pl1 = vector.reduction <add>, %pr1 : vector<4xf32> into f32
+              %sc1 = gpu.subgroup_reduce add %pl1 : (f32) -> f32
+              %live1 = arith.cmpi ule, %row, %pos1 : index
+              %scm1 = arith.select %live1, %sc1, %neg : f32
+              %mm1 = arith.select %mine, %scm1, %m1 : f32
+              %pr2 = arith.mulf %kf, %qs2 : vector<4xf32>
+              %pl2 = vector.reduction <add>, %pr2 : vector<4xf32> into f32
+              %sc2 = gpu.subgroup_reduce add %pl2 : (f32) -> f32
+              %live2 = arith.cmpi ule, %row, %pos2 : index
+              %scm2 = arith.select %live2, %sc2, %neg : f32
+              %mm2 = arith.select %mine, %scm2, %m2 : f32
+              %pr3 = arith.mulf %kf, %qs3 : vector<4xf32>
+              %pl3 = vector.reduction <add>, %pr3 : vector<4xf32> into f32
+              %sc3 = gpu.subgroup_reduce add %pl3 : (f32) -> f32
+              %live3 = arith.cmpi ule, %row, %pos3 : index
+              %scm3 = arith.select %live3, %sc3, %neg : f32
+              %mm3 = arith.select %mine, %scm3, %m3 : f32
+              %pr4 = arith.mulf %kf, %qs4 : vector<4xf32>
+              %pl4 = vector.reduction <add>, %pr4 : vector<4xf32> into f32
+              %sc4 = gpu.subgroup_reduce add %pl4 : (f32) -> f32
+              %live4 = arith.cmpi ule, %row, %pos4 : index
+              %scm4 = arith.select %live4, %sc4, %neg : f32
+              %mm4 = arith.select %mine, %scm4, %m4 : f32
+              scf.yield %mm0, %mm1, %mm2, %mm3, %mm4 : f32, f32, f32, f32, f32
+            }
+            %act0 = arith.cmpi ult, %ic, %chunks0 : index
+            %u0:4 = scf.if %act0 -> (f32, f32, vector<4xf32>, f32) {
+              %bm0 = gpu.subgroup_reduce maxnumf %my#0 : (f32) -> f32
+              %Mn0 = arith.maxnumf %M0, %bm0 : f32
+              %dm0 = arith.subf %M0, %Mn0 : f32
+              %ms0 = math.exp %dm0 : f32
+              %dp0 = arith.subf %my#0, %Mn0 : f32
+              %p0 = math.exp %dp0 : f32
+              %bs0 = gpu.subgroup_reduce add %p0 : (f32) -> f32
+              %Ss0 = arith.mulf %S0, %ms0 : f32
+              %Sn0 = arith.addf %Ss0, %bs0 : f32
+              %msv0 = vector.broadcast %ms0 : f32 to vector<4xf32>
+              %ox0 = arith.mulf %o0, %msv0 : vector<4xf32>
+              scf.yield %Mn0, %Sn0, %ox0, %p0 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M0, %S0, %o0, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act1 = arith.cmpi ult, %ic, %chunks1 : index
+            %u1:4 = scf.if %act1 -> (f32, f32, vector<4xf32>, f32) {
+              %bm1 = gpu.subgroup_reduce maxnumf %my#1 : (f32) -> f32
+              %Mn1 = arith.maxnumf %M1, %bm1 : f32
+              %dm1 = arith.subf %M1, %Mn1 : f32
+              %ms1 = math.exp %dm1 : f32
+              %dp1 = arith.subf %my#1, %Mn1 : f32
+              %p1 = math.exp %dp1 : f32
+              %bs1 = gpu.subgroup_reduce add %p1 : (f32) -> f32
+              %Ss1 = arith.mulf %S1, %ms1 : f32
+              %Sn1 = arith.addf %Ss1, %bs1 : f32
+              %msv1 = vector.broadcast %ms1 : f32 to vector<4xf32>
+              %ox1 = arith.mulf %o1, %msv1 : vector<4xf32>
+              scf.yield %Mn1, %Sn1, %ox1, %p1 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M1, %S1, %o1, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act2 = arith.cmpi ult, %ic, %chunks2 : index
+            %u2:4 = scf.if %act2 -> (f32, f32, vector<4xf32>, f32) {
+              %bm2 = gpu.subgroup_reduce maxnumf %my#2 : (f32) -> f32
+              %Mn2 = arith.maxnumf %M2, %bm2 : f32
+              %dm2 = arith.subf %M2, %Mn2 : f32
+              %ms2 = math.exp %dm2 : f32
+              %dp2 = arith.subf %my#2, %Mn2 : f32
+              %p2 = math.exp %dp2 : f32
+              %bs2 = gpu.subgroup_reduce add %p2 : (f32) -> f32
+              %Ss2 = arith.mulf %S2, %ms2 : f32
+              %Sn2 = arith.addf %Ss2, %bs2 : f32
+              %msv2 = vector.broadcast %ms2 : f32 to vector<4xf32>
+              %ox2 = arith.mulf %o2, %msv2 : vector<4xf32>
+              scf.yield %Mn2, %Sn2, %ox2, %p2 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M2, %S2, %o2, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act3 = arith.cmpi ult, %ic, %chunks3 : index
+            %u3:4 = scf.if %act3 -> (f32, f32, vector<4xf32>, f32) {
+              %bm3 = gpu.subgroup_reduce maxnumf %my#3 : (f32) -> f32
+              %Mn3 = arith.maxnumf %M3, %bm3 : f32
+              %dm3 = arith.subf %M3, %Mn3 : f32
+              %ms3 = math.exp %dm3 : f32
+              %dp3 = arith.subf %my#3, %Mn3 : f32
+              %p3 = math.exp %dp3 : f32
+              %bs3 = gpu.subgroup_reduce add %p3 : (f32) -> f32
+              %Ss3 = arith.mulf %S3, %ms3 : f32
+              %Sn3 = arith.addf %Ss3, %bs3 : f32
+              %msv3 = vector.broadcast %ms3 : f32 to vector<4xf32>
+              %ox3 = arith.mulf %o3, %msv3 : vector<4xf32>
+              scf.yield %Mn3, %Sn3, %ox3, %p3 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M3, %S3, %o3, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act4 = arith.cmpi ult, %ic, %chunks4 : index
+            %u4:4 = scf.if %act4 -> (f32, f32, vector<4xf32>, f32) {
+              %bm4 = gpu.subgroup_reduce maxnumf %my#4 : (f32) -> f32
+              %Mn4 = arith.maxnumf %M4, %bm4 : f32
+              %dm4 = arith.subf %M4, %Mn4 : f32
+              %ms4 = math.exp %dm4 : f32
+              %dp4 = arith.subf %my#4, %Mn4 : f32
+              %p4 = math.exp %dp4 : f32
+              %bs4 = gpu.subgroup_reduce add %p4 : (f32) -> f32
+              %Ss4 = arith.mulf %S4, %ms4 : f32
+              %Sn4 = arith.addf %Ss4, %bs4 : f32
+              %msv4 = vector.broadcast %ms4 : f32 to vector<4xf32>
+              %ox4 = arith.mulf %o4, %msv4 : vector<4xf32>
+              scf.yield %Mn4, %Sn4, %ox4, %p4 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M4, %S4, %o4, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %ov:5 = scf.for %cc = %c0 to %c32 step %c1 iter_args(%oa0 = %u0#2, %oa1 = %u1#2, %oa2 = %u2#2, %oa3 = %u3#2, %oa4 = %u4#2) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>) {
+              %row = arith.addi %r0, %cc : index
+              %rowc = arith.minui %row, %pos4 : index
+              %vh = vector.load %v[%rowc, %kd] {alignment = 8} : memref<?x?xf16, strided<[?, 1]>>, vector<4xf16>
+              %vf = arith.extf %vh : vector<4xf16> to vector<4xf32>
+              %cci = arith.index_cast %cc : index to i32
+              %pc0, %pv0 = gpu.shuffle idx %u0#3, %cci, %c32i : f32
+              %pcv0 = vector.broadcast %pc0 : f32 to vector<4xf32>
+              %on0 = vector.fma %vf, %pcv0, %oa0 : vector<4xf32>
+              %pc1, %pv1 = gpu.shuffle idx %u1#3, %cci, %c32i : f32
+              %pcv1 = vector.broadcast %pc1 : f32 to vector<4xf32>
+              %on1 = vector.fma %vf, %pcv1, %oa1 : vector<4xf32>
+              %pc2, %pv2 = gpu.shuffle idx %u2#3, %cci, %c32i : f32
+              %pcv2 = vector.broadcast %pc2 : f32 to vector<4xf32>
+              %on2 = vector.fma %vf, %pcv2, %oa2 : vector<4xf32>
+              %pc3, %pv3 = gpu.shuffle idx %u3#3, %cci, %c32i : f32
+              %pcv3 = vector.broadcast %pc3 : f32 to vector<4xf32>
+              %on3 = vector.fma %vf, %pcv3, %oa3 : vector<4xf32>
+              %pc4, %pv4 = gpu.shuffle idx %u4#3, %cci, %c32i : f32
+              %pcv4 = vector.broadcast %pc4 : f32 to vector<4xf32>
+              %on4 = vector.fma %vf, %pcv4, %oa4 : vector<4xf32>
+              scf.yield %on0, %on1, %on2, %on3, %on4 : vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>
+            }
+            scf.yield %u0#0, %u0#1, %ov#0, %u1#0, %u1#1, %ov#1, %u2#0, %u2#1, %ov#2, %u3#0, %u3#1, %ov#3, %u4#0, %u4#1, %ov#4 : f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>
+          }
+          %lane0 = arith.cmpi eq, %l, %c0 : index
+          %base0 = arith.muli %qt0, %c132 : index
+          %at0 = arith.addi %base0, %l4 : index
+          vector.store %st#2, %part[%hi, %wi, %at0] : memref<?x?x?xf32>, vector<4xf32>
+          %am0 = arith.addi %base0, %c128 : index
+          %as0 = arith.addi %base0, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#0, %part[%hi, %wi, %am0] : memref<?x?x?xf32>
+            memref.store %st#1, %part[%hi, %wi, %as0] : memref<?x?x?xf32>
+          }
+          %base1 = arith.muli %qt1, %c132 : index
+          %at1 = arith.addi %base1, %l4 : index
+          vector.store %st#5, %part[%hi, %wi, %at1] : memref<?x?x?xf32>, vector<4xf32>
+          %am1 = arith.addi %base1, %c128 : index
+          %as1 = arith.addi %base1, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#3, %part[%hi, %wi, %am1] : memref<?x?x?xf32>
+            memref.store %st#4, %part[%hi, %wi, %as1] : memref<?x?x?xf32>
+          }
+          %base2 = arith.muli %qt2, %c132 : index
+          %at2 = arith.addi %base2, %l4 : index
+          vector.store %st#8, %part[%hi, %wi, %at2] : memref<?x?x?xf32>, vector<4xf32>
+          %am2 = arith.addi %base2, %c128 : index
+          %as2 = arith.addi %base2, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#6, %part[%hi, %wi, %am2] : memref<?x?x?xf32>
+            memref.store %st#7, %part[%hi, %wi, %as2] : memref<?x?x?xf32>
+          }
+          %base3 = arith.muli %qt3, %c132 : index
+          %at3 = arith.addi %base3, %l4 : index
+          vector.store %st#11, %part[%hi, %wi, %at3] : memref<?x?x?xf32>, vector<4xf32>
+          %am3 = arith.addi %base3, %c128 : index
+          %as3 = arith.addi %base3, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#9, %part[%hi, %wi, %am3] : memref<?x?x?xf32>
+            memref.store %st#10, %part[%hi, %wi, %as3] : memref<?x?x?xf32>
+          }
+          %base4 = arith.muli %qt4, %c132 : index
+          %at4 = arith.addi %base4, %l4 : index
+          vector.store %st#14, %part[%hi, %wi, %at4] : memref<?x?x?xf32>, vector<4xf32>
+          %am4 = arith.addi %base4, %c128 : index
+          %as4 = arith.addi %base4, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#12, %part[%hi, %wi, %am4] : memref<?x?x?xf32>
+            memref.store %st#13, %part[%hi, %wi, %as4] : memref<?x?x?xf32>
+          }
+          macro.yield %h : i32
+        };
+      }
+    }
+  }
+  return;
+}
+
+/// `vec_attention_parts` for 6 queries in a row: query t is at position pos + t, in q[t0 + t], and its part
+/// w goes to part[h][w][132 (t0 + t) ..].
+fn round_attention_parts_6(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, pos : i32, t0 : i32, q_heads : i32, group : i32, nwg : i32, scale : f32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..q_heads across blocks {
+      for w in 0..nwg across blocks {
+        let g = h / group;
+        let _d = mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %t0 = t0 : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
+          %c0 = arith.constant 0 : index
+          %c1 = arith.constant 1 : index
+          %c4 = arith.constant 4 : index
+          %c32 = arith.constant 32 : index
+          %c128 = arith.constant 128 : index
+          %c129 = arith.constant 129 : index
+          %c132 = arith.constant 132 : index
+          %c32i = arith.constant 32 : i32
+          %neg = arith.constant -3.0e38 : f32
+          %zero = arith.constant 0.0 : f32
+          %vz4 = arith.constant dense<0.0> : vector<4xf32>
+          %l = gpu.thread_id x
+          %l4 = arith.muli %l, %c4 : index
+          %hi = arith.index_cast %h : i32 to index
+          %wi = arith.index_cast %w : i32 to index
+          %gi = arith.index_cast %g : i32 to index
+          %posi = arith.index_cast %pos : i32 to index
+          %nwgi = arith.index_cast %nwg : i32 to index
+          %t0i = arith.index_cast %t0 : i32 to index
+          %g128 = arith.muli %gi, %c128 : index
+          %kd = arith.addi %g128, %l4 : index
+          %P = memref.dim %k3, %c0 : memref<?x?x?xf16>
+          %KH = memref.dim %k3, %c1 : memref<?x?x?xf16>
+          %Wd = arith.muli %KH, %c128 : index
+          %k = memref.reinterpret_cast %k3 to offset: [0], sizes: [%P, %Wd], strides: [%Wd, 1] : memref<?x?x?xf16> to memref<?x?xf16, strided<[?, 1]>>
+          %v = memref.reinterpret_cast %v3 to offset: [0], sizes: [%P, %Wd], strides: [%Wd, 1] : memref<?x?x?xf16> to memref<?x?xf16, strided<[?, 1]>>
+          %scv = vector.broadcast %scale : f32 to vector<4xf32>
+          %ct0 = arith.constant 0 : index
+          %pos0 = arith.addi %posi, %ct0 : index
+          %n0 = arith.addi %pos0, %c32 : index
+          %chunks0 = arith.divui %n0, %c32 : index
+          %qt0 = arith.addi %t0i, %ct0 : index
+          %qv0 = vector.load %q[%qt0, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs0 = arith.mulf %qv0, %scv : vector<4xf32>
+          %ct1 = arith.constant 1 : index
+          %pos1 = arith.addi %posi, %ct1 : index
+          %n1 = arith.addi %pos1, %c32 : index
+          %chunks1 = arith.divui %n1, %c32 : index
+          %qt1 = arith.addi %t0i, %ct1 : index
+          %qv1 = vector.load %q[%qt1, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs1 = arith.mulf %qv1, %scv : vector<4xf32>
+          %ct2 = arith.constant 2 : index
+          %pos2 = arith.addi %posi, %ct2 : index
+          %n2 = arith.addi %pos2, %c32 : index
+          %chunks2 = arith.divui %n2, %c32 : index
+          %qt2 = arith.addi %t0i, %ct2 : index
+          %qv2 = vector.load %q[%qt2, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs2 = arith.mulf %qv2, %scv : vector<4xf32>
+          %ct3 = arith.constant 3 : index
+          %pos3 = arith.addi %posi, %ct3 : index
+          %n3 = arith.addi %pos3, %c32 : index
+          %chunks3 = arith.divui %n3, %c32 : index
+          %qt3 = arith.addi %t0i, %ct3 : index
+          %qv3 = vector.load %q[%qt3, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs3 = arith.mulf %qv3, %scv : vector<4xf32>
+          %ct4 = arith.constant 4 : index
+          %pos4 = arith.addi %posi, %ct4 : index
+          %n4 = arith.addi %pos4, %c32 : index
+          %chunks4 = arith.divui %n4, %c32 : index
+          %qt4 = arith.addi %t0i, %ct4 : index
+          %qv4 = vector.load %q[%qt4, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs4 = arith.mulf %qv4, %scv : vector<4xf32>
+          %ct5 = arith.constant 5 : index
+          %pos5 = arith.addi %posi, %ct5 : index
+          %n5 = arith.addi %pos5, %c32 : index
+          %chunks5 = arith.divui %n5, %c32 : index
+          %qt5 = arith.addi %t0i, %ct5 : index
+          %qv5 = vector.load %q[%qt5, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs5 = arith.mulf %qv5, %scv : vector<4xf32>
+          %st:18 = scf.for %ic = %wi to %chunks5 step %nwgi iter_args(%M0 = %neg, %S0 = %zero, %o0 = %vz4, %M1 = %neg, %S1 = %zero, %o1 = %vz4, %M2 = %neg, %S2 = %zero, %o2 = %vz4, %M3 = %neg, %S3 = %zero, %o3 = %vz4, %M4 = %neg, %S4 = %zero, %o4 = %vz4, %M5 = %neg, %S5 = %zero, %o5 = %vz4) -> (f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>) {
+            %r0 = arith.muli %ic, %c32 : index
+            %my:6 = scf.for %cc = %c0 to %c32 step %c1 iter_args(%m0 = %neg, %m1 = %neg, %m2 = %neg, %m3 = %neg, %m4 = %neg, %m5 = %neg) -> (f32, f32, f32, f32, f32, f32) {
+              %row = arith.addi %r0, %cc : index
+              %rowc = arith.minui %row, %pos5 : index
+              %kh = vector.load %k[%rowc, %kd] {alignment = 8} : memref<?x?xf16, strided<[?, 1]>>, vector<4xf16>
+              %kf = arith.extf %kh : vector<4xf16> to vector<4xf32>
+              %mine = arith.cmpi eq, %cc, %l : index
+              %pr0 = arith.mulf %kf, %qs0 : vector<4xf32>
+              %pl0 = vector.reduction <add>, %pr0 : vector<4xf32> into f32
+              %sc0 = gpu.subgroup_reduce add %pl0 : (f32) -> f32
+              %live0 = arith.cmpi ule, %row, %pos0 : index
+              %scm0 = arith.select %live0, %sc0, %neg : f32
+              %mm0 = arith.select %mine, %scm0, %m0 : f32
+              %pr1 = arith.mulf %kf, %qs1 : vector<4xf32>
+              %pl1 = vector.reduction <add>, %pr1 : vector<4xf32> into f32
+              %sc1 = gpu.subgroup_reduce add %pl1 : (f32) -> f32
+              %live1 = arith.cmpi ule, %row, %pos1 : index
+              %scm1 = arith.select %live1, %sc1, %neg : f32
+              %mm1 = arith.select %mine, %scm1, %m1 : f32
+              %pr2 = arith.mulf %kf, %qs2 : vector<4xf32>
+              %pl2 = vector.reduction <add>, %pr2 : vector<4xf32> into f32
+              %sc2 = gpu.subgroup_reduce add %pl2 : (f32) -> f32
+              %live2 = arith.cmpi ule, %row, %pos2 : index
+              %scm2 = arith.select %live2, %sc2, %neg : f32
+              %mm2 = arith.select %mine, %scm2, %m2 : f32
+              %pr3 = arith.mulf %kf, %qs3 : vector<4xf32>
+              %pl3 = vector.reduction <add>, %pr3 : vector<4xf32> into f32
+              %sc3 = gpu.subgroup_reduce add %pl3 : (f32) -> f32
+              %live3 = arith.cmpi ule, %row, %pos3 : index
+              %scm3 = arith.select %live3, %sc3, %neg : f32
+              %mm3 = arith.select %mine, %scm3, %m3 : f32
+              %pr4 = arith.mulf %kf, %qs4 : vector<4xf32>
+              %pl4 = vector.reduction <add>, %pr4 : vector<4xf32> into f32
+              %sc4 = gpu.subgroup_reduce add %pl4 : (f32) -> f32
+              %live4 = arith.cmpi ule, %row, %pos4 : index
+              %scm4 = arith.select %live4, %sc4, %neg : f32
+              %mm4 = arith.select %mine, %scm4, %m4 : f32
+              %pr5 = arith.mulf %kf, %qs5 : vector<4xf32>
+              %pl5 = vector.reduction <add>, %pr5 : vector<4xf32> into f32
+              %sc5 = gpu.subgroup_reduce add %pl5 : (f32) -> f32
+              %live5 = arith.cmpi ule, %row, %pos5 : index
+              %scm5 = arith.select %live5, %sc5, %neg : f32
+              %mm5 = arith.select %mine, %scm5, %m5 : f32
+              scf.yield %mm0, %mm1, %mm2, %mm3, %mm4, %mm5 : f32, f32, f32, f32, f32, f32
+            }
+            %act0 = arith.cmpi ult, %ic, %chunks0 : index
+            %u0:4 = scf.if %act0 -> (f32, f32, vector<4xf32>, f32) {
+              %bm0 = gpu.subgroup_reduce maxnumf %my#0 : (f32) -> f32
+              %Mn0 = arith.maxnumf %M0, %bm0 : f32
+              %dm0 = arith.subf %M0, %Mn0 : f32
+              %ms0 = math.exp %dm0 : f32
+              %dp0 = arith.subf %my#0, %Mn0 : f32
+              %p0 = math.exp %dp0 : f32
+              %bs0 = gpu.subgroup_reduce add %p0 : (f32) -> f32
+              %Ss0 = arith.mulf %S0, %ms0 : f32
+              %Sn0 = arith.addf %Ss0, %bs0 : f32
+              %msv0 = vector.broadcast %ms0 : f32 to vector<4xf32>
+              %ox0 = arith.mulf %o0, %msv0 : vector<4xf32>
+              scf.yield %Mn0, %Sn0, %ox0, %p0 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M0, %S0, %o0, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act1 = arith.cmpi ult, %ic, %chunks1 : index
+            %u1:4 = scf.if %act1 -> (f32, f32, vector<4xf32>, f32) {
+              %bm1 = gpu.subgroup_reduce maxnumf %my#1 : (f32) -> f32
+              %Mn1 = arith.maxnumf %M1, %bm1 : f32
+              %dm1 = arith.subf %M1, %Mn1 : f32
+              %ms1 = math.exp %dm1 : f32
+              %dp1 = arith.subf %my#1, %Mn1 : f32
+              %p1 = math.exp %dp1 : f32
+              %bs1 = gpu.subgroup_reduce add %p1 : (f32) -> f32
+              %Ss1 = arith.mulf %S1, %ms1 : f32
+              %Sn1 = arith.addf %Ss1, %bs1 : f32
+              %msv1 = vector.broadcast %ms1 : f32 to vector<4xf32>
+              %ox1 = arith.mulf %o1, %msv1 : vector<4xf32>
+              scf.yield %Mn1, %Sn1, %ox1, %p1 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M1, %S1, %o1, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act2 = arith.cmpi ult, %ic, %chunks2 : index
+            %u2:4 = scf.if %act2 -> (f32, f32, vector<4xf32>, f32) {
+              %bm2 = gpu.subgroup_reduce maxnumf %my#2 : (f32) -> f32
+              %Mn2 = arith.maxnumf %M2, %bm2 : f32
+              %dm2 = arith.subf %M2, %Mn2 : f32
+              %ms2 = math.exp %dm2 : f32
+              %dp2 = arith.subf %my#2, %Mn2 : f32
+              %p2 = math.exp %dp2 : f32
+              %bs2 = gpu.subgroup_reduce add %p2 : (f32) -> f32
+              %Ss2 = arith.mulf %S2, %ms2 : f32
+              %Sn2 = arith.addf %Ss2, %bs2 : f32
+              %msv2 = vector.broadcast %ms2 : f32 to vector<4xf32>
+              %ox2 = arith.mulf %o2, %msv2 : vector<4xf32>
+              scf.yield %Mn2, %Sn2, %ox2, %p2 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M2, %S2, %o2, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act3 = arith.cmpi ult, %ic, %chunks3 : index
+            %u3:4 = scf.if %act3 -> (f32, f32, vector<4xf32>, f32) {
+              %bm3 = gpu.subgroup_reduce maxnumf %my#3 : (f32) -> f32
+              %Mn3 = arith.maxnumf %M3, %bm3 : f32
+              %dm3 = arith.subf %M3, %Mn3 : f32
+              %ms3 = math.exp %dm3 : f32
+              %dp3 = arith.subf %my#3, %Mn3 : f32
+              %p3 = math.exp %dp3 : f32
+              %bs3 = gpu.subgroup_reduce add %p3 : (f32) -> f32
+              %Ss3 = arith.mulf %S3, %ms3 : f32
+              %Sn3 = arith.addf %Ss3, %bs3 : f32
+              %msv3 = vector.broadcast %ms3 : f32 to vector<4xf32>
+              %ox3 = arith.mulf %o3, %msv3 : vector<4xf32>
+              scf.yield %Mn3, %Sn3, %ox3, %p3 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M3, %S3, %o3, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act4 = arith.cmpi ult, %ic, %chunks4 : index
+            %u4:4 = scf.if %act4 -> (f32, f32, vector<4xf32>, f32) {
+              %bm4 = gpu.subgroup_reduce maxnumf %my#4 : (f32) -> f32
+              %Mn4 = arith.maxnumf %M4, %bm4 : f32
+              %dm4 = arith.subf %M4, %Mn4 : f32
+              %ms4 = math.exp %dm4 : f32
+              %dp4 = arith.subf %my#4, %Mn4 : f32
+              %p4 = math.exp %dp4 : f32
+              %bs4 = gpu.subgroup_reduce add %p4 : (f32) -> f32
+              %Ss4 = arith.mulf %S4, %ms4 : f32
+              %Sn4 = arith.addf %Ss4, %bs4 : f32
+              %msv4 = vector.broadcast %ms4 : f32 to vector<4xf32>
+              %ox4 = arith.mulf %o4, %msv4 : vector<4xf32>
+              scf.yield %Mn4, %Sn4, %ox4, %p4 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M4, %S4, %o4, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act5 = arith.cmpi ult, %ic, %chunks5 : index
+            %u5:4 = scf.if %act5 -> (f32, f32, vector<4xf32>, f32) {
+              %bm5 = gpu.subgroup_reduce maxnumf %my#5 : (f32) -> f32
+              %Mn5 = arith.maxnumf %M5, %bm5 : f32
+              %dm5 = arith.subf %M5, %Mn5 : f32
+              %ms5 = math.exp %dm5 : f32
+              %dp5 = arith.subf %my#5, %Mn5 : f32
+              %p5 = math.exp %dp5 : f32
+              %bs5 = gpu.subgroup_reduce add %p5 : (f32) -> f32
+              %Ss5 = arith.mulf %S5, %ms5 : f32
+              %Sn5 = arith.addf %Ss5, %bs5 : f32
+              %msv5 = vector.broadcast %ms5 : f32 to vector<4xf32>
+              %ox5 = arith.mulf %o5, %msv5 : vector<4xf32>
+              scf.yield %Mn5, %Sn5, %ox5, %p5 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M5, %S5, %o5, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %ov:6 = scf.for %cc = %c0 to %c32 step %c1 iter_args(%oa0 = %u0#2, %oa1 = %u1#2, %oa2 = %u2#2, %oa3 = %u3#2, %oa4 = %u4#2, %oa5 = %u5#2) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>) {
+              %row = arith.addi %r0, %cc : index
+              %rowc = arith.minui %row, %pos5 : index
+              %vh = vector.load %v[%rowc, %kd] {alignment = 8} : memref<?x?xf16, strided<[?, 1]>>, vector<4xf16>
+              %vf = arith.extf %vh : vector<4xf16> to vector<4xf32>
+              %cci = arith.index_cast %cc : index to i32
+              %pc0, %pv0 = gpu.shuffle idx %u0#3, %cci, %c32i : f32
+              %pcv0 = vector.broadcast %pc0 : f32 to vector<4xf32>
+              %on0 = vector.fma %vf, %pcv0, %oa0 : vector<4xf32>
+              %pc1, %pv1 = gpu.shuffle idx %u1#3, %cci, %c32i : f32
+              %pcv1 = vector.broadcast %pc1 : f32 to vector<4xf32>
+              %on1 = vector.fma %vf, %pcv1, %oa1 : vector<4xf32>
+              %pc2, %pv2 = gpu.shuffle idx %u2#3, %cci, %c32i : f32
+              %pcv2 = vector.broadcast %pc2 : f32 to vector<4xf32>
+              %on2 = vector.fma %vf, %pcv2, %oa2 : vector<4xf32>
+              %pc3, %pv3 = gpu.shuffle idx %u3#3, %cci, %c32i : f32
+              %pcv3 = vector.broadcast %pc3 : f32 to vector<4xf32>
+              %on3 = vector.fma %vf, %pcv3, %oa3 : vector<4xf32>
+              %pc4, %pv4 = gpu.shuffle idx %u4#3, %cci, %c32i : f32
+              %pcv4 = vector.broadcast %pc4 : f32 to vector<4xf32>
+              %on4 = vector.fma %vf, %pcv4, %oa4 : vector<4xf32>
+              %pc5, %pv5 = gpu.shuffle idx %u5#3, %cci, %c32i : f32
+              %pcv5 = vector.broadcast %pc5 : f32 to vector<4xf32>
+              %on5 = vector.fma %vf, %pcv5, %oa5 : vector<4xf32>
+              scf.yield %on0, %on1, %on2, %on3, %on4, %on5 : vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>
+            }
+            scf.yield %u0#0, %u0#1, %ov#0, %u1#0, %u1#1, %ov#1, %u2#0, %u2#1, %ov#2, %u3#0, %u3#1, %ov#3, %u4#0, %u4#1, %ov#4, %u5#0, %u5#1, %ov#5 : f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>
+          }
+          %lane0 = arith.cmpi eq, %l, %c0 : index
+          %base0 = arith.muli %qt0, %c132 : index
+          %at0 = arith.addi %base0, %l4 : index
+          vector.store %st#2, %part[%hi, %wi, %at0] : memref<?x?x?xf32>, vector<4xf32>
+          %am0 = arith.addi %base0, %c128 : index
+          %as0 = arith.addi %base0, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#0, %part[%hi, %wi, %am0] : memref<?x?x?xf32>
+            memref.store %st#1, %part[%hi, %wi, %as0] : memref<?x?x?xf32>
+          }
+          %base1 = arith.muli %qt1, %c132 : index
+          %at1 = arith.addi %base1, %l4 : index
+          vector.store %st#5, %part[%hi, %wi, %at1] : memref<?x?x?xf32>, vector<4xf32>
+          %am1 = arith.addi %base1, %c128 : index
+          %as1 = arith.addi %base1, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#3, %part[%hi, %wi, %am1] : memref<?x?x?xf32>
+            memref.store %st#4, %part[%hi, %wi, %as1] : memref<?x?x?xf32>
+          }
+          %base2 = arith.muli %qt2, %c132 : index
+          %at2 = arith.addi %base2, %l4 : index
+          vector.store %st#8, %part[%hi, %wi, %at2] : memref<?x?x?xf32>, vector<4xf32>
+          %am2 = arith.addi %base2, %c128 : index
+          %as2 = arith.addi %base2, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#6, %part[%hi, %wi, %am2] : memref<?x?x?xf32>
+            memref.store %st#7, %part[%hi, %wi, %as2] : memref<?x?x?xf32>
+          }
+          %base3 = arith.muli %qt3, %c132 : index
+          %at3 = arith.addi %base3, %l4 : index
+          vector.store %st#11, %part[%hi, %wi, %at3] : memref<?x?x?xf32>, vector<4xf32>
+          %am3 = arith.addi %base3, %c128 : index
+          %as3 = arith.addi %base3, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#9, %part[%hi, %wi, %am3] : memref<?x?x?xf32>
+            memref.store %st#10, %part[%hi, %wi, %as3] : memref<?x?x?xf32>
+          }
+          %base4 = arith.muli %qt4, %c132 : index
+          %at4 = arith.addi %base4, %l4 : index
+          vector.store %st#14, %part[%hi, %wi, %at4] : memref<?x?x?xf32>, vector<4xf32>
+          %am4 = arith.addi %base4, %c128 : index
+          %as4 = arith.addi %base4, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#12, %part[%hi, %wi, %am4] : memref<?x?x?xf32>
+            memref.store %st#13, %part[%hi, %wi, %as4] : memref<?x?x?xf32>
+          }
+          %base5 = arith.muli %qt5, %c132 : index
+          %at5 = arith.addi %base5, %l4 : index
+          vector.store %st#17, %part[%hi, %wi, %at5] : memref<?x?x?xf32>, vector<4xf32>
+          %am5 = arith.addi %base5, %c128 : index
+          %as5 = arith.addi %base5, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#15, %part[%hi, %wi, %am5] : memref<?x?x?xf32>
+            memref.store %st#16, %part[%hi, %wi, %as5] : memref<?x?x?xf32>
+          }
+          macro.yield %h : i32
+        };
+      }
+    }
+  }
+  return;
+}
+
+/// `vec_attention_parts` for 7 queries in a row: query t is at position pos + t, in q[t0 + t], and its part
+/// w goes to part[h][w][132 (t0 + t) ..].
+fn round_attention_parts_7(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, pos : i32, t0 : i32, q_heads : i32, group : i32, nwg : i32, scale : f32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..q_heads across blocks {
+      for w in 0..nwg across blocks {
+        let g = h / group;
+        let _d = mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %t0 = t0 : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
+          %c0 = arith.constant 0 : index
+          %c1 = arith.constant 1 : index
+          %c4 = arith.constant 4 : index
+          %c32 = arith.constant 32 : index
+          %c128 = arith.constant 128 : index
+          %c129 = arith.constant 129 : index
+          %c132 = arith.constant 132 : index
+          %c32i = arith.constant 32 : i32
+          %neg = arith.constant -3.0e38 : f32
+          %zero = arith.constant 0.0 : f32
+          %vz4 = arith.constant dense<0.0> : vector<4xf32>
+          %l = gpu.thread_id x
+          %l4 = arith.muli %l, %c4 : index
+          %hi = arith.index_cast %h : i32 to index
+          %wi = arith.index_cast %w : i32 to index
+          %gi = arith.index_cast %g : i32 to index
+          %posi = arith.index_cast %pos : i32 to index
+          %nwgi = arith.index_cast %nwg : i32 to index
+          %t0i = arith.index_cast %t0 : i32 to index
+          %g128 = arith.muli %gi, %c128 : index
+          %kd = arith.addi %g128, %l4 : index
+          %P = memref.dim %k3, %c0 : memref<?x?x?xf16>
+          %KH = memref.dim %k3, %c1 : memref<?x?x?xf16>
+          %Wd = arith.muli %KH, %c128 : index
+          %k = memref.reinterpret_cast %k3 to offset: [0], sizes: [%P, %Wd], strides: [%Wd, 1] : memref<?x?x?xf16> to memref<?x?xf16, strided<[?, 1]>>
+          %v = memref.reinterpret_cast %v3 to offset: [0], sizes: [%P, %Wd], strides: [%Wd, 1] : memref<?x?x?xf16> to memref<?x?xf16, strided<[?, 1]>>
+          %scv = vector.broadcast %scale : f32 to vector<4xf32>
+          %ct0 = arith.constant 0 : index
+          %pos0 = arith.addi %posi, %ct0 : index
+          %n0 = arith.addi %pos0, %c32 : index
+          %chunks0 = arith.divui %n0, %c32 : index
+          %qt0 = arith.addi %t0i, %ct0 : index
+          %qv0 = vector.load %q[%qt0, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs0 = arith.mulf %qv0, %scv : vector<4xf32>
+          %ct1 = arith.constant 1 : index
+          %pos1 = arith.addi %posi, %ct1 : index
+          %n1 = arith.addi %pos1, %c32 : index
+          %chunks1 = arith.divui %n1, %c32 : index
+          %qt1 = arith.addi %t0i, %ct1 : index
+          %qv1 = vector.load %q[%qt1, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs1 = arith.mulf %qv1, %scv : vector<4xf32>
+          %ct2 = arith.constant 2 : index
+          %pos2 = arith.addi %posi, %ct2 : index
+          %n2 = arith.addi %pos2, %c32 : index
+          %chunks2 = arith.divui %n2, %c32 : index
+          %qt2 = arith.addi %t0i, %ct2 : index
+          %qv2 = vector.load %q[%qt2, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs2 = arith.mulf %qv2, %scv : vector<4xf32>
+          %ct3 = arith.constant 3 : index
+          %pos3 = arith.addi %posi, %ct3 : index
+          %n3 = arith.addi %pos3, %c32 : index
+          %chunks3 = arith.divui %n3, %c32 : index
+          %qt3 = arith.addi %t0i, %ct3 : index
+          %qv3 = vector.load %q[%qt3, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs3 = arith.mulf %qv3, %scv : vector<4xf32>
+          %ct4 = arith.constant 4 : index
+          %pos4 = arith.addi %posi, %ct4 : index
+          %n4 = arith.addi %pos4, %c32 : index
+          %chunks4 = arith.divui %n4, %c32 : index
+          %qt4 = arith.addi %t0i, %ct4 : index
+          %qv4 = vector.load %q[%qt4, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs4 = arith.mulf %qv4, %scv : vector<4xf32>
+          %ct5 = arith.constant 5 : index
+          %pos5 = arith.addi %posi, %ct5 : index
+          %n5 = arith.addi %pos5, %c32 : index
+          %chunks5 = arith.divui %n5, %c32 : index
+          %qt5 = arith.addi %t0i, %ct5 : index
+          %qv5 = vector.load %q[%qt5, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs5 = arith.mulf %qv5, %scv : vector<4xf32>
+          %ct6 = arith.constant 6 : index
+          %pos6 = arith.addi %posi, %ct6 : index
+          %n6 = arith.addi %pos6, %c32 : index
+          %chunks6 = arith.divui %n6, %c32 : index
+          %qt6 = arith.addi %t0i, %ct6 : index
+          %qv6 = vector.load %q[%qt6, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs6 = arith.mulf %qv6, %scv : vector<4xf32>
+          %st:21 = scf.for %ic = %wi to %chunks6 step %nwgi iter_args(%M0 = %neg, %S0 = %zero, %o0 = %vz4, %M1 = %neg, %S1 = %zero, %o1 = %vz4, %M2 = %neg, %S2 = %zero, %o2 = %vz4, %M3 = %neg, %S3 = %zero, %o3 = %vz4, %M4 = %neg, %S4 = %zero, %o4 = %vz4, %M5 = %neg, %S5 = %zero, %o5 = %vz4, %M6 = %neg, %S6 = %zero, %o6 = %vz4) -> (f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>) {
+            %r0 = arith.muli %ic, %c32 : index
+            %my:7 = scf.for %cc = %c0 to %c32 step %c1 iter_args(%m0 = %neg, %m1 = %neg, %m2 = %neg, %m3 = %neg, %m4 = %neg, %m5 = %neg, %m6 = %neg) -> (f32, f32, f32, f32, f32, f32, f32) {
+              %row = arith.addi %r0, %cc : index
+              %rowc = arith.minui %row, %pos6 : index
+              %kh = vector.load %k[%rowc, %kd] {alignment = 8} : memref<?x?xf16, strided<[?, 1]>>, vector<4xf16>
+              %kf = arith.extf %kh : vector<4xf16> to vector<4xf32>
+              %mine = arith.cmpi eq, %cc, %l : index
+              %pr0 = arith.mulf %kf, %qs0 : vector<4xf32>
+              %pl0 = vector.reduction <add>, %pr0 : vector<4xf32> into f32
+              %sc0 = gpu.subgroup_reduce add %pl0 : (f32) -> f32
+              %live0 = arith.cmpi ule, %row, %pos0 : index
+              %scm0 = arith.select %live0, %sc0, %neg : f32
+              %mm0 = arith.select %mine, %scm0, %m0 : f32
+              %pr1 = arith.mulf %kf, %qs1 : vector<4xf32>
+              %pl1 = vector.reduction <add>, %pr1 : vector<4xf32> into f32
+              %sc1 = gpu.subgroup_reduce add %pl1 : (f32) -> f32
+              %live1 = arith.cmpi ule, %row, %pos1 : index
+              %scm1 = arith.select %live1, %sc1, %neg : f32
+              %mm1 = arith.select %mine, %scm1, %m1 : f32
+              %pr2 = arith.mulf %kf, %qs2 : vector<4xf32>
+              %pl2 = vector.reduction <add>, %pr2 : vector<4xf32> into f32
+              %sc2 = gpu.subgroup_reduce add %pl2 : (f32) -> f32
+              %live2 = arith.cmpi ule, %row, %pos2 : index
+              %scm2 = arith.select %live2, %sc2, %neg : f32
+              %mm2 = arith.select %mine, %scm2, %m2 : f32
+              %pr3 = arith.mulf %kf, %qs3 : vector<4xf32>
+              %pl3 = vector.reduction <add>, %pr3 : vector<4xf32> into f32
+              %sc3 = gpu.subgroup_reduce add %pl3 : (f32) -> f32
+              %live3 = arith.cmpi ule, %row, %pos3 : index
+              %scm3 = arith.select %live3, %sc3, %neg : f32
+              %mm3 = arith.select %mine, %scm3, %m3 : f32
+              %pr4 = arith.mulf %kf, %qs4 : vector<4xf32>
+              %pl4 = vector.reduction <add>, %pr4 : vector<4xf32> into f32
+              %sc4 = gpu.subgroup_reduce add %pl4 : (f32) -> f32
+              %live4 = arith.cmpi ule, %row, %pos4 : index
+              %scm4 = arith.select %live4, %sc4, %neg : f32
+              %mm4 = arith.select %mine, %scm4, %m4 : f32
+              %pr5 = arith.mulf %kf, %qs5 : vector<4xf32>
+              %pl5 = vector.reduction <add>, %pr5 : vector<4xf32> into f32
+              %sc5 = gpu.subgroup_reduce add %pl5 : (f32) -> f32
+              %live5 = arith.cmpi ule, %row, %pos5 : index
+              %scm5 = arith.select %live5, %sc5, %neg : f32
+              %mm5 = arith.select %mine, %scm5, %m5 : f32
+              %pr6 = arith.mulf %kf, %qs6 : vector<4xf32>
+              %pl6 = vector.reduction <add>, %pr6 : vector<4xf32> into f32
+              %sc6 = gpu.subgroup_reduce add %pl6 : (f32) -> f32
+              %live6 = arith.cmpi ule, %row, %pos6 : index
+              %scm6 = arith.select %live6, %sc6, %neg : f32
+              %mm6 = arith.select %mine, %scm6, %m6 : f32
+              scf.yield %mm0, %mm1, %mm2, %mm3, %mm4, %mm5, %mm6 : f32, f32, f32, f32, f32, f32, f32
+            }
+            %act0 = arith.cmpi ult, %ic, %chunks0 : index
+            %u0:4 = scf.if %act0 -> (f32, f32, vector<4xf32>, f32) {
+              %bm0 = gpu.subgroup_reduce maxnumf %my#0 : (f32) -> f32
+              %Mn0 = arith.maxnumf %M0, %bm0 : f32
+              %dm0 = arith.subf %M0, %Mn0 : f32
+              %ms0 = math.exp %dm0 : f32
+              %dp0 = arith.subf %my#0, %Mn0 : f32
+              %p0 = math.exp %dp0 : f32
+              %bs0 = gpu.subgroup_reduce add %p0 : (f32) -> f32
+              %Ss0 = arith.mulf %S0, %ms0 : f32
+              %Sn0 = arith.addf %Ss0, %bs0 : f32
+              %msv0 = vector.broadcast %ms0 : f32 to vector<4xf32>
+              %ox0 = arith.mulf %o0, %msv0 : vector<4xf32>
+              scf.yield %Mn0, %Sn0, %ox0, %p0 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M0, %S0, %o0, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act1 = arith.cmpi ult, %ic, %chunks1 : index
+            %u1:4 = scf.if %act1 -> (f32, f32, vector<4xf32>, f32) {
+              %bm1 = gpu.subgroup_reduce maxnumf %my#1 : (f32) -> f32
+              %Mn1 = arith.maxnumf %M1, %bm1 : f32
+              %dm1 = arith.subf %M1, %Mn1 : f32
+              %ms1 = math.exp %dm1 : f32
+              %dp1 = arith.subf %my#1, %Mn1 : f32
+              %p1 = math.exp %dp1 : f32
+              %bs1 = gpu.subgroup_reduce add %p1 : (f32) -> f32
+              %Ss1 = arith.mulf %S1, %ms1 : f32
+              %Sn1 = arith.addf %Ss1, %bs1 : f32
+              %msv1 = vector.broadcast %ms1 : f32 to vector<4xf32>
+              %ox1 = arith.mulf %o1, %msv1 : vector<4xf32>
+              scf.yield %Mn1, %Sn1, %ox1, %p1 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M1, %S1, %o1, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act2 = arith.cmpi ult, %ic, %chunks2 : index
+            %u2:4 = scf.if %act2 -> (f32, f32, vector<4xf32>, f32) {
+              %bm2 = gpu.subgroup_reduce maxnumf %my#2 : (f32) -> f32
+              %Mn2 = arith.maxnumf %M2, %bm2 : f32
+              %dm2 = arith.subf %M2, %Mn2 : f32
+              %ms2 = math.exp %dm2 : f32
+              %dp2 = arith.subf %my#2, %Mn2 : f32
+              %p2 = math.exp %dp2 : f32
+              %bs2 = gpu.subgroup_reduce add %p2 : (f32) -> f32
+              %Ss2 = arith.mulf %S2, %ms2 : f32
+              %Sn2 = arith.addf %Ss2, %bs2 : f32
+              %msv2 = vector.broadcast %ms2 : f32 to vector<4xf32>
+              %ox2 = arith.mulf %o2, %msv2 : vector<4xf32>
+              scf.yield %Mn2, %Sn2, %ox2, %p2 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M2, %S2, %o2, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act3 = arith.cmpi ult, %ic, %chunks3 : index
+            %u3:4 = scf.if %act3 -> (f32, f32, vector<4xf32>, f32) {
+              %bm3 = gpu.subgroup_reduce maxnumf %my#3 : (f32) -> f32
+              %Mn3 = arith.maxnumf %M3, %bm3 : f32
+              %dm3 = arith.subf %M3, %Mn3 : f32
+              %ms3 = math.exp %dm3 : f32
+              %dp3 = arith.subf %my#3, %Mn3 : f32
+              %p3 = math.exp %dp3 : f32
+              %bs3 = gpu.subgroup_reduce add %p3 : (f32) -> f32
+              %Ss3 = arith.mulf %S3, %ms3 : f32
+              %Sn3 = arith.addf %Ss3, %bs3 : f32
+              %msv3 = vector.broadcast %ms3 : f32 to vector<4xf32>
+              %ox3 = arith.mulf %o3, %msv3 : vector<4xf32>
+              scf.yield %Mn3, %Sn3, %ox3, %p3 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M3, %S3, %o3, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act4 = arith.cmpi ult, %ic, %chunks4 : index
+            %u4:4 = scf.if %act4 -> (f32, f32, vector<4xf32>, f32) {
+              %bm4 = gpu.subgroup_reduce maxnumf %my#4 : (f32) -> f32
+              %Mn4 = arith.maxnumf %M4, %bm4 : f32
+              %dm4 = arith.subf %M4, %Mn4 : f32
+              %ms4 = math.exp %dm4 : f32
+              %dp4 = arith.subf %my#4, %Mn4 : f32
+              %p4 = math.exp %dp4 : f32
+              %bs4 = gpu.subgroup_reduce add %p4 : (f32) -> f32
+              %Ss4 = arith.mulf %S4, %ms4 : f32
+              %Sn4 = arith.addf %Ss4, %bs4 : f32
+              %msv4 = vector.broadcast %ms4 : f32 to vector<4xf32>
+              %ox4 = arith.mulf %o4, %msv4 : vector<4xf32>
+              scf.yield %Mn4, %Sn4, %ox4, %p4 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M4, %S4, %o4, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act5 = arith.cmpi ult, %ic, %chunks5 : index
+            %u5:4 = scf.if %act5 -> (f32, f32, vector<4xf32>, f32) {
+              %bm5 = gpu.subgroup_reduce maxnumf %my#5 : (f32) -> f32
+              %Mn5 = arith.maxnumf %M5, %bm5 : f32
+              %dm5 = arith.subf %M5, %Mn5 : f32
+              %ms5 = math.exp %dm5 : f32
+              %dp5 = arith.subf %my#5, %Mn5 : f32
+              %p5 = math.exp %dp5 : f32
+              %bs5 = gpu.subgroup_reduce add %p5 : (f32) -> f32
+              %Ss5 = arith.mulf %S5, %ms5 : f32
+              %Sn5 = arith.addf %Ss5, %bs5 : f32
+              %msv5 = vector.broadcast %ms5 : f32 to vector<4xf32>
+              %ox5 = arith.mulf %o5, %msv5 : vector<4xf32>
+              scf.yield %Mn5, %Sn5, %ox5, %p5 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M5, %S5, %o5, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act6 = arith.cmpi ult, %ic, %chunks6 : index
+            %u6:4 = scf.if %act6 -> (f32, f32, vector<4xf32>, f32) {
+              %bm6 = gpu.subgroup_reduce maxnumf %my#6 : (f32) -> f32
+              %Mn6 = arith.maxnumf %M6, %bm6 : f32
+              %dm6 = arith.subf %M6, %Mn6 : f32
+              %ms6 = math.exp %dm6 : f32
+              %dp6 = arith.subf %my#6, %Mn6 : f32
+              %p6 = math.exp %dp6 : f32
+              %bs6 = gpu.subgroup_reduce add %p6 : (f32) -> f32
+              %Ss6 = arith.mulf %S6, %ms6 : f32
+              %Sn6 = arith.addf %Ss6, %bs6 : f32
+              %msv6 = vector.broadcast %ms6 : f32 to vector<4xf32>
+              %ox6 = arith.mulf %o6, %msv6 : vector<4xf32>
+              scf.yield %Mn6, %Sn6, %ox6, %p6 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M6, %S6, %o6, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %ov:7 = scf.for %cc = %c0 to %c32 step %c1 iter_args(%oa0 = %u0#2, %oa1 = %u1#2, %oa2 = %u2#2, %oa3 = %u3#2, %oa4 = %u4#2, %oa5 = %u5#2, %oa6 = %u6#2) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>) {
+              %row = arith.addi %r0, %cc : index
+              %rowc = arith.minui %row, %pos6 : index
+              %vh = vector.load %v[%rowc, %kd] {alignment = 8} : memref<?x?xf16, strided<[?, 1]>>, vector<4xf16>
+              %vf = arith.extf %vh : vector<4xf16> to vector<4xf32>
+              %cci = arith.index_cast %cc : index to i32
+              %pc0, %pv0 = gpu.shuffle idx %u0#3, %cci, %c32i : f32
+              %pcv0 = vector.broadcast %pc0 : f32 to vector<4xf32>
+              %on0 = vector.fma %vf, %pcv0, %oa0 : vector<4xf32>
+              %pc1, %pv1 = gpu.shuffle idx %u1#3, %cci, %c32i : f32
+              %pcv1 = vector.broadcast %pc1 : f32 to vector<4xf32>
+              %on1 = vector.fma %vf, %pcv1, %oa1 : vector<4xf32>
+              %pc2, %pv2 = gpu.shuffle idx %u2#3, %cci, %c32i : f32
+              %pcv2 = vector.broadcast %pc2 : f32 to vector<4xf32>
+              %on2 = vector.fma %vf, %pcv2, %oa2 : vector<4xf32>
+              %pc3, %pv3 = gpu.shuffle idx %u3#3, %cci, %c32i : f32
+              %pcv3 = vector.broadcast %pc3 : f32 to vector<4xf32>
+              %on3 = vector.fma %vf, %pcv3, %oa3 : vector<4xf32>
+              %pc4, %pv4 = gpu.shuffle idx %u4#3, %cci, %c32i : f32
+              %pcv4 = vector.broadcast %pc4 : f32 to vector<4xf32>
+              %on4 = vector.fma %vf, %pcv4, %oa4 : vector<4xf32>
+              %pc5, %pv5 = gpu.shuffle idx %u5#3, %cci, %c32i : f32
+              %pcv5 = vector.broadcast %pc5 : f32 to vector<4xf32>
+              %on5 = vector.fma %vf, %pcv5, %oa5 : vector<4xf32>
+              %pc6, %pv6 = gpu.shuffle idx %u6#3, %cci, %c32i : f32
+              %pcv6 = vector.broadcast %pc6 : f32 to vector<4xf32>
+              %on6 = vector.fma %vf, %pcv6, %oa6 : vector<4xf32>
+              scf.yield %on0, %on1, %on2, %on3, %on4, %on5, %on6 : vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>
+            }
+            scf.yield %u0#0, %u0#1, %ov#0, %u1#0, %u1#1, %ov#1, %u2#0, %u2#1, %ov#2, %u3#0, %u3#1, %ov#3, %u4#0, %u4#1, %ov#4, %u5#0, %u5#1, %ov#5, %u6#0, %u6#1, %ov#6 : f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>
+          }
+          %lane0 = arith.cmpi eq, %l, %c0 : index
+          %base0 = arith.muli %qt0, %c132 : index
+          %at0 = arith.addi %base0, %l4 : index
+          vector.store %st#2, %part[%hi, %wi, %at0] : memref<?x?x?xf32>, vector<4xf32>
+          %am0 = arith.addi %base0, %c128 : index
+          %as0 = arith.addi %base0, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#0, %part[%hi, %wi, %am0] : memref<?x?x?xf32>
+            memref.store %st#1, %part[%hi, %wi, %as0] : memref<?x?x?xf32>
+          }
+          %base1 = arith.muli %qt1, %c132 : index
+          %at1 = arith.addi %base1, %l4 : index
+          vector.store %st#5, %part[%hi, %wi, %at1] : memref<?x?x?xf32>, vector<4xf32>
+          %am1 = arith.addi %base1, %c128 : index
+          %as1 = arith.addi %base1, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#3, %part[%hi, %wi, %am1] : memref<?x?x?xf32>
+            memref.store %st#4, %part[%hi, %wi, %as1] : memref<?x?x?xf32>
+          }
+          %base2 = arith.muli %qt2, %c132 : index
+          %at2 = arith.addi %base2, %l4 : index
+          vector.store %st#8, %part[%hi, %wi, %at2] : memref<?x?x?xf32>, vector<4xf32>
+          %am2 = arith.addi %base2, %c128 : index
+          %as2 = arith.addi %base2, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#6, %part[%hi, %wi, %am2] : memref<?x?x?xf32>
+            memref.store %st#7, %part[%hi, %wi, %as2] : memref<?x?x?xf32>
+          }
+          %base3 = arith.muli %qt3, %c132 : index
+          %at3 = arith.addi %base3, %l4 : index
+          vector.store %st#11, %part[%hi, %wi, %at3] : memref<?x?x?xf32>, vector<4xf32>
+          %am3 = arith.addi %base3, %c128 : index
+          %as3 = arith.addi %base3, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#9, %part[%hi, %wi, %am3] : memref<?x?x?xf32>
+            memref.store %st#10, %part[%hi, %wi, %as3] : memref<?x?x?xf32>
+          }
+          %base4 = arith.muli %qt4, %c132 : index
+          %at4 = arith.addi %base4, %l4 : index
+          vector.store %st#14, %part[%hi, %wi, %at4] : memref<?x?x?xf32>, vector<4xf32>
+          %am4 = arith.addi %base4, %c128 : index
+          %as4 = arith.addi %base4, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#12, %part[%hi, %wi, %am4] : memref<?x?x?xf32>
+            memref.store %st#13, %part[%hi, %wi, %as4] : memref<?x?x?xf32>
+          }
+          %base5 = arith.muli %qt5, %c132 : index
+          %at5 = arith.addi %base5, %l4 : index
+          vector.store %st#17, %part[%hi, %wi, %at5] : memref<?x?x?xf32>, vector<4xf32>
+          %am5 = arith.addi %base5, %c128 : index
+          %as5 = arith.addi %base5, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#15, %part[%hi, %wi, %am5] : memref<?x?x?xf32>
+            memref.store %st#16, %part[%hi, %wi, %as5] : memref<?x?x?xf32>
+          }
+          %base6 = arith.muli %qt6, %c132 : index
+          %at6 = arith.addi %base6, %l4 : index
+          vector.store %st#20, %part[%hi, %wi, %at6] : memref<?x?x?xf32>, vector<4xf32>
+          %am6 = arith.addi %base6, %c128 : index
+          %as6 = arith.addi %base6, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#18, %part[%hi, %wi, %am6] : memref<?x?x?xf32>
+            memref.store %st#19, %part[%hi, %wi, %as6] : memref<?x?x?xf32>
+          }
+          macro.yield %h : i32
+        };
+      }
+    }
+  }
+  return;
+}
+
+/// `vec_attention_parts` for 8 queries in a row: query t is at position pos + t, in q[t0 + t], and its part
+/// w goes to part[h][w][132 (t0 + t) ..].
+fn round_attention_parts_8(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, pos : i32, t0 : i32, q_heads : i32, group : i32, nwg : i32, scale : f32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..q_heads across blocks {
+      for w in 0..nwg across blocks {
+        let g = h / group;
+        let _d = mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %t0 = t0 : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
+          %c0 = arith.constant 0 : index
+          %c1 = arith.constant 1 : index
+          %c4 = arith.constant 4 : index
+          %c32 = arith.constant 32 : index
+          %c128 = arith.constant 128 : index
+          %c129 = arith.constant 129 : index
+          %c132 = arith.constant 132 : index
+          %c32i = arith.constant 32 : i32
+          %neg = arith.constant -3.0e38 : f32
+          %zero = arith.constant 0.0 : f32
+          %vz4 = arith.constant dense<0.0> : vector<4xf32>
+          %l = gpu.thread_id x
+          %l4 = arith.muli %l, %c4 : index
+          %hi = arith.index_cast %h : i32 to index
+          %wi = arith.index_cast %w : i32 to index
+          %gi = arith.index_cast %g : i32 to index
+          %posi = arith.index_cast %pos : i32 to index
+          %nwgi = arith.index_cast %nwg : i32 to index
+          %t0i = arith.index_cast %t0 : i32 to index
+          %g128 = arith.muli %gi, %c128 : index
+          %kd = arith.addi %g128, %l4 : index
+          %P = memref.dim %k3, %c0 : memref<?x?x?xf16>
+          %KH = memref.dim %k3, %c1 : memref<?x?x?xf16>
+          %Wd = arith.muli %KH, %c128 : index
+          %k = memref.reinterpret_cast %k3 to offset: [0], sizes: [%P, %Wd], strides: [%Wd, 1] : memref<?x?x?xf16> to memref<?x?xf16, strided<[?, 1]>>
+          %v = memref.reinterpret_cast %v3 to offset: [0], sizes: [%P, %Wd], strides: [%Wd, 1] : memref<?x?x?xf16> to memref<?x?xf16, strided<[?, 1]>>
+          %scv = vector.broadcast %scale : f32 to vector<4xf32>
+          %ct0 = arith.constant 0 : index
+          %pos0 = arith.addi %posi, %ct0 : index
+          %n0 = arith.addi %pos0, %c32 : index
+          %chunks0 = arith.divui %n0, %c32 : index
+          %qt0 = arith.addi %t0i, %ct0 : index
+          %qv0 = vector.load %q[%qt0, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs0 = arith.mulf %qv0, %scv : vector<4xf32>
+          %ct1 = arith.constant 1 : index
+          %pos1 = arith.addi %posi, %ct1 : index
+          %n1 = arith.addi %pos1, %c32 : index
+          %chunks1 = arith.divui %n1, %c32 : index
+          %qt1 = arith.addi %t0i, %ct1 : index
+          %qv1 = vector.load %q[%qt1, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs1 = arith.mulf %qv1, %scv : vector<4xf32>
+          %ct2 = arith.constant 2 : index
+          %pos2 = arith.addi %posi, %ct2 : index
+          %n2 = arith.addi %pos2, %c32 : index
+          %chunks2 = arith.divui %n2, %c32 : index
+          %qt2 = arith.addi %t0i, %ct2 : index
+          %qv2 = vector.load %q[%qt2, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs2 = arith.mulf %qv2, %scv : vector<4xf32>
+          %ct3 = arith.constant 3 : index
+          %pos3 = arith.addi %posi, %ct3 : index
+          %n3 = arith.addi %pos3, %c32 : index
+          %chunks3 = arith.divui %n3, %c32 : index
+          %qt3 = arith.addi %t0i, %ct3 : index
+          %qv3 = vector.load %q[%qt3, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs3 = arith.mulf %qv3, %scv : vector<4xf32>
+          %ct4 = arith.constant 4 : index
+          %pos4 = arith.addi %posi, %ct4 : index
+          %n4 = arith.addi %pos4, %c32 : index
+          %chunks4 = arith.divui %n4, %c32 : index
+          %qt4 = arith.addi %t0i, %ct4 : index
+          %qv4 = vector.load %q[%qt4, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs4 = arith.mulf %qv4, %scv : vector<4xf32>
+          %ct5 = arith.constant 5 : index
+          %pos5 = arith.addi %posi, %ct5 : index
+          %n5 = arith.addi %pos5, %c32 : index
+          %chunks5 = arith.divui %n5, %c32 : index
+          %qt5 = arith.addi %t0i, %ct5 : index
+          %qv5 = vector.load %q[%qt5, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs5 = arith.mulf %qv5, %scv : vector<4xf32>
+          %ct6 = arith.constant 6 : index
+          %pos6 = arith.addi %posi, %ct6 : index
+          %n6 = arith.addi %pos6, %c32 : index
+          %chunks6 = arith.divui %n6, %c32 : index
+          %qt6 = arith.addi %t0i, %ct6 : index
+          %qv6 = vector.load %q[%qt6, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs6 = arith.mulf %qv6, %scv : vector<4xf32>
+          %ct7 = arith.constant 7 : index
+          %pos7 = arith.addi %posi, %ct7 : index
+          %n7 = arith.addi %pos7, %c32 : index
+          %chunks7 = arith.divui %n7, %c32 : index
+          %qt7 = arith.addi %t0i, %ct7 : index
+          %qv7 = vector.load %q[%qt7, %hi, %l4] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %qs7 = arith.mulf %qv7, %scv : vector<4xf32>
+          %st:24 = scf.for %ic = %wi to %chunks7 step %nwgi iter_args(%M0 = %neg, %S0 = %zero, %o0 = %vz4, %M1 = %neg, %S1 = %zero, %o1 = %vz4, %M2 = %neg, %S2 = %zero, %o2 = %vz4, %M3 = %neg, %S3 = %zero, %o3 = %vz4, %M4 = %neg, %S4 = %zero, %o4 = %vz4, %M5 = %neg, %S5 = %zero, %o5 = %vz4, %M6 = %neg, %S6 = %zero, %o6 = %vz4, %M7 = %neg, %S7 = %zero, %o7 = %vz4) -> (f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>) {
+            %r0 = arith.muli %ic, %c32 : index
+            %my:8 = scf.for %cc = %c0 to %c32 step %c1 iter_args(%m0 = %neg, %m1 = %neg, %m2 = %neg, %m3 = %neg, %m4 = %neg, %m5 = %neg, %m6 = %neg, %m7 = %neg) -> (f32, f32, f32, f32, f32, f32, f32, f32) {
+              %row = arith.addi %r0, %cc : index
+              %rowc = arith.minui %row, %pos7 : index
+              %kh = vector.load %k[%rowc, %kd] {alignment = 8} : memref<?x?xf16, strided<[?, 1]>>, vector<4xf16>
+              %kf = arith.extf %kh : vector<4xf16> to vector<4xf32>
+              %mine = arith.cmpi eq, %cc, %l : index
+              %pr0 = arith.mulf %kf, %qs0 : vector<4xf32>
+              %pl0 = vector.reduction <add>, %pr0 : vector<4xf32> into f32
+              %sc0 = gpu.subgroup_reduce add %pl0 : (f32) -> f32
+              %live0 = arith.cmpi ule, %row, %pos0 : index
+              %scm0 = arith.select %live0, %sc0, %neg : f32
+              %mm0 = arith.select %mine, %scm0, %m0 : f32
+              %pr1 = arith.mulf %kf, %qs1 : vector<4xf32>
+              %pl1 = vector.reduction <add>, %pr1 : vector<4xf32> into f32
+              %sc1 = gpu.subgroup_reduce add %pl1 : (f32) -> f32
+              %live1 = arith.cmpi ule, %row, %pos1 : index
+              %scm1 = arith.select %live1, %sc1, %neg : f32
+              %mm1 = arith.select %mine, %scm1, %m1 : f32
+              %pr2 = arith.mulf %kf, %qs2 : vector<4xf32>
+              %pl2 = vector.reduction <add>, %pr2 : vector<4xf32> into f32
+              %sc2 = gpu.subgroup_reduce add %pl2 : (f32) -> f32
+              %live2 = arith.cmpi ule, %row, %pos2 : index
+              %scm2 = arith.select %live2, %sc2, %neg : f32
+              %mm2 = arith.select %mine, %scm2, %m2 : f32
+              %pr3 = arith.mulf %kf, %qs3 : vector<4xf32>
+              %pl3 = vector.reduction <add>, %pr3 : vector<4xf32> into f32
+              %sc3 = gpu.subgroup_reduce add %pl3 : (f32) -> f32
+              %live3 = arith.cmpi ule, %row, %pos3 : index
+              %scm3 = arith.select %live3, %sc3, %neg : f32
+              %mm3 = arith.select %mine, %scm3, %m3 : f32
+              %pr4 = arith.mulf %kf, %qs4 : vector<4xf32>
+              %pl4 = vector.reduction <add>, %pr4 : vector<4xf32> into f32
+              %sc4 = gpu.subgroup_reduce add %pl4 : (f32) -> f32
+              %live4 = arith.cmpi ule, %row, %pos4 : index
+              %scm4 = arith.select %live4, %sc4, %neg : f32
+              %mm4 = arith.select %mine, %scm4, %m4 : f32
+              %pr5 = arith.mulf %kf, %qs5 : vector<4xf32>
+              %pl5 = vector.reduction <add>, %pr5 : vector<4xf32> into f32
+              %sc5 = gpu.subgroup_reduce add %pl5 : (f32) -> f32
+              %live5 = arith.cmpi ule, %row, %pos5 : index
+              %scm5 = arith.select %live5, %sc5, %neg : f32
+              %mm5 = arith.select %mine, %scm5, %m5 : f32
+              %pr6 = arith.mulf %kf, %qs6 : vector<4xf32>
+              %pl6 = vector.reduction <add>, %pr6 : vector<4xf32> into f32
+              %sc6 = gpu.subgroup_reduce add %pl6 : (f32) -> f32
+              %live6 = arith.cmpi ule, %row, %pos6 : index
+              %scm6 = arith.select %live6, %sc6, %neg : f32
+              %mm6 = arith.select %mine, %scm6, %m6 : f32
+              %pr7 = arith.mulf %kf, %qs7 : vector<4xf32>
+              %pl7 = vector.reduction <add>, %pr7 : vector<4xf32> into f32
+              %sc7 = gpu.subgroup_reduce add %pl7 : (f32) -> f32
+              %live7 = arith.cmpi ule, %row, %pos7 : index
+              %scm7 = arith.select %live7, %sc7, %neg : f32
+              %mm7 = arith.select %mine, %scm7, %m7 : f32
+              scf.yield %mm0, %mm1, %mm2, %mm3, %mm4, %mm5, %mm6, %mm7 : f32, f32, f32, f32, f32, f32, f32, f32
+            }
+            %act0 = arith.cmpi ult, %ic, %chunks0 : index
+            %u0:4 = scf.if %act0 -> (f32, f32, vector<4xf32>, f32) {
+              %bm0 = gpu.subgroup_reduce maxnumf %my#0 : (f32) -> f32
+              %Mn0 = arith.maxnumf %M0, %bm0 : f32
+              %dm0 = arith.subf %M0, %Mn0 : f32
+              %ms0 = math.exp %dm0 : f32
+              %dp0 = arith.subf %my#0, %Mn0 : f32
+              %p0 = math.exp %dp0 : f32
+              %bs0 = gpu.subgroup_reduce add %p0 : (f32) -> f32
+              %Ss0 = arith.mulf %S0, %ms0 : f32
+              %Sn0 = arith.addf %Ss0, %bs0 : f32
+              %msv0 = vector.broadcast %ms0 : f32 to vector<4xf32>
+              %ox0 = arith.mulf %o0, %msv0 : vector<4xf32>
+              scf.yield %Mn0, %Sn0, %ox0, %p0 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M0, %S0, %o0, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act1 = arith.cmpi ult, %ic, %chunks1 : index
+            %u1:4 = scf.if %act1 -> (f32, f32, vector<4xf32>, f32) {
+              %bm1 = gpu.subgroup_reduce maxnumf %my#1 : (f32) -> f32
+              %Mn1 = arith.maxnumf %M1, %bm1 : f32
+              %dm1 = arith.subf %M1, %Mn1 : f32
+              %ms1 = math.exp %dm1 : f32
+              %dp1 = arith.subf %my#1, %Mn1 : f32
+              %p1 = math.exp %dp1 : f32
+              %bs1 = gpu.subgroup_reduce add %p1 : (f32) -> f32
+              %Ss1 = arith.mulf %S1, %ms1 : f32
+              %Sn1 = arith.addf %Ss1, %bs1 : f32
+              %msv1 = vector.broadcast %ms1 : f32 to vector<4xf32>
+              %ox1 = arith.mulf %o1, %msv1 : vector<4xf32>
+              scf.yield %Mn1, %Sn1, %ox1, %p1 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M1, %S1, %o1, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act2 = arith.cmpi ult, %ic, %chunks2 : index
+            %u2:4 = scf.if %act2 -> (f32, f32, vector<4xf32>, f32) {
+              %bm2 = gpu.subgroup_reduce maxnumf %my#2 : (f32) -> f32
+              %Mn2 = arith.maxnumf %M2, %bm2 : f32
+              %dm2 = arith.subf %M2, %Mn2 : f32
+              %ms2 = math.exp %dm2 : f32
+              %dp2 = arith.subf %my#2, %Mn2 : f32
+              %p2 = math.exp %dp2 : f32
+              %bs2 = gpu.subgroup_reduce add %p2 : (f32) -> f32
+              %Ss2 = arith.mulf %S2, %ms2 : f32
+              %Sn2 = arith.addf %Ss2, %bs2 : f32
+              %msv2 = vector.broadcast %ms2 : f32 to vector<4xf32>
+              %ox2 = arith.mulf %o2, %msv2 : vector<4xf32>
+              scf.yield %Mn2, %Sn2, %ox2, %p2 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M2, %S2, %o2, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act3 = arith.cmpi ult, %ic, %chunks3 : index
+            %u3:4 = scf.if %act3 -> (f32, f32, vector<4xf32>, f32) {
+              %bm3 = gpu.subgroup_reduce maxnumf %my#3 : (f32) -> f32
+              %Mn3 = arith.maxnumf %M3, %bm3 : f32
+              %dm3 = arith.subf %M3, %Mn3 : f32
+              %ms3 = math.exp %dm3 : f32
+              %dp3 = arith.subf %my#3, %Mn3 : f32
+              %p3 = math.exp %dp3 : f32
+              %bs3 = gpu.subgroup_reduce add %p3 : (f32) -> f32
+              %Ss3 = arith.mulf %S3, %ms3 : f32
+              %Sn3 = arith.addf %Ss3, %bs3 : f32
+              %msv3 = vector.broadcast %ms3 : f32 to vector<4xf32>
+              %ox3 = arith.mulf %o3, %msv3 : vector<4xf32>
+              scf.yield %Mn3, %Sn3, %ox3, %p3 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M3, %S3, %o3, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act4 = arith.cmpi ult, %ic, %chunks4 : index
+            %u4:4 = scf.if %act4 -> (f32, f32, vector<4xf32>, f32) {
+              %bm4 = gpu.subgroup_reduce maxnumf %my#4 : (f32) -> f32
+              %Mn4 = arith.maxnumf %M4, %bm4 : f32
+              %dm4 = arith.subf %M4, %Mn4 : f32
+              %ms4 = math.exp %dm4 : f32
+              %dp4 = arith.subf %my#4, %Mn4 : f32
+              %p4 = math.exp %dp4 : f32
+              %bs4 = gpu.subgroup_reduce add %p4 : (f32) -> f32
+              %Ss4 = arith.mulf %S4, %ms4 : f32
+              %Sn4 = arith.addf %Ss4, %bs4 : f32
+              %msv4 = vector.broadcast %ms4 : f32 to vector<4xf32>
+              %ox4 = arith.mulf %o4, %msv4 : vector<4xf32>
+              scf.yield %Mn4, %Sn4, %ox4, %p4 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M4, %S4, %o4, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act5 = arith.cmpi ult, %ic, %chunks5 : index
+            %u5:4 = scf.if %act5 -> (f32, f32, vector<4xf32>, f32) {
+              %bm5 = gpu.subgroup_reduce maxnumf %my#5 : (f32) -> f32
+              %Mn5 = arith.maxnumf %M5, %bm5 : f32
+              %dm5 = arith.subf %M5, %Mn5 : f32
+              %ms5 = math.exp %dm5 : f32
+              %dp5 = arith.subf %my#5, %Mn5 : f32
+              %p5 = math.exp %dp5 : f32
+              %bs5 = gpu.subgroup_reduce add %p5 : (f32) -> f32
+              %Ss5 = arith.mulf %S5, %ms5 : f32
+              %Sn5 = arith.addf %Ss5, %bs5 : f32
+              %msv5 = vector.broadcast %ms5 : f32 to vector<4xf32>
+              %ox5 = arith.mulf %o5, %msv5 : vector<4xf32>
+              scf.yield %Mn5, %Sn5, %ox5, %p5 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M5, %S5, %o5, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act6 = arith.cmpi ult, %ic, %chunks6 : index
+            %u6:4 = scf.if %act6 -> (f32, f32, vector<4xf32>, f32) {
+              %bm6 = gpu.subgroup_reduce maxnumf %my#6 : (f32) -> f32
+              %Mn6 = arith.maxnumf %M6, %bm6 : f32
+              %dm6 = arith.subf %M6, %Mn6 : f32
+              %ms6 = math.exp %dm6 : f32
+              %dp6 = arith.subf %my#6, %Mn6 : f32
+              %p6 = math.exp %dp6 : f32
+              %bs6 = gpu.subgroup_reduce add %p6 : (f32) -> f32
+              %Ss6 = arith.mulf %S6, %ms6 : f32
+              %Sn6 = arith.addf %Ss6, %bs6 : f32
+              %msv6 = vector.broadcast %ms6 : f32 to vector<4xf32>
+              %ox6 = arith.mulf %o6, %msv6 : vector<4xf32>
+              scf.yield %Mn6, %Sn6, %ox6, %p6 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M6, %S6, %o6, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %act7 = arith.cmpi ult, %ic, %chunks7 : index
+            %u7:4 = scf.if %act7 -> (f32, f32, vector<4xf32>, f32) {
+              %bm7 = gpu.subgroup_reduce maxnumf %my#7 : (f32) -> f32
+              %Mn7 = arith.maxnumf %M7, %bm7 : f32
+              %dm7 = arith.subf %M7, %Mn7 : f32
+              %ms7 = math.exp %dm7 : f32
+              %dp7 = arith.subf %my#7, %Mn7 : f32
+              %p7 = math.exp %dp7 : f32
+              %bs7 = gpu.subgroup_reduce add %p7 : (f32) -> f32
+              %Ss7 = arith.mulf %S7, %ms7 : f32
+              %Sn7 = arith.addf %Ss7, %bs7 : f32
+              %msv7 = vector.broadcast %ms7 : f32 to vector<4xf32>
+              %ox7 = arith.mulf %o7, %msv7 : vector<4xf32>
+              scf.yield %Mn7, %Sn7, %ox7, %p7 : f32, f32, vector<4xf32>, f32
+            } else {
+              scf.yield %M7, %S7, %o7, %zero : f32, f32, vector<4xf32>, f32
+            }
+            %ov:8 = scf.for %cc = %c0 to %c32 step %c1 iter_args(%oa0 = %u0#2, %oa1 = %u1#2, %oa2 = %u2#2, %oa3 = %u3#2, %oa4 = %u4#2, %oa5 = %u5#2, %oa6 = %u6#2, %oa7 = %u7#2) -> (vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>) {
+              %row = arith.addi %r0, %cc : index
+              %rowc = arith.minui %row, %pos7 : index
+              %vh = vector.load %v[%rowc, %kd] {alignment = 8} : memref<?x?xf16, strided<[?, 1]>>, vector<4xf16>
+              %vf = arith.extf %vh : vector<4xf16> to vector<4xf32>
+              %cci = arith.index_cast %cc : index to i32
+              %pc0, %pv0 = gpu.shuffle idx %u0#3, %cci, %c32i : f32
+              %pcv0 = vector.broadcast %pc0 : f32 to vector<4xf32>
+              %on0 = vector.fma %vf, %pcv0, %oa0 : vector<4xf32>
+              %pc1, %pv1 = gpu.shuffle idx %u1#3, %cci, %c32i : f32
+              %pcv1 = vector.broadcast %pc1 : f32 to vector<4xf32>
+              %on1 = vector.fma %vf, %pcv1, %oa1 : vector<4xf32>
+              %pc2, %pv2 = gpu.shuffle idx %u2#3, %cci, %c32i : f32
+              %pcv2 = vector.broadcast %pc2 : f32 to vector<4xf32>
+              %on2 = vector.fma %vf, %pcv2, %oa2 : vector<4xf32>
+              %pc3, %pv3 = gpu.shuffle idx %u3#3, %cci, %c32i : f32
+              %pcv3 = vector.broadcast %pc3 : f32 to vector<4xf32>
+              %on3 = vector.fma %vf, %pcv3, %oa3 : vector<4xf32>
+              %pc4, %pv4 = gpu.shuffle idx %u4#3, %cci, %c32i : f32
+              %pcv4 = vector.broadcast %pc4 : f32 to vector<4xf32>
+              %on4 = vector.fma %vf, %pcv4, %oa4 : vector<4xf32>
+              %pc5, %pv5 = gpu.shuffle idx %u5#3, %cci, %c32i : f32
+              %pcv5 = vector.broadcast %pc5 : f32 to vector<4xf32>
+              %on5 = vector.fma %vf, %pcv5, %oa5 : vector<4xf32>
+              %pc6, %pv6 = gpu.shuffle idx %u6#3, %cci, %c32i : f32
+              %pcv6 = vector.broadcast %pc6 : f32 to vector<4xf32>
+              %on6 = vector.fma %vf, %pcv6, %oa6 : vector<4xf32>
+              %pc7, %pv7 = gpu.shuffle idx %u7#3, %cci, %c32i : f32
+              %pcv7 = vector.broadcast %pc7 : f32 to vector<4xf32>
+              %on7 = vector.fma %vf, %pcv7, %oa7 : vector<4xf32>
+              scf.yield %on0, %on1, %on2, %on3, %on4, %on5, %on6, %on7 : vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>, vector<4xf32>
+            }
+            scf.yield %u0#0, %u0#1, %ov#0, %u1#0, %u1#1, %ov#1, %u2#0, %u2#1, %ov#2, %u3#0, %u3#1, %ov#3, %u4#0, %u4#1, %ov#4, %u5#0, %u5#1, %ov#5, %u6#0, %u6#1, %ov#6, %u7#0, %u7#1, %ov#7 : f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>, f32, f32, vector<4xf32>
+          }
+          %lane0 = arith.cmpi eq, %l, %c0 : index
+          %base0 = arith.muli %qt0, %c132 : index
+          %at0 = arith.addi %base0, %l4 : index
+          vector.store %st#2, %part[%hi, %wi, %at0] : memref<?x?x?xf32>, vector<4xf32>
+          %am0 = arith.addi %base0, %c128 : index
+          %as0 = arith.addi %base0, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#0, %part[%hi, %wi, %am0] : memref<?x?x?xf32>
+            memref.store %st#1, %part[%hi, %wi, %as0] : memref<?x?x?xf32>
+          }
+          %base1 = arith.muli %qt1, %c132 : index
+          %at1 = arith.addi %base1, %l4 : index
+          vector.store %st#5, %part[%hi, %wi, %at1] : memref<?x?x?xf32>, vector<4xf32>
+          %am1 = arith.addi %base1, %c128 : index
+          %as1 = arith.addi %base1, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#3, %part[%hi, %wi, %am1] : memref<?x?x?xf32>
+            memref.store %st#4, %part[%hi, %wi, %as1] : memref<?x?x?xf32>
+          }
+          %base2 = arith.muli %qt2, %c132 : index
+          %at2 = arith.addi %base2, %l4 : index
+          vector.store %st#8, %part[%hi, %wi, %at2] : memref<?x?x?xf32>, vector<4xf32>
+          %am2 = arith.addi %base2, %c128 : index
+          %as2 = arith.addi %base2, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#6, %part[%hi, %wi, %am2] : memref<?x?x?xf32>
+            memref.store %st#7, %part[%hi, %wi, %as2] : memref<?x?x?xf32>
+          }
+          %base3 = arith.muli %qt3, %c132 : index
+          %at3 = arith.addi %base3, %l4 : index
+          vector.store %st#11, %part[%hi, %wi, %at3] : memref<?x?x?xf32>, vector<4xf32>
+          %am3 = arith.addi %base3, %c128 : index
+          %as3 = arith.addi %base3, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#9, %part[%hi, %wi, %am3] : memref<?x?x?xf32>
+            memref.store %st#10, %part[%hi, %wi, %as3] : memref<?x?x?xf32>
+          }
+          %base4 = arith.muli %qt4, %c132 : index
+          %at4 = arith.addi %base4, %l4 : index
+          vector.store %st#14, %part[%hi, %wi, %at4] : memref<?x?x?xf32>, vector<4xf32>
+          %am4 = arith.addi %base4, %c128 : index
+          %as4 = arith.addi %base4, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#12, %part[%hi, %wi, %am4] : memref<?x?x?xf32>
+            memref.store %st#13, %part[%hi, %wi, %as4] : memref<?x?x?xf32>
+          }
+          %base5 = arith.muli %qt5, %c132 : index
+          %at5 = arith.addi %base5, %l4 : index
+          vector.store %st#17, %part[%hi, %wi, %at5] : memref<?x?x?xf32>, vector<4xf32>
+          %am5 = arith.addi %base5, %c128 : index
+          %as5 = arith.addi %base5, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#15, %part[%hi, %wi, %am5] : memref<?x?x?xf32>
+            memref.store %st#16, %part[%hi, %wi, %as5] : memref<?x?x?xf32>
+          }
+          %base6 = arith.muli %qt6, %c132 : index
+          %at6 = arith.addi %base6, %l4 : index
+          vector.store %st#20, %part[%hi, %wi, %at6] : memref<?x?x?xf32>, vector<4xf32>
+          %am6 = arith.addi %base6, %c128 : index
+          %as6 = arith.addi %base6, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#18, %part[%hi, %wi, %am6] : memref<?x?x?xf32>
+            memref.store %st#19, %part[%hi, %wi, %as6] : memref<?x?x?xf32>
+          }
+          %base7 = arith.muli %qt7, %c132 : index
+          %at7 = arith.addi %base7, %l4 : index
+          vector.store %st#23, %part[%hi, %wi, %at7] : memref<?x?x?xf32>, vector<4xf32>
+          %am7 = arith.addi %base7, %c128 : index
+          %as7 = arith.addi %base7, %c129 : index
+          scf.if %lane0 {
+            memref.store %st#21, %part[%hi, %wi, %am7] : memref<?x?x?xf32>
+            memref.store %st#22, %part[%hi, %wi, %as7] : memref<?x?x?xf32>
+          }
+          macro.yield %h : i32
+        };
+      }
+    }
+  }
+  return;
+}
+
+/// `vec_attention_merge` for queries t0 to t0 + n - 1, whose parts are at part[h][w][132 t ..]: out[t][h]
+/// gets the attention of head h of query t.
+fn round_attention_merge(out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, part : &Tensor<f32, [?, ?, ?], Memory::HBM>, parts : i32, t0 : i32, n : i32, q_heads : i32) -> void {
+  spawn on(Topology::Device) {
+    for i in 0..n across blocks {
+      for h in 0..q_heads across blocks {
+        let t = t0 + i;
+        let _d = mlir!( threads : 128, inputs : (%out = out : memref<?x?x?xf32>, %part = part : memref<?x?x?xf32>, %parts = parts : i32, %h = h : i32, %t = t : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(part), writes_only(out[t][h])]) {
+          %c0 = arith.constant 0 : index
+          %c1 = arith.constant 1 : index
+          %c2 = arith.constant 2 : index
+          %c3 = arith.constant 3 : index
+          %c4 = arith.constant 4 : index
+          %c16 = arith.constant 16 : index
+          %c32 = arith.constant 32 : index
+          %c64 = arith.constant 64 : index
+          %c96 = arith.constant 96 : index
+          %c128 = arith.constant 128 : index
+          %c129 = arith.constant 129 : index
+          %c132 = arith.constant 132 : index
+          %neg = arith.constant -3.0e38 : f32
+          %zero = arith.constant 0.0 : f32
+          %one = arith.constant 1.0 : f32
+          %tid = gpu.thread_id x
+          %sg = arith.divui %tid, %c32 : index
+          %l = arith.remui %tid, %c32 : index
+          %hi = arith.index_cast %h : i32 to index
+          %ti = arith.index_cast %t : i32 to index
+          %base = arith.muli %ti, %c132 : index
+          %bm = arith.addi %base, %c128 : index
+          %bs = arith.addi %base, %c129 : index
+          %np = arith.index_cast %parts : i32 to index
+          %last = arith.subi %np, %c1 : index
+          %p0 = arith.addi %l, %c0 : index
+          %live0 = arith.cmpi ult, %p0, %np : index
+          %pc0 = arith.minui %p0, %last : index
+          %mr0 = memref.load %part[%hi, %pc0, %bm] : memref<?x?x?xf32>
+          %m0 = arith.select %live0, %mr0, %neg : f32
+          %p1 = arith.addi %l, %c32 : index
+          %live1 = arith.cmpi ult, %p1, %np : index
+          %pc1 = arith.minui %p1, %last : index
+          %mr1 = memref.load %part[%hi, %pc1, %bm] : memref<?x?x?xf32>
+          %m1 = arith.select %live1, %mr1, %neg : f32
+          %p2 = arith.addi %l, %c64 : index
+          %live2 = arith.cmpi ult, %p2, %np : index
+          %pc2 = arith.minui %p2, %last : index
+          %mr2 = memref.load %part[%hi, %pc2, %bm] : memref<?x?x?xf32>
+          %m2 = arith.select %live2, %mr2, %neg : f32
+          %p3 = arith.addi %l, %c96 : index
+          %live3 = arith.cmpi ult, %p3, %np : index
+          %pc3 = arith.minui %p3, %last : index
+          %mr3 = memref.load %part[%hi, %pc3, %bm] : memref<?x?x?xf32>
+          %m3 = arith.select %live3, %mr3, %neg : f32
+          %m01 = arith.maxnumf %m0, %m1 : f32
+          %m23 = arith.maxnumf %m2, %m3 : f32
+          %mx = arith.maxnumf %m01, %m23 : f32
+          %big = gpu.subgroup_reduce maxnumf %mx : (f32) -> f32
+          %dm0 = arith.subf %m0, %big : f32
+          %w0 = math.exp %dm0 : f32
+          %s0 = memref.load %part[%hi, %pc0, %bs] : memref<?x?x?xf32>
+          %ws0 = arith.mulf %w0, %s0 : f32
+          %wv0 = vector.broadcast %w0 : f32 to vector<4xf32>
+          %dm1 = arith.subf %m1, %big : f32
+          %w1 = math.exp %dm1 : f32
+          %s1 = memref.load %part[%hi, %pc1, %bs] : memref<?x?x?xf32>
+          %ws1 = arith.mulf %w1, %s1 : f32
+          %wv1 = vector.broadcast %w1 : f32 to vector<4xf32>
+          %dm2 = arith.subf %m2, %big : f32
+          %w2 = math.exp %dm2 : f32
+          %s2 = memref.load %part[%hi, %pc2, %bs] : memref<?x?x?xf32>
+          %ws2 = arith.mulf %w2, %s2 : f32
+          %wv2 = vector.broadcast %w2 : f32 to vector<4xf32>
+          %dm3 = arith.subf %m3, %big : f32
+          %w3 = math.exp %dm3 : f32
+          %s3 = memref.load %part[%hi, %pc3, %bs] : memref<?x?x?xf32>
+          %ws3 = arith.mulf %w3, %s3 : f32
+          %wv3 = vector.broadcast %w3 : f32 to vector<4xf32>
+          %t01 = arith.addf %ws0, %ws1 : f32
+          %t23 = arith.addf %ws2, %ws3 : f32
+          %ts = arith.addf %t01, %t23 : f32
+          %total = gpu.subgroup_reduce add %ts : (f32) -> f32
+          %inv = arith.divf %one, %total : f32
+          %lane0 = arith.cmpi eq, %l, %c0 : index
+          %sg4 = arith.muli %sg, %c4 : index
+          %vz4 = arith.constant dense<0.0> : vector<4xf32>
+          scf.for %n = %c0 to %c128 step %c16 {
+            %d = arith.addi %n, %sg4 : index
+            %pd = arith.addi %base, %d : index
+            %x0 = vector.load %part[%hi, %pc0, %pd] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+            %a0 = vector.fma %x0, %wv0, %vz4 : vector<4xf32>
+            %x1 = vector.load %part[%hi, %pc1, %pd] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+            %a1 = vector.fma %x1, %wv1, %a0 : vector<4xf32>
+            %x2 = vector.load %part[%hi, %pc2, %pd] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+            %a2 = vector.fma %x2, %wv2, %a1 : vector<4xf32>
+            %x3 = vector.load %part[%hi, %pc3, %pd] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+            %a3 = vector.fma %x3, %wv3, %a2 : vector<4xf32>
+            %e0 = vector.extract %a3[0] : f32 from vector<4xf32>
+            %r0 = gpu.subgroup_reduce add %e0 : (f32) -> f32
+            %o0 = arith.mulf %r0, %inv : f32
+            %e1 = vector.extract %a3[1] : f32 from vector<4xf32>
+            %r1 = gpu.subgroup_reduce add %e1 : (f32) -> f32
+            %o1 = arith.mulf %r1, %inv : f32
+            %e2 = vector.extract %a3[2] : f32 from vector<4xf32>
+            %r2 = gpu.subgroup_reduce add %e2 : (f32) -> f32
+            %o2 = arith.mulf %r2, %inv : f32
+            %e3 = vector.extract %a3[3] : f32 from vector<4xf32>
+            %r3 = gpu.subgroup_reduce add %e3 : (f32) -> f32
+            %o3 = arith.mulf %r3, %inv : f32
+            scf.if %lane0 {
+              %d0 = arith.addi %d, %c0 : index
+              memref.store %o0, %out[%ti, %hi, %d0] : memref<?x?x?xf32>
+              %d1 = arith.addi %d, %c1 : index
+              memref.store %o1, %out[%ti, %hi, %d1] : memref<?x?x?xf32>
+              %d2 = arith.addi %d, %c2 : index
+              memref.store %o2, %out[%ti, %hi, %d2] : memref<?x?x?xf32>
+              %d3 = arith.addi %d, %c3 : index
+              memref.store %o3, %out[%ti, %hi, %d3] : memref<?x?x?xf32>
+            }
+          }
+          macro.yield %h : i32
+        };
+      }
+    }
+  }
+  return;
+}
