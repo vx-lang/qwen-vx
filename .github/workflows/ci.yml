@@ -23,7 +23,7 @@ jobs:
 
       - name: Install Vx
         run: |
-          brew install --quiet z3
+          brew install --quiet llvm@22 z3
           curl -fsSL https://vxlang.org/install.sh | VX_NO_MODIFY_PATH=1 sh
           ~/.vx/current/bin/vxc --version
 
