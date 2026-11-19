@@ -1,5 +1,5 @@
-# Runs the tests with a released Vx toolchain. The GitHub runner has no Apple GPU, so the Vx
-# program runs on the CPU, as on any computer without one.
+# Runs the tests with a released Vx toolchain on an Apple silicon runner, because the `mlir!`
+# blocks with `threads` of the program run only on a GPU.
 name: CI
 
 on:
@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-24.04
+    runs-on: macos-15
     # A run takes 5 to 8 minutes. A test that hangs stops here, not at the limit of 6 hours.
     timeout-minutes: 30
     env:
@@ -23,8 +23,7 @@ jobs:
 
       - name: Install Vx
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq z3
+          brew install --quiet llvm@22 z3
           curl -fsSL https://vxlang.org/install.sh | VX_NO_MODIFY_PATH=1 sh
           ~/.vx/current/bin/vxc --version
 
