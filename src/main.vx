@@ -244,7 +244,17 @@ fn generate_with_drafts(w : &Weights, s : &mut State, t : &Tokenizer, text_mode 
   }
   let _ready = transfer(&r.next, Memory::CPU_DRAM);
   *start = Instant::now();
-  let mut next = transfer(Tensor<i32>([1]), Memory::HBM);
+  // The tokens of a run of plain steps: token j is in ring[j].
+  let mut ring = Vec<Slot>::new();
+  for j in 0..AHEAD {
+    ring.push(Slot {
+      next: transfer(Tensor<i32>([1]), Memory::HBM),
+    });
+  }
+  // The length of the next run of plain steps: 1 after a round, then 2, 4 and up to AHEAD while
+  // no draft comes up. The GPU runs the tokens of a run before the CPU reads them. Lines mode
+  // prints the logit of each token, so it reads each one.
+  let mut run = 1;
   let mut context = Vec<i32>::new();
   for i in 0..prompt.len() {
     context.push(prompt[i]);
@@ -274,18 +284,36 @@ fn generate_with_drafts(w : &Weights, s : &mut State, t : &Tokenizer, text_mode 
     let draft = tokens_after(&context, m.end, k);
     k = draft.len();
     if k == 0 {
-      // A plain step, with the kernels of one token.
+      // Plain steps, with the kernels of one token each.
+      let mut n = 1;
+      if text_mode {
+        n = i32::min(run, room);
+      }
       let mut h = Tensor<i32>([1]);
       h[0] = token;
       let input = transfer(h, Memory::HBM);
       run_layers(w, s, &input, pos);
-      predict(w, s, &mut next);
-      token = read_token(&next);
-      context.push(token);
-      step = step + 1;
-      pos = pos + 1;
-      going = show(t, w, text_mode, step, token, read_logit(&s.logits, token));
+      predict(w, s, &mut ring[0].next);
+      for j in 1..n {
+        run_layers(w, s, &ring[j - 1].next, pos + j);
+        predict(w, s, &mut ring[j].next);
+      }
+      let mut j = 0;
+      while j < n && going {
+        token = read_token(&ring[j].next);
+        context.push(token);
+        step = step + 1;
+        pos = pos + 1;
+        let mut logit : f32 = 0.0;
+        if !text_mode {
+          logit = read_logit(&s.logits, token);
+        }
+        going = show(t, w, text_mode, step, token, logit);
+        j = j + 1;
+      }
+      run = i32::min(run * 2, AHEAD);
     } else {
+      run = 1;
       let mut inputs = Vec<i32>::new();
       inputs.push(token);
       for i in 0..k {
