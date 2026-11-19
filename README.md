@@ -95,6 +95,13 @@ pip install numpy tokenizers huggingface_hub
        --tokenizer qwen.vxt --chat --prompt "Write a C++ function that reverses a string." --steps 300
    ```
 
+   With `--draft 7`, the program checks drafts from the context: the tokens after the longest
+   earlier match of the last tokens. When the model keeps a draft, several tokens come from one
+   read of the weights, and the text is the same as without `--draft`. This helps most when the
+   reply repeats the prompt, as an edit of a file does: about 1.8 times as fast with the 30B
+   model (`docs/optimizations.md`, entry 14). It needs the 30B model in Q4_0 with the 6-bit
+   `lm_head` (`scripts/convert.py --q4 --q6-lm-head`), and `--steps` of at least 16.
+
 1. Generate a few tokens with the NumPy reference. It prints the prompt as token ids:
 
    ```sh
