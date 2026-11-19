@@ -20,7 +20,7 @@ changed, its measurements, and the changes that did not help.
 
 ## Install Vx
 
-The program needs Vx v0.0.4 or later:
+The program needs Vx v0.0.5 or later:
 
 ```sh
 curl -fsSL https://vxlang.org/install.sh | sh
