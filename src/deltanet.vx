@@ -73,15 +73,15 @@ fn deltanet_state(v_heads : i32) -> Tensor<f32, [?, ?, ?], Memory::HBM> {
 }
 
 /// The Gated DeltaNet of one token: `y` (v_heads x 128 values, the input of `linear_out`) from `proj`
-/// (the output of `linear_in`). z starts at `z_at` of `proj`, b at `b_at` and a at `a_at`. `conv` is
-/// [2 k_heads + v_heads, 4] times 128 channels, as [channel, tap], oldest tap first; `neg_a`,
-/// `dt_bias` have v_heads values, and `norm` 128.
-fn deltanet_step(y : &mut Tensor<f32, [?], Memory::HBM>, conv_state : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, state : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, t : &mut DeltaNetScratch, proj : &Tensor<f32, [?], Memory::HBM>, conv : &Tensor<f32, [?, ?], Memory::HBM>, neg_a : &Tensor<f32, [?], Memory::HBM>, dt_bias : &Tensor<f32, [?], Memory::HBM>, norm : &Tensor<f32, [?], Memory::HBM>, z_at : i32, b_at : i32, a_at : i32, k_heads : i32, v_heads : i32, eps : f32) -> void {
+/// (the output of `linear_in`). z starts at `z_at` of `proj`, b at `b_at` and a at `a_at`. `conv` has
+/// 4 taps for each of the (2 k_heads + v_heads) x 128 channels, channel c at 4 c, oldest tap
+/// first. `neg_a` and `dt_bias` have v_heads values, and `norm` 128.
+fn deltanet_step(y : &mut Tensor<f32, [?], Memory::HBM>, conv_state : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, state : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, t : &mut DeltaNetScratch, proj : &Tensor<f32, [?], Memory::HBM>, conv : &Tensor<f32, [?], Memory::HBM>, neg_a : &Tensor<f32, [?], Memory::HBM>, dt_bias : &Tensor<f32, [?], Memory::HBM>, norm : &Tensor<f32, [?], Memory::HBM>, z_at : i32, b_at : i32, a_at : i32, k_heads : i32, v_heads : i32, eps : f32) -> void {
   let channels = (2 * k_heads + v_heads) * 128;
   assert(k_heads > 0 && v_heads % k_heads == 0 && v_heads <= 64, "deltanet_step: v_heads must be a multiple of k_heads, and at most 64");
   assert(conv_state.extent(0) == 2 * k_heads + v_heads && conv_state.extent(1) == 128 && conv_state.extent(2) == 3, "deltanet_step: conv_state must be [2 k_heads + v_heads, 128, 3]");
   assert(state.extent(0) == v_heads && state.extent(1) == 128 && state.extent(2) == 128, "deltanet_step: state must be [v_heads, 128, 128]");
-  assert(conv.extent(0) == channels && conv.extent(1) == 4, "deltanet_step: conv must be [channels, 4]");
+  assert(conv.len() == channels * 4, "deltanet_step: conv must have 4 taps for each channel");
   assert(proj.len() >= channels && proj.len() >= z_at + v_heads * 128 && proj.len() >= b_at + v_heads && proj.len() >= a_at + v_heads, "deltanet_step: proj is too short for its offsets");
   assert(neg_a.len() >= v_heads && dt_bias.len() >= v_heads && norm.len() >= 128 && y.len() >= v_heads * 128, "deltanet_step: a tensor is too short");
   deltanet_conv(&mut t.q, &mut t.k, &mut t.v, conv_state, proj, conv, k_heads, v_heads);
@@ -94,7 +94,7 @@ fn deltanet_step(y : &mut Tensor<f32, [?], Memory::HBM>, conv_state : &mut Tenso
 /// The convolution and the SiLU of q, k and v, and the L2 norms of q and k. Block h does the 128
 /// channels of one head: heads 0 to k_heads - 1 of q, then those of k, then those of v. The channels
 /// of `proj` are in the same order, so channel i of block h is h * 128 + i.
-fn deltanet_conv(qn : &mut Tensor<f32, [?, ?], Memory::HBM>, kn : &mut Tensor<f32, [?, ?], Memory::HBM>, vv : &mut Tensor<f32, [?, ?], Memory::HBM>, conv_state : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, proj : &Tensor<f32, [?], Memory::HBM>, conv : &Tensor<f32, [?, ?], Memory::HBM>, k_heads : i32, v_heads : i32) -> void {
+fn deltanet_conv(qn : &mut Tensor<f32, [?, ?], Memory::HBM>, kn : &mut Tensor<f32, [?, ?], Memory::HBM>, vv : &mut Tensor<f32, [?, ?], Memory::HBM>, conv_state : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, proj : &Tensor<f32, [?], Memory::HBM>, conv : &Tensor<f32, [?], Memory::HBM>, k_heads : i32, v_heads : i32) -> void {
   spawn on(Topology::Device) {
     for h in 0..2 * k_heads + v_heads across blocks {
       let mut y = unsafe { Tensor<f32, [128], Memory::SMEM>::uninit() };
@@ -105,7 +105,7 @@ fn deltanet_conv(qn : &mut Tensor<f32, [?, ?], Memory::HBM>, kn : &mut Tensor<f3
         let x1 = conv_state[h][i][1];
         let x2 = conv_state[h][i][2];
         let x3 = proj[c];
-        let a = conv[c][0] * x0 + conv[c][1] * x1 + conv[c][2] * x2 + conv[c][3] * x3;
+        let a = conv[c * 4] * x0 + conv[c * 4 + 1] * x1 + conv[c * 4 + 2] * x2 + conv[c * 4 + 3] * x3;
         let s = a / (1.0 + (0.0 - a).fast_exp());
         conv_state[h][i][0] = x1;
         conv_state[h][i][1] = x2;
