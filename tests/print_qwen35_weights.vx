@@ -1,0 +1,176 @@
+// Loads the weight file of a Qwen3.5 MoE model (arch 1, format version 2) into GPU memory, copies
+// each tensor back, and prints its first codes and the sum of all its codes, as
+// print_weights.vx does for the older models. `reference.py --tensors` prints the same lines
+// from the file, so no output of `diff` means that each tensor reached GPU memory whole and in
+// the right place. The first line also gives the config of version 2. The tiny model is in bf16,
+// then in Q4_0 with a 6-bit lm_head.
+//
+// RUN: python3 %S/../scripts/make_tiny_model.py --qwen35 %t.vxw > /dev/null
+// RUN: vxc %s --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t.vxw | grep -v -e '^\[JIT\]' -e '^$' > %t.out
+// RUN: head -1 %t.out | FileCheck %s
+// RUN: python3 %S/../scripts/reference.py %t.vxw --tensors | diff - <(tail -n +2 %t.out)
+// RUN: python3 %S/../scripts/make_tiny_model.py --qwen35 --q4 --q6-lm-head %t-q4.vxw > /dev/null
+// RUN: vxc %s --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t-q4.vxw | grep -v -e '^\[JIT\]' -e '^$' > %t-q4.out
+// RUN: python3 %S/../scripts/reference.py %t-q4.vxw --tensors | diff - <(tail -n +2 %t-q4.out)
+//
+// CHECK: {{^}}arch=1 interval=4 k_heads=2 v_heads=4 k_dim=128 v_dim=128 conv=4 shared=128 rotary=64 full=3;{{$}}
+
+import qwen::weights;
+import core::num;
+import core::convert;
+
+/// The 16 bits of a bf16 value.
+fn code(v : bf16) -> u32 {
+  return (v as f32).to_bits() >> 16;
+}
+
+/// Prints `name count=N codes=a,b,c,d sum=S;`, with the first `shown` codes of `first`.
+fn print_line(name : *const i8, layer : i32, count : i64, first : &Tensor<u32, [?]>, shown : i32, sum : u64) -> void {
+  if layer >= 0 {
+    print!("layers.{}.", layer);
+  }
+  print!("{} count={} codes=", name, count);
+  for i in 0..shown {
+    if i > 0 {
+      print!(",");
+    }
+    print!("{}", first[i]);
+  }
+  println!(" sum={};", sum);
+  return;
+}
+
+/// The line of a tensor of bf16 values in GPU memory. A code is the 16 bits of a value.
+fn report(name : *const i8, layer : i32, t : &Tensor<bf16, [?], Memory::HBM>) -> void {
+  let h = transfer(t, Memory::CPU_DRAM);
+  let n = h.len();
+  let mut first = Tensor<u32>([4]);
+  let mut sum : u64 = 0;
+  for i in 0..n {
+    if i < 4 {
+      first[i] = code(h[i]);
+    }
+    sum = sum + u64::from(code(h[i]));
+  }
+  print_line(name, layer, i64::from(n), &first, i32::min(n, 4), sum);
+  return;
+}
+
+/// The line of a tensor of codes in GPU memory, 4 bytes in each u32 word: Q4_0 codes, two in each
+/// byte, or the high 2 bits of 6-bit codes, four in each byte. A code here is one byte.
+fn report_codes(name : *const i8, layer : i32, t : &Tensor<u32, [?], Memory::HBM>) -> void {
+  let h = transfer(t, Memory::CPU_DRAM);
+  let n = h.len();
+  let mut first = Tensor<u32>([4]);
+  for k in 0..4 {
+    first[k] = (h[0] >> ((8 * k) as u32)) & 255u32;
+  }
+  let mut sum : u64 = 0;
+  for i in 0..n {
+    let w = h[i];
+    sum = sum + u64::from((w & 255u32) + ((w >> 8u32) & 255u32) + ((w >> 16u32) & 255u32) + (w >> 24u32));
+  }
+  print_line(name, layer, 4 * i64::from(n), &first, 4, sum);
+  return;
+}
+
+/// The line of a tensor of f32 values in GPU memory. A code is the 32 bits of a value.
+fn report_f32(name : *const i8, layer : i32, t : &Tensor<f32, [?], Memory::HBM>) -> void {
+  let h = transfer(t, Memory::CPU_DRAM);
+  let n = h.len();
+  let mut first = Tensor<u32>([4]);
+  let mut sum : u64 = 0;
+  for i in 0..n {
+    if i < 4 {
+      first[i] = h[i].to_bits();
+    }
+    sum = sum + u64::from(h[i].to_bits());
+  }
+  print_line(name, layer, i64::from(n), &first, i32::min(n, 4), sum);
+  return;
+}
+
+/// The line of a tensor of f16 scales in GPU memory. A code is the 16 bits of a value.
+fn report_f16(name : *const i8, layer : i32, t : &Tensor<f16, [?], Memory::HBM>) -> void {
+  let h = transfer(t, Memory::CPU_DRAM);
+  let n = h.len();
+  // A plain host tensor, whose memory a pointer can read as u16 bits.
+  let mut plain = Tensor<f16>([n]);
+  for i in 0..n {
+    plain[i] = h[i];
+  }
+  let raw : *mut i8 = plain.as_mut_ptr();
+  let bits : *mut u16 = raw;
+  let mut first = Tensor<u32>([4]);
+  let mut sum : u64 = 0;
+  for i in 0..n {
+    let code = u32::from(unsafe { bits[i] });
+    if i < 4 {
+      first[i] = code;
+    }
+    sum = sum + u64::from(code);
+  }
+  print_line(name, layer, i64::from(n), &first, i32::min(n, 4), sum);
+  return;
+}
+
+/// The lines of a weight matrix, as the file has its tensors: bf16 values, Q4_0 codes and their
+/// scales, or the low 4 bits of 6-bit codes, their high 2 bits, and their scales.
+fn report_matrix(name : *const i8, high_name : *const i8, scale_name : *const i8, layer : i32, m : &WeightMatrix) -> void {
+  if m.dtype == U4 {
+    report_codes(name, layer, &m.codes);
+    report_f16(scale_name, layer, &m.group_scales);
+  } else if m.dtype == U6 {
+    report_codes(name, layer, &m.codes);
+    report_codes(high_name, layer, &m.high);
+    report_f16(scale_name, layer, &m.group_scales);
+  } else {
+    assert(m.dtype == BF16, "the tiny Qwen3.5 files have no fp8 matrices");
+    report(name, layer, &m.bf16);
+  }
+  return;
+}
+
+fn main(argc : i32, argv : *mut *mut i8) -> i32 {
+  assert(argc == 2, "give the weight file as the only argument");
+  let arch = weight_file_arch(unsafe { argv[1] });
+  let w = load_qwen35_weights(unsafe { argv[1] });
+  let c = &w.config;
+  let mut full = 0;
+  for l in 0..c.num_layers {
+    if w.layers[l].full_attention {
+      full = full + l;
+    }
+  }
+  println!("arch={} interval={} k_heads={} v_heads={} k_dim={} v_dim={} conv={} shared={} rotary={} full={};",
+    arch, c.full_attention_interval, c.linear_k_heads, c.linear_v_heads, c.linear_k_dim, c.linear_v_dim, c.conv_width,
+    c.shared_expert_inter, c.rotary_dim, full);
+  println!("config hidden={} layers={} vocab={};", c.hidden_size, c.num_layers, c.vocab_size);
+  report("embed", -1, &w.embed);
+  for l in 0..c.num_layers {
+    let layer = &w.layers[l];
+    report_f32("attn_norm", l, &layer.attn_norm);
+    if layer.full_attention {
+      report_matrix("qkv", "qkv.high", "qkv.scale", l, &layer.qkv);
+      report_f32("q_norm", l, &layer.q_norm);
+      report_f32("k_norm", l, &layer.k_norm);
+      report_matrix("attn_out", "attn_out.high", "attn_out.scale", l, &layer.attn_out);
+    } else {
+      report_matrix("linear_in", "linear_in.high", "linear_in.scale", l, &layer.linear_in);
+      report_f32("conv", l, &layer.conv);
+      report_f32("neg_A", l, &layer.neg_a);
+      report_f32("dt_bias", l, &layer.dt_bias);
+      report_f32("linear_norm", l, &layer.linear_norm);
+      report_matrix("linear_out", "linear_out.high", "linear_out.scale", l, &layer.linear_out);
+    }
+    report_f32("mlp_norm", l, &layer.mlp_norm);
+    report("router", l, &layer.router);
+    report_matrix("experts_gate_up", "experts_gate_up.high", "experts_gate_up.scale", l, &layer.gate_up);
+    report_matrix("experts_down", "experts_down.high", "experts_down.scale", l, &layer.down);
+    report_matrix("shared_gate_up", "shared_gate_up.high", "shared_gate_up.scale", l, &layer.shared_gate_up);
+    report_matrix("shared_down", "shared_down.high", "shared_down.scale", l, &layer.shared_down);
+  }
+  report_f32("final_norm", -1, &w.final_norm);
+  report_matrix("lm_head", "lm_head.high", "lm_head.scale", -1, &w.lm_head);
+  return 0;
+}
