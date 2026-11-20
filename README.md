@@ -149,6 +149,10 @@ of Qwen3-Coder-30B-A3B.
 | `scripts/test_tokenizer.py` | Compares the tokenizer in Vx with the `tokenizers` package. |
 | `scripts/chat.py` | Chats with a model through a session, with a cache of the system prompt. |
 | `scripts/make_vx_guides.py` | Makes the guides of `docs/vx-guides` from the Vx book. |
+| `scripts/make_draft_prompts.py` | Writes the 12 code prompts that measure decoding with drafts. |
+| `scripts/record_experts.cpp` | Records the greedy output and the experts of every position, with llama.cpp. Its first comment says how to build it. |
+| `scripts/simulate_drafts.py` | Replays the recorded outputs as rounds of decoding with drafts, and estimates the speedup of each draft policy. |
+| `scripts/test_simulate_drafts.py` | Tests `simulate_drafts.py`. |
 
 [`examples/`](examples/README.md) asks the 30B model for programs in Rust, C++ and Python. It
 compiles each one and checks its output.
