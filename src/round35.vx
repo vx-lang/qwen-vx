@@ -1,0 +1,727 @@
+//===- round35.vx - Qwen app ------------------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// A round of a Qwen3.5 or Qwen3.6 model (arch 1, #89): n positions in a row, start to
+// start + n - 1, with one read of the weights, as `run_round` (src/speculate.vx) for arch 0. Each
+// position gets the result of the kernels of a generated token (src/qwen35.vx) bit for bit, so a
+// round gives the tokens that plain decoding gives.
+//
+// The state of a DeltaNet layer is the problem: a token changes S and the last 3 inputs of the
+// convolution, and a round does not know which of its positions it keeps until the CPU reads the
+// tokens. So a round reads S and the convolution inputs and writes neither. It keeps the q, k, v,
+// beta and decay of each position, and the outputs of `linear_in`. Then `commit_round35` runs the
+// update of the state again for the positions that the CPU keeps, and writes it. That costs one
+// more read of S for each round, about 2 MB for each layer.
+//
+// The full attention layers run the kernels of one token for each position, in order, so each
+// position sees the rows of the KV cache that the positions before it wrote. The KV cache keeps
+// the rows of all n positions; the next round or step writes over the rows that the CPU does not
+// keep, before any token reads them.
+import core::num;
+import std::nn;
+import std::vec;
+import qwen::deltanet;
+import qwen::gated_attention;
+import qwen::model;
+import qwen::products;
+import qwen::q6;
+import qwen::qwen35;
+import qwen::round;
+import qwen::simd;
+import qwen::weights;
+
+/// The tensors of a round of up to ROUND_MAX positions, in GPU memory. Row t of each is position
+/// t. `proj` and `y` are as in `Qwen35State`, and `add` is the output of a product before its
+/// residual add. The `d` tensors, `beta`, `decay` and `o` are those of the DeltaNet, for the layer
+/// that runs; `proj` and those tensors of a DeltaNet layer are what `commit_round35` reads, so a
+/// round keeps them for each DeltaNet layer: `kept` has one `RoundLayer35` for each layer.
+struct Round35 {
+  tokens : Tensor<i32, [?], Memory::HBM>,
+  x : Tensor<f32, [?, ?], Memory::HBM>,
+  xn : Tensor<f32, [?, ?], Memory::HBM>,
+  y : Tensor<f32, [?, ?], Memory::HBM>,
+  add : Tensor<f32, [?, ?], Memory::HBM>,
+  o : Tensor<f32, [?, ?, ?], Memory::HBM>,
+  router : Tensor<f32, [?, ?], Memory::HBM>,
+  ids : Tensor<i32, [?, ?], Memory::HBM>,
+  weights : Tensor<f32, [?, ?], Memory::HBM>,
+  mlp : Tensor<f32, [?, ?], Memory::HBM>,
+  shared_ids : Tensor<i32, [?, ?], Memory::HBM>,
+  shared_weight : Tensor<f32, [?, ?], Memory::HBM>,
+  shared_mlp : Tensor<f32, [?, ?], Memory::HBM>,
+  logits : Tensor<f32, [?, ?], Memory::HBM>,
+  next : Tensor<i32, [?], Memory::HBM>,
+  kept : Vec<RoundLayer35>,
+}
+
+/// What a round keeps of one layer for `commit_round35`. A full attention layer keeps only `proj`,
+/// which it uses while it runs; the others have one value each.
+struct RoundLayer35 {
+  proj : Tensor<f32, [?, ?], Memory::HBM>,
+  dq : Tensor<f32, [?, ?, ?], Memory::HBM>,
+  dk : Tensor<f32, [?, ?, ?], Memory::HBM>,
+  dv : Tensor<f32, [?, ?, ?], Memory::HBM>,
+  beta : Tensor<f32, [?, ?], Memory::HBM>,
+  decay : Tensor<f32, [?, ?], Memory::HBM>,
+}
+
+fn round35_zeros(a : i32, b : i32) -> Tensor<f32, [?, ?], Memory::HBM> {
+  let mut x = Tensor<f32>([a, b]);
+  for i in 0..a {
+    for j in 0..b {
+      x[i][j] = 0.0;
+    }
+  }
+  return transfer(x, Memory::HBM);
+}
+
+/// Whether the round kernels can run model `w`: Q4_0 layers and experts, and a 6-bit lm_head.
+fn can_round35(w : &Qwen35Weights) -> bool {
+  let mut ok = w.lm_head.dtype == U6;
+  for l in 0..w.config.num_layers {
+    ok = ok && w.layers[l].gate_up.dtype == U4 && w.layers[l].down.dtype == U4 && w.layers[l].shared_gate_up.dtype == U4 && w.layers[l].shared_down.dtype == U4;
+    if w.layers[l].full_attention {
+      ok = ok && w.layers[l].qkv.dtype == U4 && w.layers[l].attn_out.dtype == U4;
+    } else {
+      ok = ok && w.layers[l].linear_in.dtype == U4 && w.layers[l].linear_out.dtype == U4;
+    }
+  }
+  return ok;
+}
+
+fn new_round35(c : &Config) -> Round35 {
+  let n = ROUND_MAX;
+  let kh = c.linear_k_heads;
+  let vh = c.linear_v_heads;
+  let qkv_rows = (2 * c.num_q_heads + 2 * c.num_kv_heads) * 256;
+  let in_rows = (2 * kh + 2 * vh) * 128 + 2 * vh;
+  let k = c.experts_per_token;
+  let mut kept = Vec<RoundLayer35>::new();
+  for l in 0..c.num_layers {
+    if (l + 1) % c.full_attention_interval == 0 {
+      kept.push(RoundLayer35 {
+        proj: transfer(Tensor<f32>([n, qkv_rows]), Memory::HBM),
+        dq: transfer(Tensor<f32>([1, 1, 1]), Memory::HBM),
+        dk: transfer(Tensor<f32>([1, 1, 1]), Memory::HBM),
+        dv: transfer(Tensor<f32>([1, 1, 1]), Memory::HBM),
+        beta: transfer(Tensor<f32>([1, 1]), Memory::HBM),
+        decay: transfer(Tensor<f32>([1, 1]), Memory::HBM),
+      });
+    } else {
+      kept.push(RoundLayer35 {
+        proj: transfer(Tensor<f32>([n, in_rows]), Memory::HBM),
+        dq: transfer(Tensor<f32>([n, kh, 128]), Memory::HBM),
+        dk: transfer(Tensor<f32>([n, kh, 128]), Memory::HBM),
+        dv: transfer(Tensor<f32>([n, vh, 128]), Memory::HBM),
+        beta: transfer(Tensor<f32>([n, vh]), Memory::HBM),
+        decay: transfer(Tensor<f32>([n, vh]), Memory::HBM),
+      });
+    }
+  }
+  let mut shared_ids = Tensor<i32>([n, 1]);
+  for t in 0..n {
+    shared_ids[t][0] = 0;
+  }
+  return Round35 {
+    tokens: transfer(Tensor<i32>([n]), Memory::HBM),
+    x: transfer(Tensor<f32>([n, c.hidden_size]), Memory::HBM),
+    xn: transfer(Tensor<f32>([n, c.hidden_size]), Memory::HBM),
+    y: transfer(Tensor<f32>([n, i32::max(c.num_q_heads * 256, vh * 128)]), Memory::HBM),
+    add: transfer(Tensor<f32>([n, c.hidden_size]), Memory::HBM),
+    o: transfer(Tensor<f32>([n, vh, 128]), Memory::HBM),
+    router: transfer(Tensor<f32>([n, c.num_experts + 1]), Memory::HBM),
+    ids: transfer(Tensor<i32>([n, k]), Memory::HBM),
+    weights: transfer(Tensor<f32>([n, k]), Memory::HBM),
+    mlp: transfer(Tensor<f32>([n * k, c.moe_intermediate_size]), Memory::HBM),
+    shared_ids: transfer(shared_ids, Memory::HBM),
+    shared_weight: round35_zeros(n, 1),
+    shared_mlp: transfer(Tensor<f32>([n, c.shared_expert_inter]), Memory::HBM),
+    logits: transfer(Tensor<f32>([n, c.vocab_size]), Memory::HBM),
+    next: transfer(Tensor<i32>([n]), Memory::HBM),
+    kept: kept,
+  };
+}
+
+// ---------------------------------------------------------------------------- small kernels ---
+
+/// `rms_norm_f32` for each of n rows.
+fn rms_norm_f32_rows(y : &mut Tensor<f32, [?, ?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<f32, [?], Memory::HBM>, n : i32, dim : i32, eps : f32) -> void {
+  assert(n > 0 && y.extent(0) >= n && x.extent(0) >= n && y.extent(1) >= dim && x.extent(1) >= dim && w.len() >= dim, "rms_norm_f32_rows: a tensor is too small");
+  spawn on(Topology::Device) {
+    for t in 0..n across blocks {
+      let mut part = unsafe { Tensor<f32, [1024], Memory::SMEM>::uninit() };
+      for l in 0..1024 across lanes {
+        let mut s : f32 = 0.0;
+        let mut i = l;
+        while i < dim {
+          s = s + x[t][i] * x[t][i];
+          i = i + 1024;
+        }
+        part[l] = s;
+      }
+      let ss = lanes::sum(&part, 1024);
+      let inv = 1.0 / (ss / (dim as f32) + eps).sqrt();
+      for l in 0..1024 across lanes {
+        for j in 0..(dim + 1023) / 1024 {
+          let i = j * 1024 + l;
+          if i < dim {
+            y[t][i] = x[t][i] * inv * w[i];
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// x[t][i] += a[t][i], for t below n: the residual add of `nn_matvec_q4_add`, after
+/// `nn_matvec_q4_rows` wrote the products to `a`.
+fn add_rows(x : &mut Tensor<f32, [?, ?], Memory::HBM>, a : &Tensor<f32, [?, ?], Memory::HBM>, n : i32, dim : i32) -> void {
+  spawn on(Topology::Device) {
+    for t in 0..n across blocks {
+      for b in 0..(dim + 255) / 256 across blocks {
+        for l in 0..256 across lanes {
+          let i = b * 256 + l;
+          if i < dim {
+            x[t][i] = x[t][i] + a[t][i];
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// x[t][i] = y[i], for i below dim.
+fn put_row(x : &mut Tensor<f32, [?, ?], Memory::HBM>, y : &Tensor<f32, [?], Memory::HBM>, t : i32, dim : i32) -> void {
+  spawn on(Topology::Device) {
+    for b in 0..(dim + 255) / 256 across blocks {
+      for l in 0..256 across lanes {
+        let i = b * 256 + l;
+        if i < dim {
+          x[t][i] = y[i];
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// y[i] = x[t][i], for i below dim.
+fn take_row(y : &mut Tensor<f32, [?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, t : i32, dim : i32) -> void {
+  spawn on(Topology::Device) {
+    for b in 0..(dim + 255) / 256 across blocks {
+      for l in 0..256 across lanes {
+        let i = b * 256 + l;
+        if i < dim {
+          y[i] = x[t][i];
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// out[t][0] = sigmoid(logits[t][at]), for t below n: `shared_gate` for each row.
+fn shared_gate_rows(out : &mut Tensor<f32, [?, ?], Memory::HBM>, logits : &Tensor<f32, [?, ?], Memory::HBM>, n : i32, at : i32) -> void {
+  spawn on(Topology::Device) {
+    for b in 0..1 across blocks {
+      for t in 0..ROUND_MAX across lanes {
+        if t < n {
+          out[t][0] = 1.0 / (1.0 + (0.0 - logits[t][at]).fast_exp());
+        }
+      }
+    }
+  }
+  return;
+}
+
+// -------------------------------------------------------------------------------- DeltaNet ---
+
+/// `deltanet_conv` for positions 0 to n - 1 of the round, without the write of the convolution
+/// state. The input of position p is proj[p] when p >= 0, and conv_state[.][.][3 + p] before the
+/// round.
+fn round_dn_conv(qn : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, kn : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, vv : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, conv_state : &Tensor<f32, [?, ?, ?], Memory::HBM>, proj : &Tensor<f32, [?, ?], Memory::HBM>, conv : &Tensor<f32, [?], Memory::HBM>, n : i32, k_heads : i32, v_heads : i32) -> void {
+  spawn on(Topology::Device) {
+    for t in 0..n across blocks {
+      for h in 0..2 * k_heads + v_heads across blocks {
+        let mut y = unsafe { Tensor<f32, [128], Memory::SMEM>::uninit() };
+        let mut part = unsafe { Tensor<f32, [128], Memory::SMEM>::uninit() };
+        for i in 0..128 across lanes {
+          let c = h * 128 + i;
+          let mut x0 : f32 = 0.0;
+          if t >= 3 {
+            x0 = proj[t - 3][c];
+          } else {
+            x0 = conv_state[h][i][t];
+          }
+          let mut x1 : f32 = 0.0;
+          if t >= 2 {
+            x1 = proj[t - 2][c];
+          } else {
+            x1 = conv_state[h][i][t + 1];
+          }
+          let mut x2 : f32 = 0.0;
+          if t >= 1 {
+            x2 = proj[t - 1][c];
+          } else {
+            x2 = conv_state[h][i][2];
+          }
+          let x3 = proj[t][c];
+          let a = conv[c * 4] * x0 + conv[c * 4 + 1] * x1 + conv[c * 4 + 2] * x2 + conv[c * 4 + 3] * x3;
+          let s = a / (1.0 + (0.0 - a).fast_exp());
+          y[i] = s;
+          part[i] = s * s;
+        }
+        let ss = lanes::sum(&part, 128);
+        let inv = 1.0 / (ss + 0.000001).sqrt();
+        for i in 0..128 across lanes {
+          if h < k_heads {
+            qn[t][h][i] = y[i] * inv * 0.08838834764831845;
+          } else if h < 2 * k_heads {
+            kn[t][h - k_heads][i] = y[i] * inv;
+          } else {
+            vv[t][h - 2 * k_heads][i] = y[i];
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// The convolution state after the first `count` positions of the round: the inputs of positions
+/// count - 3 to count - 1.
+fn round_dn_commit_conv(conv_state : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, proj : &Tensor<f32, [?, ?], Memory::HBM>, count : i32, heads : i32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..heads across blocks {
+      for i in 0..128 across lanes {
+        let c = h * 128 + i;
+        let o0 = conv_state[h][i][0];
+        let o1 = conv_state[h][i][1];
+        let o2 = conv_state[h][i][2];
+        // Input count - 3 + j, for j = 0, 1, 2; before the round, input p is o(3 + p).
+        let mut n0 = o0;
+        let mut n1 = o1;
+        let mut n2 = o2;
+        if count == 1 {
+          n0 = o1;
+          n1 = o2;
+          n2 = proj[0][c];
+        } else if count == 2 {
+          n0 = o2;
+          n1 = proj[0][c];
+          n2 = proj[1][c];
+        } else {
+          n0 = proj[count - 3][c];
+          n1 = proj[count - 2][c];
+          n2 = proj[count - 1][c];
+        }
+        conv_state[h][i][0] = n0;
+        conv_state[h][i][1] = n1;
+        conv_state[h][i][2] = n2;
+      }
+    }
+  }
+  return;
+}
+
+/// `deltanet_gates` for each of n rows.
+fn round_dn_gates(beta : &mut Tensor<f32, [?, ?], Memory::HBM>, decay : &mut Tensor<f32, [?, ?], Memory::HBM>, proj : &Tensor<f32, [?, ?], Memory::HBM>, neg_a : &Tensor<f32, [?], Memory::HBM>, dt_bias : &Tensor<f32, [?], Memory::HBM>, b_at : i32, a_at : i32, n : i32, v_heads : i32) -> void {
+  spawn on(Topology::Device) {
+    for t in 0..n across blocks {
+      for j in 0..64 across lanes {
+        if j < v_heads {
+          let b = proj[t][b_at + j];
+          beta[t][j] = 1.0 / (1.0 + (0.0 - b).fast_exp());
+          let x = proj[t][a_at + j] + dt_bias[j];
+          let mut sp = x;
+          if x <= 20.0 {
+            sp = simd_log(1.0 + x.fast_exp());
+          }
+          decay[t][j] = (neg_a[j] * sp).fast_exp();
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// `deltanet_recur` for positions 0 to n - 1 of the round, in order, without the write of S: each
+/// lane keeps its 4 values of a row of S in registers over the positions. o[t] gets the output of
+/// position t.
+fn round_dn_recur(o : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, state : &Tensor<f32, [?, ?, ?], Memory::HBM>, qn : &Tensor<f32, [?, ?, ?], Memory::HBM>, kn : &Tensor<f32, [?, ?, ?], Memory::HBM>, vv : &Tensor<f32, [?, ?, ?], Memory::HBM>, beta : &Tensor<f32, [?, ?], Memory::HBM>, decay : &Tensor<f32, [?, ?], Memory::HBM>, group : i32, n : i32, v_heads : i32) -> void {
+  assert(n >= 1 && n <= ROUND_MAX, "round_dn_recur: n must be 1 to ROUND_MAX");
+  spawn on(Topology::Device) {
+    for h in 0..v_heads across blocks {
+      for vq in 0..4 across blocks {
+        for s in 0..1 across subgroups {
+          for l in 0..32 across lanes(32) {
+            let g = h / group;
+            let d = 4 * l;
+            let mut mine = unsafe { Tensor<f32, [16]>::uninit() };
+            for t in 0..16 {
+              mine[t] = 0.0;
+            }
+            for m in 0..32 {
+              let v = vq * 32 + m;
+              let mut s0 = state[h][v][d];
+              let mut s1 = state[h][v][d + 1];
+              let mut s2 = state[h][v][d + 2];
+              let mut s3 = state[h][v][d + 3];
+              for t in 0..n {
+                let dec = decay[t][h];
+                let k0 = kn[t][g][d];
+                let k1 = kn[t][g][d + 1];
+                let k2 = kn[t][g][d + 2];
+                let k3 = kn[t][g][d + 3];
+                let a0 = s0 * dec;
+                let a1 = s1 * dec;
+                let a2 = s2 * dec;
+                let a3 = s3 * dec;
+                let kv = simd_sum(a0 * k0 + a1 * k1 + a2 * k2 + a3 * k3);
+                let delta = (vv[t][h][v] - kv) * beta[t][h];
+                s0 = a0 + k0 * delta;
+                s1 = a1 + k1 * delta;
+                s2 = a2 + k2 * delta;
+                s3 = a3 + k3 * delta;
+                let out = simd_sum(s0 * qn[t][g][d] + s1 * qn[t][g][d + 1] + s2 * qn[t][g][d + 2] + s3 * qn[t][g][d + 3]);
+                if m == l {
+                  mine[t] = out;
+                }
+              }
+            }
+            for t in 0..n {
+              o[t][h][vq * 32 + l] = mine[t];
+            }
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// The update of S of `deltanet_recur` for the first `count` positions of the round, in order,
+/// written back to `state`. It needs no q and gives no output.
+fn round_dn_commit_state(state : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, kn : &Tensor<f32, [?, ?, ?], Memory::HBM>, vv : &Tensor<f32, [?, ?, ?], Memory::HBM>, beta : &Tensor<f32, [?, ?], Memory::HBM>, decay : &Tensor<f32, [?, ?], Memory::HBM>, group : i32, count : i32, v_heads : i32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..v_heads across blocks {
+      for vq in 0..4 across blocks {
+        for s in 0..1 across subgroups {
+          for l in 0..32 across lanes(32) {
+            let g = h / group;
+            let d = 4 * l;
+            for m in 0..32 {
+              let v = vq * 32 + m;
+              let mut s0 = state[h][v][d];
+              let mut s1 = state[h][v][d + 1];
+              let mut s2 = state[h][v][d + 2];
+              let mut s3 = state[h][v][d + 3];
+              for t in 0..count {
+                let dec = decay[t][h];
+                let k0 = kn[t][g][d];
+                let k1 = kn[t][g][d + 1];
+                let k2 = kn[t][g][d + 2];
+                let k3 = kn[t][g][d + 3];
+                let a0 = s0 * dec;
+                let a1 = s1 * dec;
+                let a2 = s2 * dec;
+                let a3 = s3 * dec;
+                let kv = simd_sum(a0 * k0 + a1 * k1 + a2 * k2 + a3 * k3);
+                let delta = (vv[t][h][v] - kv) * beta[t][h];
+                s0 = a0 + k0 * delta;
+                s1 = a1 + k1 * delta;
+                s2 = a2 + k2 * delta;
+                s3 = a3 + k3 * delta;
+              }
+              state[h][v][d] = s0;
+              state[h][v][d + 1] = s1;
+              state[h][v][d + 2] = s2;
+              state[h][v][d + 3] = s3;
+            }
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// `deltanet_gated_norm` for each of n rows.
+fn round_dn_gated_norm(y : &mut Tensor<f32, [?, ?], Memory::HBM>, o : &Tensor<f32, [?, ?, ?], Memory::HBM>, proj : &Tensor<f32, [?, ?], Memory::HBM>, norm : &Tensor<f32, [?], Memory::HBM>, z_at : i32, n : i32, v_heads : i32, eps : f32) -> void {
+  spawn on(Topology::Device) {
+    for t in 0..n across blocks {
+      for h in 0..v_heads across blocks {
+        let mut part = unsafe { Tensor<f32, [128], Memory::SMEM>::uninit() };
+        for i in 0..128 across lanes {
+          let a = o[t][h][i];
+          part[i] = a * a;
+        }
+        let ss = lanes::sum(&part, 128);
+        let inv = 1.0 / (ss / 128.0 + eps).sqrt();
+        for i in 0..128 across lanes {
+          let z = proj[t][z_at + h * 128 + i];
+          y[t][h * 128 + i] = o[t][h][i] * inv * norm[i] * (z / (1.0 + (0.0 - z).fast_exp()));
+        }
+      }
+    }
+  }
+  return;
+}
+
+// --------------------------------------------------------------------------------- experts ---
+
+/// `moe_swiglu_q4_blocks` for n positions: out[t * k + e] gets the output of expert ids[t][e] for
+/// x[t]. A block runs the body of `moe_swiglu_q4_blocks` for one position and expert.
+fn moe_swiglu_q4_blocks_rows(out : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, ids : &Tensor<i32, [?, ?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, n : i32, k : i32, rows : i32, cols : i32, experts : i32) -> void {
+  assert(k > 0 && n > 0 && ids.extent(0) >= n && ids.extent(1) >= k && x.extent(0) >= n && out.extent(0) >= n * k && out.extent(1) >= rows, "moe_swiglu_q4_blocks_rows: `ids` needs n rows of k values, `x` n rows, and `out` a row of rows values for each of the n * k");
+  assert(rows % 8 == 0, "moe_swiglu_q4_blocks_rows: rows must be a multiple of 8");
+  nn_check_q4(w.len(), scales.len(), x.extent(1), experts * 2 * rows, cols);
+  let words = cols / 8;
+  let groups = cols / 32;
+  spawn on(Topology::Device) {
+    for rb in 0..rows / 8 across blocks {
+      for te in 0..n * k across blocks {
+        let mut part = unsafe {
+          Tensor<f32, [2, 8, 32], Memory::SMEM>::uninit()
+        };
+        for s in 0..2 across subgroups {
+          for l in 0..32 across lanes(32) {
+            let t = te / k;
+            let e = te - t * k;
+            let mut acc = unsafe { Tensor<f32, [8]>::uninit() };
+            for j in 0..8 {
+              acc[j] = 0.0;
+            }
+            let id = ids[t][e];
+            assert(id >= 0 && id < experts, "moe_swiglu_q4_blocks_rows: an id is not the number of an expert");
+            let first = id * 2 * rows + rb * 8 + s * 4;
+            let mut i = l * 2;
+            while i < words {
+              let c = i * 8;
+              let mut xp = unsafe { Tensor<f32, [16]>::uninit() };
+              for u in 0..16 {
+                xp[u] = x[t][c + u];
+              }
+              let sum8 = 8.0 * (xp[0] + xp[1] + xp[2] + xp[3] + xp[4] + xp[5] + xp[6] + xp[7] + xp[8] + xp[9] + xp[10] + xp[11] + xp[12] + xp[13] + xp[14] + xp[15]);
+              xp[1] = xp[1] * 0.0625;
+              xp[2] = xp[2] * 0.00390625;
+              xp[3] = xp[3] * 0.000244140625;
+              xp[4] = xp[4] * 0.0000152587890625;
+              xp[5] = xp[5] * 0.00000095367431640625;
+              xp[6] = xp[6] * 0.000000059604644775390625;
+              xp[7] = xp[7] * 0.0000000037252902984619140625;
+              xp[9] = xp[9] * 0.0625;
+              xp[10] = xp[10] * 0.00390625;
+              xp[11] = xp[11] * 0.000244140625;
+              xp[12] = xp[12] * 0.0000152587890625;
+              xp[13] = xp[13] * 0.00000095367431640625;
+              xp[14] = xp[14] * 0.000000059604644775390625;
+              xp[15] = xp[15] * 0.0000000037252902984619140625;
+              for j in 0..8 {
+                let row = first + j % 4 + (j / 4) * rows;
+                let at = row * words + i;
+                let w0 = w[at];
+                let w1 = w[at + 1];
+                let dot = ((w0 & 15u32) as f32) * xp[0] + ((w0 & 240u32) as f32) * xp[1] + ((w0 & 3840u32) as f32) * xp[2] + ((w0 & 61440u32) as f32) * xp[3] + ((w0 & 983040u32) as f32) * xp[4] + ((w0 & 15728640u32) as f32) * xp[5] + ((w0 & 251658240u32) as f32) * xp[6] + ((w0 & 4026531840u32) as f32) * xp[7] + ((w1 & 15u32) as f32) * xp[8] + ((w1 & 240u32) as f32) * xp[9] + ((w1 & 3840u32) as f32) * xp[10] + ((w1 & 61440u32) as f32) * xp[11] + ((w1 & 983040u32) as f32) * xp[12] + ((w1 & 15728640u32) as f32) * xp[13] + ((w1 & 251658240u32) as f32) * xp[14] + ((w1 & 4026531840u32) as f32) * xp[15];
+                acc[j] = acc[j] + (dot - sum8) * (scales[row * groups + i / 4] as f32);
+              }
+              i = i + 64;
+            }
+            part[s][0][l] = acc[0];
+            part[s][1][l] = acc[1];
+            part[s][2][l] = acc[2];
+            part[s][3][l] = acc[3];
+            part[s][4][l] = acc[4];
+            part[s][5][l] = acc[5];
+            part[s][6][l] = acc[6];
+            part[s][7][l] = acc[7];
+          }
+          let g0 = lanes::sum(&part[s][0], 32);
+          let u0 = lanes::sum(&part[s][4], 32);
+          out[te][rb * 8 + s * 4 + 0] = g0 / (1.0 + (0.0 - g0).fast_exp()) * u0;
+          let g1 = lanes::sum(&part[s][1], 32);
+          let u1 = lanes::sum(&part[s][5], 32);
+          out[te][rb * 8 + s * 4 + 1] = g1 / (1.0 + (0.0 - g1).fast_exp()) * u1;
+          let g2 = lanes::sum(&part[s][2], 32);
+          let u2 = lanes::sum(&part[s][6], 32);
+          out[te][rb * 8 + s * 4 + 2] = g2 / (1.0 + (0.0 - g2).fast_exp()) * u2;
+          let g3 = lanes::sum(&part[s][3], 32);
+          let u3 = lanes::sum(&part[s][7], 32);
+          out[te][rb * 8 + s * 4 + 3] = g3 / (1.0 + (0.0 - g3).fast_exp()) * u3;
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// `moe_down_q4_add_blocks` for n positions: y[t] += the experts ids[t] of h[t * k] to
+/// h[t * k + k - 1], times weights[t]. A block runs the body of `moe_down_q4_add_blocks` for one
+/// position.
+fn moe_down_q4_add_blocks_rows(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, ids : &Tensor<i32, [?, ?], Memory::HBM>, weights : &Tensor<f32, [?, ?], Memory::HBM>, h : &Tensor<f32, [?, ?], Memory::HBM>, n : i32, k : i32, rows : i32, cols : i32, experts : i32) -> void {
+  assert(k > 0 && n > 0 && ids.extent(0) >= n && ids.extent(1) >= k && weights.extent(0) >= n && weights.extent(1) >= k && h.extent(0) >= n * k && h.extent(1) >= cols && y.extent(0) >= n, "moe_down_q4_add_blocks_rows: `ids` and `weights` need n rows of k values, `h` a row of cols values for each of the n * k, and `y` n rows");
+  nn_check_q4(w.len(), scales.len(), cols, experts * rows, cols);
+  assert(rows % 8 == 0 && y.extent(1) >= rows, "moe_down_q4_add_blocks_rows: rows must be a multiple of 8, and the output needs rows values");
+  let words = cols / 8;
+  let groups = cols / 32;
+  spawn on(Topology::Device) {
+    for rb in 0..rows / 8 across blocks {
+      for t in 0..n across blocks {
+        let mut part = unsafe {
+          Tensor<f32, [2, 4, 32], Memory::SMEM>::uninit()
+        };
+        for s in 0..2 across subgroups {
+          for l in 0..32 across lanes(32) {
+            let mut acc = unsafe { Tensor<f32, [4]>::uninit() };
+            for j in 0..4 {
+              acc[j] = 0.0;
+            }
+            let pairs = words / 2;
+            let mut p = l;
+            while p < k * pairs {
+              let e = p / pairs;
+              let i = (p - e * pairs) * 2;
+              let id = ids[t][e];
+              assert(id >= 0 && id < experts, "moe_down_q4_add_blocks_rows: an id is not the number of an expert");
+              let first = id * rows + rb * 8 + s * 4;
+              let we = weights[t][e];
+              let c = i * 8;
+              let mut xp = unsafe { Tensor<f32, [16]>::uninit() };
+              for u in 0..16 {
+                xp[u] = h[t * k + e][c + u];
+              }
+              let sum8 = 8.0 * (xp[0] + xp[1] + xp[2] + xp[3] + xp[4] + xp[5] + xp[6] + xp[7] + xp[8] + xp[9] + xp[10] + xp[11] + xp[12] + xp[13] + xp[14] + xp[15]);
+              xp[1] = xp[1] * 0.0625;
+              xp[2] = xp[2] * 0.00390625;
+              xp[3] = xp[3] * 0.000244140625;
+              xp[4] = xp[4] * 0.0000152587890625;
+              xp[5] = xp[5] * 0.00000095367431640625;
+              xp[6] = xp[6] * 0.000000059604644775390625;
+              xp[7] = xp[7] * 0.0000000037252902984619140625;
+              xp[9] = xp[9] * 0.0625;
+              xp[10] = xp[10] * 0.00390625;
+              xp[11] = xp[11] * 0.000244140625;
+              xp[12] = xp[12] * 0.0000152587890625;
+              xp[13] = xp[13] * 0.00000095367431640625;
+              xp[14] = xp[14] * 0.000000059604644775390625;
+              xp[15] = xp[15] * 0.0000000037252902984619140625;
+              for j in 0..4 {
+                let row = first + j;
+                let at = row * words + i;
+                let w0 = w[at];
+                let w1 = w[at + 1];
+                let dot = ((w0 & 15u32) as f32) * xp[0] + ((w0 & 240u32) as f32) * xp[1] + ((w0 & 3840u32) as f32) * xp[2] + ((w0 & 61440u32) as f32) * xp[3] + ((w0 & 983040u32) as f32) * xp[4] + ((w0 & 15728640u32) as f32) * xp[5] + ((w0 & 251658240u32) as f32) * xp[6] + ((w0 & 4026531840u32) as f32) * xp[7] + ((w1 & 15u32) as f32) * xp[8] + ((w1 & 240u32) as f32) * xp[9] + ((w1 & 3840u32) as f32) * xp[10] + ((w1 & 61440u32) as f32) * xp[11] + ((w1 & 983040u32) as f32) * xp[12] + ((w1 & 15728640u32) as f32) * xp[13] + ((w1 & 251658240u32) as f32) * xp[14] + ((w1 & 4026531840u32) as f32) * xp[15];
+                acc[j] = acc[j] + we * (dot - sum8) * (scales[row * groups + i / 4] as f32);
+              }
+              p = p + 32;
+            }
+            part[s][0][l] = acc[0];
+            part[s][1][l] = acc[1];
+            part[s][2][l] = acc[2];
+            part[s][3][l] = acc[3];
+          }
+          let s0 = lanes::sum(&part[s][0], 32);
+          let s1 = lanes::sum(&part[s][1], 32);
+          let s2 = lanes::sum(&part[s][2], 32);
+          let s3 = lanes::sum(&part[s][3], 32);
+          y[t][rb * 8 + s * 4 + 0] = y[t][rb * 8 + s * 4 + 0] + s0;
+          y[t][rb * 8 + s * 4 + 1] = y[t][rb * 8 + s * 4 + 1] + s1;
+          y[t][rb * 8 + s * 4 + 2] = y[t][rb * 8 + s * 4 + 2] + s2;
+          y[t][rb * 8 + s * 4 + 3] = y[t][rb * 8 + s * 4 + 3] + s3;
+        }
+      }
+    }
+  }
+  return;
+}
+
+// ------------------------------------------------------------------------------- the round ---
+
+/// Runs the n tokens of `tokens` at positions start to start + n - 1 through the model, as
+/// `run_qwen35_layers` and then `predict_qwen35` for each token in turn: r.next[t] gets the greedy
+/// token after token t. The KV caches get the rows of all n tokens. The DeltaNet states do not
+/// change: `commit_round35` writes them for the tokens that the caller keeps.
+fn run_round35(w : &Qwen35Weights, s : &mut Qwen35State, r : &mut Round35, tokens : &Vec<i32>, start : i32, n : i32) -> void {
+  let c = &w.config;
+  let eps = c.rms_norm_eps as f32;
+  let kh = c.linear_k_heads;
+  let vh = c.linear_v_heads;
+  let z_at = (2 * kh + vh) * 128;
+  let b_at = z_at + vh * 128;
+  let a_at = b_at + vh;
+  let qkv_rows = (2 * c.num_q_heads + 2 * c.num_kv_heads) * 256;
+  let k = c.experts_per_token;
+  assert(n >= 1 && n <= ROUND_MAX && start + n <= s.max_seq, "run_round35: n must be 1 to ROUND_MAX, and the positions must fit in the KV cache");
+  let mut h = Tensor<i32>([ROUND_MAX]);
+  for t in 0..ROUND_MAX {
+    h[t] = 0;
+    if t < n {
+      h[t] = tokens[t];
+    }
+  }
+  r.tokens = transfer(h, Memory::HBM);
+  nn_embed_rows(&mut r.x, &w.embed, &r.tokens, n, c.hidden_size);
+  let mut kit = r.kept.iter_mut();
+  let mut l = 0;
+  for ls in s.layers.iter_mut() {
+    let layer = &w.layers[l];
+    let kept = kit.next().unwrap();
+    rms_norm_f32_rows(&mut r.xn, &r.x, &layer.attn_norm, n, c.hidden_size, eps);
+    if layer.full_attention {
+      nn_matvec_q4_rows(&mut kept.proj, &layer.qkv.codes, &layer.qkv.group_scales, &r.xn, n, qkv_rows, c.hidden_size);
+      for t in 0..n {
+        take_row(&mut s.proj, &kept.proj, t, qkv_rows);
+        gated_norm_rope_and_store(&mut s.q, &mut ls.k, &mut ls.v, &s.proj, &layer.q_norm, &layer.k_norm, &s.cos, &s.sin, start + t, c.num_q_heads, c.num_kv_heads, c.rotary_dim, eps);
+        gated_attention(&mut s.y, &mut s.parts, &s.q, &ls.k, &ls.v, &s.proj, start + t, c.num_q_heads, c.num_kv_heads);
+        put_row(&mut r.y, &s.y, t, c.num_q_heads * 256);
+      }
+      nn_matvec_q4_rows(&mut r.add, &layer.attn_out.codes, &layer.attn_out.group_scales, &r.y, n, c.hidden_size, c.num_q_heads * 256);
+    } else {
+      nn_matvec_q4_rows(&mut kept.proj, &layer.linear_in.codes, &layer.linear_in.group_scales, &r.xn, n, a_at + vh, c.hidden_size);
+      round_dn_conv(&mut kept.dq, &mut kept.dk, &mut kept.dv, &ls.conv, &kept.proj, &layer.conv, n, kh, vh);
+      round_dn_gates(&mut kept.beta, &mut kept.decay, &kept.proj, &layer.neg_a, &layer.dt_bias, b_at, a_at, n, vh);
+      round_dn_recur(&mut r.o, &ls.s, &kept.dq, &kept.dk, &kept.dv, &kept.beta, &kept.decay, vh / kh, n, vh);
+      round_dn_gated_norm(&mut r.y, &r.o, &kept.proj, &layer.linear_norm, z_at, n, vh, eps);
+      nn_matvec_q4_rows(&mut r.add, &layer.linear_out.codes, &layer.linear_out.group_scales, &r.y, n, c.hidden_size, vh * 128);
+    }
+    add_rows(&mut r.x, &r.add, n, c.hidden_size);
+    rms_norm_f32_rows(&mut r.xn, &r.x, &layer.mlp_norm, n, c.hidden_size, eps);
+    nn_matvec_rows(&mut r.router, &layer.router, &r.xn, n, c.num_experts + 1, c.hidden_size);
+    nn_top_k_rows(&mut r.ids, &mut r.weights, &r.router, n, c.num_experts, k);
+    shared_gate_rows(&mut r.shared_weight, &r.router, n, c.num_experts);
+    moe_swiglu_q4_blocks_rows(&mut r.mlp, &layer.gate_up.codes, &layer.gate_up.group_scales, &r.ids, &r.xn, n, k, c.moe_intermediate_size, c.hidden_size, c.num_experts);
+    moe_down_q4_add_blocks_rows(&mut r.x, &layer.down.codes, &layer.down.group_scales, &r.ids, &r.weights, &r.mlp, n, k, c.hidden_size, c.moe_intermediate_size, c.num_experts);
+    moe_swiglu_q4_blocks_rows(&mut r.shared_mlp, &layer.shared_gate_up.codes, &layer.shared_gate_up.group_scales, &r.shared_ids, &r.xn, n, 1, c.shared_expert_inter, c.hidden_size, 1);
+    moe_down_q4_add_blocks_rows(&mut r.x, &layer.shared_down.codes, &layer.shared_down.group_scales, &r.shared_ids, &r.shared_weight, &r.shared_mlp, n, 1, c.hidden_size, c.shared_expert_inter, 1);
+    l = l + 1;
+  }
+  rms_norm_f32_rows(&mut r.xn, &r.x, &w.final_norm, n, c.hidden_size, eps);
+  matvec_q6_rows(&mut r.logits, &w.lm_head.codes, &w.lm_head.high, &w.lm_head.group_scales, &r.xn, n, c.vocab_size, c.hidden_size);
+  nn_argmax_rows(&mut r.next, &r.logits, n, c.vocab_size);
+  return;
+}
+
+/// Keeps the first `count` tokens of the last round: writes the DeltaNet states as `run_qwen35_layers`
+/// leaves them after those tokens, bit for bit. The KV caches already have their rows.
+fn commit_round35(w : &Qwen35Weights, s : &mut Qwen35State, r : &Round35, count : i32) -> void {
+  let c = &w.config;
+  let kh = c.linear_k_heads;
+  let vh = c.linear_v_heads;
+  assert(count >= 1 && count <= ROUND_MAX, "commit_round35: count must be 1 to ROUND_MAX");
+  let mut l = 0;
+  for ls in s.layers.iter_mut() {
+    if !w.layers[l].full_attention {
+      let kept = &r.kept[l];
+      round_dn_commit_state(&mut ls.s, &kept.dk, &kept.dv, &kept.beta, &kept.decay, vh / kh, count, vh);
+      round_dn_commit_conv(&mut ls.conv, &kept.proj, count, 2 * kh + vh);
+    }
+    l = l + 1;
+  }
+  return;
+}

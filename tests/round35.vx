@@ -1,0 +1,176 @@
+//===- round35.vx - Qwen app ------------------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// A round of a Qwen3.5/Qwen3.6 model (src/round35.vx) against plain decoding (src/qwen35.vx), on
+// the tiny model of Q4_0 layers and a 6-bit lm_head. Each value must be equal bit for bit. State
+// `r` runs rounds of 6, 4, 2 and 5 tokens after a prompt, and keeps 3, 1, 2 and 5 of them with
+// `commit_round35`. State `b` decodes the kept tokens one at a time, and state `a`, a copy of `b`
+// before each round, decodes all the tokens of the round. The logits of each position of a round
+// must be those of `a`, and the DeltaNet states after the commit those of `b`.
+//
+// RUN: python3 %S/../scripts/make_tiny_model.py --qwen35 --q4 --q6-lm-head %t.vxw > /dev/null
+// RUN: vxc %s --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t.vxw | FileCheck %s
+//
+// CHECK: {{^}}round of 6: logits 0 differ, tokens 0 differ{{$}}
+// CHECK: {{^}}keep 3: states 0 differ{{$}}
+// CHECK: {{^}}round of 4: logits 0 differ, tokens 0 differ{{$}}
+// CHECK: {{^}}keep 1: states 0 differ{{$}}
+// CHECK: {{^}}round of 2: logits 0 differ, tokens 0 differ{{$}}
+// CHECK: {{^}}keep 2: states 0 differ{{$}}
+// CHECK: {{^}}round of 5: logits 0 differ, tokens 0 differ{{$}}
+// CHECK: {{^}}keep 5: states 0 differ{{$}}
+import core::convert;
+import core::num;
+import std::nn;
+import std::vec;
+import qwen::model;
+import qwen::prefill35;
+import qwen::qwen35;
+import qwen::round;
+import qwen::round35;
+import qwen::weights;
+
+/// Decodes `tokens` one at a time from position `pos`, and gives the logits of each, one after
+/// another.
+fn decode(w : &Qwen35Weights, s : &mut Qwen35State, tokens : &Vec<i32>, pos : i32) -> Vec<f32> {
+  let mut out = Vec<f32>::new();
+  let mut next = transfer(Tensor<i32>([1]), Memory::HBM);
+  for t in 0..tokens.len() {
+    let mut h = Tensor<i32>([1]);
+    h[0] = tokens[t];
+    let input = transfer(h, Memory::HBM);
+    run_qwen35_layers(w, s, &input, pos + t);
+    predict_qwen35(w, s, &mut next);
+    let logits = transfer(&s.logits, Memory::CPU_DRAM);
+    for i in 0..w.config.vocab_size {
+      out.push(logits[i]);
+    }
+  }
+  return out;
+}
+
+/// The number of values of the DeltaNet states (S and the convolution inputs) of a and b that are
+/// not equal bit for bit.
+fn states_differ(w : &Qwen35Weights, a : &Qwen35State, b : &Qwen35State) -> i32 {
+  let mut differ = 0;
+  for l in 0..w.config.num_layers {
+    if !w.layers[l].full_attention {
+      let sa = transfer(&a.layers[l].s, Memory::CPU_DRAM);
+      let sb = transfer(&b.layers[l].s, Memory::CPU_DRAM);
+      for h in 0..sa.extent(0) {
+        for i in 0..128 {
+          for j in 0..128 {
+            if sa[h][i][j].to_bits() != sb[h][i][j].to_bits() {
+              differ = differ + 1;
+            }
+          }
+        }
+      }
+      let ca = transfer(&a.layers[l].conv, Memory::CPU_DRAM);
+      let cb = transfer(&b.layers[l].conv, Memory::CPU_DRAM);
+      for h in 0..ca.extent(0) {
+        for i in 0..128 {
+          for j in 0..3 {
+            if ca[h][i][j].to_bits() != cb[h][i][j].to_bits() {
+              differ = differ + 1;
+            }
+          }
+        }
+      }
+    }
+  }
+  return differ;
+}
+
+/// Runs `tokens` as a round on `r` and decodes them one at a time on `a`, both from `pos`, and
+/// prints how many logits and tokens differ.
+fn check_round(w : &Qwen35Weights, rs : &mut Qwen35State, round : &mut Round35, a : &mut Qwen35State, tokens : &Vec<i32>, pos : i32) -> void {
+  let n = tokens.len();
+  let want = decode(w, a, tokens, pos);
+  run_round35(w, rs, round, tokens, pos, n);
+  let got = transfer(&round.logits, Memory::CPU_DRAM);
+  let next = transfer(&round.next, Memory::CPU_DRAM);
+  let vocab = w.config.vocab_size;
+  let mut differ = 0;
+  let mut tokens_differ = 0;
+  for t in 0..n {
+    let mut best = 0;
+    for i in 0..vocab {
+      if got[t][i].to_bits() != want[t * vocab + i].to_bits() {
+        differ = differ + 1;
+      }
+      if want[t * vocab + i] > want[t * vocab + best] {
+        best = i;
+      }
+    }
+    if next[t] != best {
+      tokens_differ = tokens_differ + 1;
+    }
+  }
+  println!("round of {}: logits {} differ, tokens {} differ", n, differ, tokens_differ);
+  return;
+}
+
+fn some_tokens(first : i32, n : i32, vocab : i32) -> Vec<i32> {
+  let mut v = Vec<i32>::new();
+  for i in 0..n {
+    v.push((first + i * 37) % vocab);
+  }
+  return v;
+}
+
+/// Copies the state of each layer of `src` to `dst`.
+fn copy_states(dst : &mut Qwen35State, src : &Qwen35State) -> void {
+  let mut l = 0;
+  for ls in dst.layers.iter_mut() {
+    ls.s = transfer(transfer(&src.layers[l].s, Memory::CPU_DRAM), Memory::HBM);
+    ls.conv = transfer(transfer(&src.layers[l].conv, Memory::CPU_DRAM), Memory::HBM);
+    ls.k = transfer(transfer(&src.layers[l].k, Memory::CPU_DRAM), Memory::HBM);
+    ls.v = transfer(transfer(&src.layers[l].v, Memory::CPU_DRAM), Memory::HBM);
+    l = l + 1;
+  }
+  return;
+}
+
+fn main(argc : i32, argv : *mut *mut i8) -> i32 {
+  let w = load_qwen35_weights(unsafe { argv[1] });
+  let vocab = w.config.vocab_size;
+  let max_seq = 64;
+  let mut a = new_qwen35_state(&w.config, max_seq);
+  let mut b = new_qwen35_state(&w.config, max_seq);
+  let mut r = new_qwen35_state(&w.config, max_seq);
+  let mut round = new_round35(&w.config);
+  let prompt = some_tokens(5, 7, vocab);
+  prefill_qwen35(&w, &mut b, &prompt);
+  prefill_qwen35(&w, &mut r, &prompt);
+  let mut pos = prompt.len();
+  let mut sizes = Vec<i32>::new();
+  let mut keeps = Vec<i32>::new();
+  sizes.push(6);
+  keeps.push(3);
+  sizes.push(4);
+  keeps.push(1);
+  sizes.push(2);
+  keeps.push(2);
+  sizes.push(5);
+  keeps.push(5);
+  for i in 0..sizes.len() {
+    // `a` decodes all the tokens of the round, from a copy of `b`; `b` decodes the kept ones.
+    copy_states(&mut a, &b);
+    let tokens = some_tokens(11 + 13 * i, sizes[i], vocab);
+    check_round(&w, &mut r, &mut round, &mut a, &tokens, pos);
+    let mut kept = Vec<i32>::new();
+    for j in 0..keeps[i] {
+      kept.push(tokens[j]);
+    }
+    let _logits = decode(&w, &mut b, &kept, pos);
+    commit_round35(&w, &mut r, &round, keeps[i]);
+    println!("keep {}: states {} differ", keeps[i], states_differ(&w, &r, &b));
+    pos = pos + keeps[i];
+  }
+  return 0;
+}
