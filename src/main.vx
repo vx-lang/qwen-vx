@@ -26,6 +26,7 @@ import std::vec;
 import qwen::weights;
 import qwen::model;
 import qwen::qwen35;
+import qwen::prefill35;
 import qwen::prefill;
 import qwen::session;
 import qwen::speculate;
@@ -355,8 +356,8 @@ fn generate_with_drafts(w : &Weights, s : &mut State, t : &Tokenizer, text_mode 
   return step;
 }
 
-/// `main` for a Qwen3.5 or Qwen3.6 model (weight file v2, arch 1). The prompt runs one token at a
-/// time; it has no chunked prefill and no drafts yet (#89). Prints the same lines as `main`.
+/// `main` for a Qwen3.5 or Qwen3.6 model (weight file v2, arch 1). The prompt runs in chunks
+/// (src/prefill35.vx). There are no drafts yet (#89). Prints the same lines as `main`.
 fn run_qwen35(path : *const i8, t : &Tokenizer, text_mode : bool, prompt : &Vec<i32>, steps : i32) -> i32 {
   let w = load_qwen35_weights(path);
   let count = prompt.len();
@@ -390,12 +391,7 @@ fn run_qwen35(path : *const i8, t : &Tokenizer, text_mode : bool, prompt : &Vec<
     println!(";");
   }
   let prompt_start = Instant::now();
-  let mut ht = Tensor<i32>([1]);
-  for i in 0..count {
-    ht[0] = prompt[i];
-    let token = transfer(&ht, Memory::HBM);
-    run_qwen35_layers(&w, &mut s, &token, i);
-  }
+  prefill_qwen35(&w, &mut s, prompt);
   predict_qwen35(&w, &mut s, &mut slots[0].next);
   let mut tokens = Vec<i32>::new();
   tokens.push(read_token(&slots[0].next));
@@ -412,8 +408,9 @@ fn run_qwen35(path : *const i8, t : &Tokenizer, text_mode : bool, prompt : &Vec<
     } else {
       println!("step={} token={} logit={};", step, token, read_logit(&s.logits, token));
     }
-    if step == 0 {
-      // The first token after the prompt compiles the kernels of a step, so the clock starts after it.
+    if step == 1 {
+      // The tokens of step 0 compile the kernels of a step, so the clock starts after them. (A token
+      // cannot run twice to warm up, as in `main`: the DeltaNet would update its state twice.)
       start = Instant::now();
     }
     if step + 1 < steps && tokens.len() == step + 1 {

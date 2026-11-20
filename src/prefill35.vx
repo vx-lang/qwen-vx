@@ -1,0 +1,865 @@
+//===- prefill35.vx - Qwen app ----------------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// The prompt of a Qwen3.5 or Qwen3.6 model (arch 1, #89) in chunks, as src/prefill.vx does for
+// arch 0. A chunk reads each weight once for all its tokens: the products are those of
+// src/prefill.vx (`pf_mm`), and the experts are sorted by expert in the same way. The parts that
+// are new here:
+//
+// - The DeltaNet of a chunk. The convolution and the norms run for all the tokens at once. The
+//   update of the state runs the tokens in order, in one kernel that keeps S in registers.
+// - The gated attention of a chunk: the kernels of src/gated_attention.vx for ATT_TOKENS tokens
+//   at a time, each with ATT_GROUPS SIMD groups for each head.
+// - The shared expert, as a dense SwiGLU over the chunk, times sigmoid(its gate).
+import core::convert;
+import core::num;
+import std::nn;
+import std::vec;
+import qwen::deltanet;
+import qwen::gated_attention;
+import qwen::model;
+import qwen::prefill;
+import qwen::qwen35;
+import qwen::simd;
+import qwen::weights;
+
+/// The tokens of a chunk that the attention takes at a time, and the SIMD groups of each head and
+/// token. The scratch space of the parts is ATT_TOKENS x q_heads x ATT_GROUPS x 260 values.
+const ATT_TOKENS : i32 = 64;
+const ATT_GROUPS : i32 = 8;
+
+/// The tensors of a chunk, made once. `rows`, `zeros` and the `e_` tensors are those of `Prefill`.
+/// `proj` is the output of `qkv` or `linear_in` for each token, and `y` the input of `attn_out` or
+/// `linear_out`. The `d` tensors are those of the DeltaNet, and the `s_` tensors those of the shared
+/// expert. `router` has the logits of the experts, then that of the gate of the shared expert.
+struct Prefill35 {
+  chunk : i32,
+  tokens : Tensor<i32, [?], Memory::HBM>,
+  rows : Tensor<i32, [?], Memory::HBM>,
+  zeros : Tensor<i32, [?], Memory::HBM>,
+  no_bias : Tensor<bf16, [?], Memory::HBM>,
+  x : Tensor<f32, [?, ?], Memory::HBM>,
+  xn : Tensor<f32, [?, ?], Memory::HBM>,
+  proj : Tensor<f32, [?, ?], Memory::HBM>,
+  y : Tensor<f32, [?, ?], Memory::HBM>,
+  q : Tensor<f32, [?, ?, ?], Memory::HBM>,
+  parts : Tensor<f32, [?, ?, ?, ?], Memory::HBM>,
+  dq : Tensor<f32, [?, ?, ?], Memory::HBM>,
+  dk : Tensor<f32, [?, ?, ?], Memory::HBM>,
+  dv : Tensor<f32, [?, ?, ?], Memory::HBM>,
+  beta : Tensor<f32, [?, ?], Memory::HBM>,
+  decay : Tensor<f32, [?, ?], Memory::HBM>,
+  o : Tensor<f32, [?, ?, ?, ?], Memory::HBM>,
+  router : Tensor<f32, [?, ?], Memory::HBM>,
+  ids : Tensor<i32, [?, ?], Memory::HBM>,
+  wts : Tensor<f32, [?, ?], Memory::HBM>,
+  e_rows : Tensor<i32, [?], Memory::HBM>,
+  e_ident : Tensor<i32, [?], Memory::HBM>,
+  e_bases : Tensor<i32, [?], Memory::HBM>,
+  slot : Tensor<i32, [?], Memory::HBM>,
+  e_counts : Tensor<i32, [?], Memory::HBM>,
+  e_lane_counts : Tensor<i32, [?], Memory::HBM>,
+  e_gu : Tensor<f32, [?, ?], Memory::HBM>,
+  e_h : Tensor<f32, [?, ?], Memory::HBM>,
+  e_out : Tensor<f32, [?, ?], Memory::HBM>,
+  s_gu : Tensor<f32, [?, ?], Memory::HBM>,
+  s_h : Tensor<f32, [?, ?], Memory::HBM>,
+  s_out : Tensor<f32, [?, ?], Memory::HBM>,
+}
+
+/// The tensors for chunks of up to `chunk` tokens.
+fn new_prefill35(c : &Config, chunk : i32) -> Prefill35 {
+  assert(chunk > 0 && chunk % 16 == 0, "new_prefill35: the chunk must be a multiple of 16");
+  let k = c.experts_per_token;
+  let experts = c.num_experts;
+  let positions = expert_positions(c, chunk);
+  let cap = (chunk + 31) / 32 * 32;
+  let mut ident = Tensor<i32>([positions]);
+  for p in 0..positions {
+    ident[p] = p;
+  }
+  let qkv_rows = (2 * c.num_q_heads + 2 * c.num_kv_heads) * 256;
+  let in_rows = (2 * c.linear_k_heads + 2 * c.linear_v_heads) * 128 + 2 * c.linear_v_heads;
+  let kh = c.linear_k_heads;
+  let vh = c.linear_v_heads;
+  return Prefill35 {
+    chunk: chunk,
+    tokens: transfer(Tensor<i32>([chunk]), Memory::HBM),
+    rows: transfer(Tensor<i32>([cap]), Memory::HBM),
+    zeros: transfer(Tensor<i32>([cap / 16]), Memory::HBM),
+    no_bias: transfer(Tensor<bf16>([1]), Memory::HBM),
+    x: transfer(Tensor<f32>([cap, c.hidden_size]), Memory::HBM),
+    xn: transfer(Tensor<f32>([cap, c.hidden_size]), Memory::HBM),
+    proj: transfer(Tensor<f32>([cap, i32::max(qkv_rows, in_rows)]), Memory::HBM),
+    y: transfer(Tensor<f32>([cap, i32::max(c.num_q_heads * 256, vh * 128)]), Memory::HBM),
+    q: transfer(Tensor<f32>([chunk, c.num_q_heads, 256]), Memory::HBM),
+    parts: transfer(Tensor<f32>([ATT_TOKENS, c.num_q_heads, ATT_GROUPS, 260]), Memory::HBM),
+    dq: transfer(Tensor<f32>([chunk, kh, 128]), Memory::HBM),
+    dk: transfer(Tensor<f32>([chunk, kh, 128]), Memory::HBM),
+    dv: transfer(Tensor<f32>([chunk, vh, 128]), Memory::HBM),
+    beta: transfer(Tensor<f32>([chunk, vh]), Memory::HBM),
+    decay: transfer(Tensor<f32>([chunk, vh]), Memory::HBM),
+    o: transfer(Tensor<f32>([chunk, vh, 16, 8]), Memory::HBM),
+    router: transfer(Tensor<f32>([cap, experts + 1]), Memory::HBM),
+    ids: transfer(Tensor<i32>([chunk, k]), Memory::HBM),
+    wts: transfer(Tensor<f32>([chunk, k]), Memory::HBM),
+    e_rows: transfer(Tensor<i32>([positions]), Memory::HBM),
+    e_ident: transfer(ident, Memory::HBM),
+    e_bases: transfer(Tensor<i32>([positions / 16]), Memory::HBM),
+    slot: transfer(Tensor<i32>([chunk * k]), Memory::HBM),
+    e_counts: transfer(Tensor<i32>([experts]), Memory::HBM),
+    e_lane_counts: transfer(Tensor<i32>([experts * 32]), Memory::HBM),
+    e_gu: transfer(Tensor<f32>([positions, 2 * c.moe_intermediate_size]), Memory::HBM),
+    e_h: transfer(Tensor<f32>([positions, c.moe_intermediate_size]), Memory::HBM),
+    e_out: transfer(Tensor<f32>([positions, c.hidden_size]), Memory::HBM),
+    s_gu: transfer(Tensor<f32>([cap, 2 * c.shared_expert_inter]), Memory::HBM),
+    s_h: transfer(Tensor<f32>([cap, c.shared_expert_inter]), Memory::HBM),
+    s_out: transfer(Tensor<f32>([cap, c.hidden_size]), Memory::HBM),
+  };
+}
+
+// ------------------------------------------------------------------------------ norms ---
+
+/// `pf_rms_norm` with f32 weights.
+fn pf35_rms_norm(y : &mut Tensor<f32, [?, ?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<f32, [?], Memory::HBM>, n : i32, dim : i32, eps : f32) -> void {
+  spawn on(Topology::Device) {
+    for t in 0..n across blocks {
+      let mut part = unsafe { Tensor<f32, [1024], Memory::SMEM>::uninit() };
+      for l in 0..1024 across lanes {
+        let mut s : f32 = 0.0;
+        let mut i = l;
+        while i < dim {
+          s = s + x[t][i] * x[t][i];
+          i = i + 1024;
+        }
+        part[l] = s;
+      }
+      let ss = lanes::sum(&part, 1024);
+      let inv = 1.0 / (ss / (dim as f32) + eps).sqrt();
+      for l in 0..1024 across lanes {
+        for j in 0..(dim + 1023) / 1024 {
+          let i = j * 1024 + l;
+          if i < dim {
+            y[t][i] = x[t][i] * inv * w[i];
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// `pf_add_rms_norm` with f32 weights: x[t] += y[t], then y[t] = the RMSNorm of x[t] times w.
+fn pf35_add_rms_norm(x : &mut Tensor<f32, [?, ?], Memory::HBM>, y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<f32, [?], Memory::HBM>, n : i32, dim : i32, eps : f32) -> void {
+  spawn on(Topology::Device) {
+    for t in 0..n across blocks {
+      let mut part = unsafe { Tensor<f32, [1024], Memory::SMEM>::uninit() };
+      for l in 0..1024 across lanes {
+        let mut s : f32 = 0.0;
+        for j in 0..(dim + 1023) / 1024 {
+          let i = j * 1024 + l;
+          if i < dim {
+            let v = x[t][i] + y[t][i];
+            x[t][i] = v;
+            s = s + v * v;
+          }
+        }
+        part[l] = s;
+      }
+      let ss = lanes::sum(&part, 1024);
+      let inv = 1.0 / (ss / (dim as f32) + eps).sqrt();
+      for l in 0..1024 across lanes {
+        for j in 0..(dim + 1023) / 1024 {
+          let i = j * 1024 + l;
+          if i < dim {
+            y[t][i] = x[t][i] * inv * w[i];
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+// --------------------------------------------------------------------------- DeltaNet ---
+
+/// The convolution, the SiLU and the L2 norms of the n tokens of the chunk, as `deltanet_conv` for
+/// each. Block (t, h) is one SIMD group for head h of token t, and lane l does its channels 4 l to
+/// 4 l + 3. The inputs before the chunk come from `conv_state`, which this kernel does not change.
+fn pf_dn_conv(qn : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, kn : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, vv : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, conv_state : &Tensor<f32, [?, ?, ?], Memory::HBM>, proj : &Tensor<f32, [?, ?], Memory::HBM>, conv : &Tensor<f32, [?], Memory::HBM>, n : i32, k_heads : i32, v_heads : i32) -> void {
+  spawn on(Topology::Device) {
+    for t in 0..n across blocks {
+      for h in 0..2 * k_heads + v_heads across blocks {
+        for s in 0..1 across subgroups {
+          for l in 0..32 across lanes(32) {
+            let mut y = unsafe { Tensor<f32, [4]>::uninit() };
+            for j in 0..4 {
+              let i = 4 * l + j;
+              let c = h * 128 + i;
+              let mut x0 : f32 = 0.0;
+              if t >= 3 {
+                x0 = proj[t - 3][c];
+              } else {
+                x0 = conv_state[h][i][t];
+              }
+              let mut x1 : f32 = 0.0;
+              if t >= 2 {
+                x1 = proj[t - 2][c];
+              } else {
+                x1 = conv_state[h][i][t + 1];
+              }
+              let mut x2 : f32 = 0.0;
+              if t >= 1 {
+                x2 = proj[t - 1][c];
+              } else {
+                x2 = conv_state[h][i][2];
+              }
+              let a = conv[c * 4] * x0 + conv[c * 4 + 1] * x1 + conv[c * 4 + 2] * x2 + conv[c * 4 + 3] * proj[t][c];
+              y[j] = a / (1.0 + (0.0 - a).fast_exp());
+            }
+            let ss = simd_sum(y[0] * y[0] + y[1] * y[1] + y[2] * y[2] + y[3] * y[3]);
+            let inv = 1.0 / (ss + 0.000001).sqrt();
+            for j in 0..4 {
+              if h < k_heads {
+                qn[t][h][4 * l + j] = y[j] * inv * 0.08838834764831845;
+              } else if h < 2 * k_heads {
+                kn[t][h - k_heads][4 * l + j] = y[j] * inv;
+              } else {
+                vv[t][h - 2 * k_heads][4 * l + j] = y[j];
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// The inputs of the convolution after the chunk: the last 3 of the chunk and of the state before.
+fn pf_dn_conv_state(conv_state : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, proj : &Tensor<f32, [?, ?], Memory::HBM>, n : i32, heads : i32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..heads across blocks {
+      for i in 0..128 across lanes {
+        let c = h * 128 + i;
+        let mut x = unsafe { Tensor<f32, [3]>::uninit() };
+        for j in 0..3 {
+          // Input n - 3 + j of the chunk: an input of the chunk, or one of the state before it.
+          let at = n - 3 + j;
+          if at >= 0 {
+            x[j] = proj[at][c];
+          } else {
+            x[j] = conv_state[h][i][3 + at];
+          }
+        }
+        conv_state[h][i][0] = x[0];
+        conv_state[h][i][1] = x[1];
+        conv_state[h][i][2] = x[2];
+      }
+    }
+  }
+  return;
+}
+
+/// beta and the decay of each head of v, for each token of the chunk, as `deltanet_gates`.
+fn pf_dn_gates(beta : &mut Tensor<f32, [?, ?], Memory::HBM>, decay : &mut Tensor<f32, [?, ?], Memory::HBM>, proj : &Tensor<f32, [?, ?], Memory::HBM>, neg_a : &Tensor<f32, [?], Memory::HBM>, dt_bias : &Tensor<f32, [?], Memory::HBM>, b_at : i32, a_at : i32, n : i32, v_heads : i32) -> void {
+  spawn on(Topology::Device) {
+    for t in 0..n across blocks {
+      for j in 0..64 across lanes {
+        if j < v_heads {
+          let b = proj[t][b_at + j];
+          beta[t][j] = 1.0 / (1.0 + (0.0 - b).fast_exp());
+          let x = proj[t][a_at + j] + dt_bias[j];
+          let mut sp = x;
+          if x <= 20.0 {
+            sp = simd_log(1.0 + x.fast_exp());
+          }
+          decay[t][j] = (neg_a[j] * sp).fast_exp();
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// y[t] = rms_norm(o[t]) * norm * silu(z[t]) for each head of v, as `deltanet_gated_norm`.
+fn pf_dn_gated_norm(y : &mut Tensor<f32, [?, ?], Memory::HBM>, o : &Tensor<f32, [?, ?, ?, ?], Memory::HBM>, proj : &Tensor<f32, [?, ?], Memory::HBM>, norm : &Tensor<f32, [?], Memory::HBM>, z_at : i32, n : i32, v_heads : i32, eps : f32) -> void {
+  spawn on(Topology::Device) {
+    for t in 0..n across blocks {
+      for h in 0..v_heads across blocks {
+        let mut part = unsafe { Tensor<f32, [128], Memory::SMEM>::uninit() };
+        for i in 0..128 across lanes {
+          let a = o[t][h][i / 8][i % 8];
+          part[i] = a * a;
+        }
+        let ss = lanes::sum(&part, 128);
+        let inv = 1.0 / (ss / 128.0 + eps).sqrt();
+        for i in 0..128 across lanes {
+          let z = proj[t][z_at + h * 128 + i];
+          y[t][h * 128 + i] = o[t][h][i / 8][i % 8] * inv * norm[i] * (z / (1.0 + (0.0 - z).fast_exp()));
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// The update of the state and the output q . S for the n tokens of the chunk, in order. Block (h, vq)
+/// is one SIMD group for values vq * 8 to vq * 8 + 7 of v of head h. Lane l owns values 4 l to 4 l + 3
+/// of k, and keeps its 32 values of S in registers for the whole chunk: S is read and written once.
+/// For each token and value of v, the operations are those of `deltanet_recur`, in the same order.
+/// o[t][h][vq][m] is the output of value vq * 8 + m.
+fn pf_dn_recur(o : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, state : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, qn : &Tensor<f32, [?, ?, ?], Memory::HBM>, kn : &Tensor<f32, [?, ?, ?], Memory::HBM>, vv : &Tensor<f32, [?, ?, ?], Memory::HBM>, beta : &Tensor<f32, [?, ?], Memory::HBM>, decay : &Tensor<f32, [?, ?], Memory::HBM>, group : i32, n : i32, v_heads : i32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..v_heads across blocks {
+      for vq in 0..16 across blocks {
+        for s in 0..1 across subgroups {
+          for l in 0..32 across lanes(32) {
+            let g = h / group;
+            let d = 4 * l;
+            let mut s0_0 = state[h][vq * 8 + 0][d + 0];
+            let mut s0_1 = state[h][vq * 8 + 0][d + 1];
+            let mut s0_2 = state[h][vq * 8 + 0][d + 2];
+            let mut s0_3 = state[h][vq * 8 + 0][d + 3];
+            let mut s1_0 = state[h][vq * 8 + 1][d + 0];
+            let mut s1_1 = state[h][vq * 8 + 1][d + 1];
+            let mut s1_2 = state[h][vq * 8 + 1][d + 2];
+            let mut s1_3 = state[h][vq * 8 + 1][d + 3];
+            let mut s2_0 = state[h][vq * 8 + 2][d + 0];
+            let mut s2_1 = state[h][vq * 8 + 2][d + 1];
+            let mut s2_2 = state[h][vq * 8 + 2][d + 2];
+            let mut s2_3 = state[h][vq * 8 + 2][d + 3];
+            let mut s3_0 = state[h][vq * 8 + 3][d + 0];
+            let mut s3_1 = state[h][vq * 8 + 3][d + 1];
+            let mut s3_2 = state[h][vq * 8 + 3][d + 2];
+            let mut s3_3 = state[h][vq * 8 + 3][d + 3];
+            let mut s4_0 = state[h][vq * 8 + 4][d + 0];
+            let mut s4_1 = state[h][vq * 8 + 4][d + 1];
+            let mut s4_2 = state[h][vq * 8 + 4][d + 2];
+            let mut s4_3 = state[h][vq * 8 + 4][d + 3];
+            let mut s5_0 = state[h][vq * 8 + 5][d + 0];
+            let mut s5_1 = state[h][vq * 8 + 5][d + 1];
+            let mut s5_2 = state[h][vq * 8 + 5][d + 2];
+            let mut s5_3 = state[h][vq * 8 + 5][d + 3];
+            let mut s6_0 = state[h][vq * 8 + 6][d + 0];
+            let mut s6_1 = state[h][vq * 8 + 6][d + 1];
+            let mut s6_2 = state[h][vq * 8 + 6][d + 2];
+            let mut s6_3 = state[h][vq * 8 + 6][d + 3];
+            let mut s7_0 = state[h][vq * 8 + 7][d + 0];
+            let mut s7_1 = state[h][vq * 8 + 7][d + 1];
+            let mut s7_2 = state[h][vq * 8 + 7][d + 2];
+            let mut s7_3 = state[h][vq * 8 + 7][d + 3];
+            for t in 0..n {
+              let q0 = qn[t][g][d + 0];
+              let q1 = qn[t][g][d + 1];
+              let q2 = qn[t][g][d + 2];
+              let q3 = qn[t][g][d + 3];
+              let k0 = kn[t][g][d + 0];
+              let k1 = kn[t][g][d + 1];
+              let k2 = kn[t][g][d + 2];
+              let k3 = kn[t][g][d + 3];
+              let b = beta[t][h];
+              let dec = decay[t][h];
+              let mut mine : f32 = 0.0;
+              let a0_0 = s0_0 * dec;
+              let a0_1 = s0_1 * dec;
+              let a0_2 = s0_2 * dec;
+              let a0_3 = s0_3 * dec;
+              let kv0 = simd_sum(a0_0 * k0 + a0_1 * k1 + a0_2 * k2 + a0_3 * k3);
+              let delta0 = (vv[t][h][vq * 8 + 0] - kv0) * b;
+              s0_0 = a0_0 + k0 * delta0;
+              s0_1 = a0_1 + k1 * delta0;
+              s0_2 = a0_2 + k2 * delta0;
+              s0_3 = a0_3 + k3 * delta0;
+              let out0 = simd_sum(s0_0 * q0 + s0_1 * q1 + s0_2 * q2 + s0_3 * q3);
+              if l == 0 {
+                mine = out0;
+              }
+              let a1_0 = s1_0 * dec;
+              let a1_1 = s1_1 * dec;
+              let a1_2 = s1_2 * dec;
+              let a1_3 = s1_3 * dec;
+              let kv1 = simd_sum(a1_0 * k0 + a1_1 * k1 + a1_2 * k2 + a1_3 * k3);
+              let delta1 = (vv[t][h][vq * 8 + 1] - kv1) * b;
+              s1_0 = a1_0 + k0 * delta1;
+              s1_1 = a1_1 + k1 * delta1;
+              s1_2 = a1_2 + k2 * delta1;
+              s1_3 = a1_3 + k3 * delta1;
+              let out1 = simd_sum(s1_0 * q0 + s1_1 * q1 + s1_2 * q2 + s1_3 * q3);
+              if l == 1 {
+                mine = out1;
+              }
+              let a2_0 = s2_0 * dec;
+              let a2_1 = s2_1 * dec;
+              let a2_2 = s2_2 * dec;
+              let a2_3 = s2_3 * dec;
+              let kv2 = simd_sum(a2_0 * k0 + a2_1 * k1 + a2_2 * k2 + a2_3 * k3);
+              let delta2 = (vv[t][h][vq * 8 + 2] - kv2) * b;
+              s2_0 = a2_0 + k0 * delta2;
+              s2_1 = a2_1 + k1 * delta2;
+              s2_2 = a2_2 + k2 * delta2;
+              s2_3 = a2_3 + k3 * delta2;
+              let out2 = simd_sum(s2_0 * q0 + s2_1 * q1 + s2_2 * q2 + s2_3 * q3);
+              if l == 2 {
+                mine = out2;
+              }
+              let a3_0 = s3_0 * dec;
+              let a3_1 = s3_1 * dec;
+              let a3_2 = s3_2 * dec;
+              let a3_3 = s3_3 * dec;
+              let kv3 = simd_sum(a3_0 * k0 + a3_1 * k1 + a3_2 * k2 + a3_3 * k3);
+              let delta3 = (vv[t][h][vq * 8 + 3] - kv3) * b;
+              s3_0 = a3_0 + k0 * delta3;
+              s3_1 = a3_1 + k1 * delta3;
+              s3_2 = a3_2 + k2 * delta3;
+              s3_3 = a3_3 + k3 * delta3;
+              let out3 = simd_sum(s3_0 * q0 + s3_1 * q1 + s3_2 * q2 + s3_3 * q3);
+              if l == 3 {
+                mine = out3;
+              }
+              let a4_0 = s4_0 * dec;
+              let a4_1 = s4_1 * dec;
+              let a4_2 = s4_2 * dec;
+              let a4_3 = s4_3 * dec;
+              let kv4 = simd_sum(a4_0 * k0 + a4_1 * k1 + a4_2 * k2 + a4_3 * k3);
+              let delta4 = (vv[t][h][vq * 8 + 4] - kv4) * b;
+              s4_0 = a4_0 + k0 * delta4;
+              s4_1 = a4_1 + k1 * delta4;
+              s4_2 = a4_2 + k2 * delta4;
+              s4_3 = a4_3 + k3 * delta4;
+              let out4 = simd_sum(s4_0 * q0 + s4_1 * q1 + s4_2 * q2 + s4_3 * q3);
+              if l == 4 {
+                mine = out4;
+              }
+              let a5_0 = s5_0 * dec;
+              let a5_1 = s5_1 * dec;
+              let a5_2 = s5_2 * dec;
+              let a5_3 = s5_3 * dec;
+              let kv5 = simd_sum(a5_0 * k0 + a5_1 * k1 + a5_2 * k2 + a5_3 * k3);
+              let delta5 = (vv[t][h][vq * 8 + 5] - kv5) * b;
+              s5_0 = a5_0 + k0 * delta5;
+              s5_1 = a5_1 + k1 * delta5;
+              s5_2 = a5_2 + k2 * delta5;
+              s5_3 = a5_3 + k3 * delta5;
+              let out5 = simd_sum(s5_0 * q0 + s5_1 * q1 + s5_2 * q2 + s5_3 * q3);
+              if l == 5 {
+                mine = out5;
+              }
+              let a6_0 = s6_0 * dec;
+              let a6_1 = s6_1 * dec;
+              let a6_2 = s6_2 * dec;
+              let a6_3 = s6_3 * dec;
+              let kv6 = simd_sum(a6_0 * k0 + a6_1 * k1 + a6_2 * k2 + a6_3 * k3);
+              let delta6 = (vv[t][h][vq * 8 + 6] - kv6) * b;
+              s6_0 = a6_0 + k0 * delta6;
+              s6_1 = a6_1 + k1 * delta6;
+              s6_2 = a6_2 + k2 * delta6;
+              s6_3 = a6_3 + k3 * delta6;
+              let out6 = simd_sum(s6_0 * q0 + s6_1 * q1 + s6_2 * q2 + s6_3 * q3);
+              if l == 6 {
+                mine = out6;
+              }
+              let a7_0 = s7_0 * dec;
+              let a7_1 = s7_1 * dec;
+              let a7_2 = s7_2 * dec;
+              let a7_3 = s7_3 * dec;
+              let kv7 = simd_sum(a7_0 * k0 + a7_1 * k1 + a7_2 * k2 + a7_3 * k3);
+              let delta7 = (vv[t][h][vq * 8 + 7] - kv7) * b;
+              s7_0 = a7_0 + k0 * delta7;
+              s7_1 = a7_1 + k1 * delta7;
+              s7_2 = a7_2 + k2 * delta7;
+              s7_3 = a7_3 + k3 * delta7;
+              let out7 = simd_sum(s7_0 * q0 + s7_1 * q1 + s7_2 * q2 + s7_3 * q3);
+              if l == 7 {
+                mine = out7;
+              }
+              if l < 8 {
+                o[t][h][vq][l] = mine;
+              }
+            }
+            state[h][vq * 8 + 0][d + 0] = s0_0;
+            state[h][vq * 8 + 0][d + 1] = s0_1;
+            state[h][vq * 8 + 0][d + 2] = s0_2;
+            state[h][vq * 8 + 0][d + 3] = s0_3;
+            state[h][vq * 8 + 1][d + 0] = s1_0;
+            state[h][vq * 8 + 1][d + 1] = s1_1;
+            state[h][vq * 8 + 1][d + 2] = s1_2;
+            state[h][vq * 8 + 1][d + 3] = s1_3;
+            state[h][vq * 8 + 2][d + 0] = s2_0;
+            state[h][vq * 8 + 2][d + 1] = s2_1;
+            state[h][vq * 8 + 2][d + 2] = s2_2;
+            state[h][vq * 8 + 2][d + 3] = s2_3;
+            state[h][vq * 8 + 3][d + 0] = s3_0;
+            state[h][vq * 8 + 3][d + 1] = s3_1;
+            state[h][vq * 8 + 3][d + 2] = s3_2;
+            state[h][vq * 8 + 3][d + 3] = s3_3;
+            state[h][vq * 8 + 4][d + 0] = s4_0;
+            state[h][vq * 8 + 4][d + 1] = s4_1;
+            state[h][vq * 8 + 4][d + 2] = s4_2;
+            state[h][vq * 8 + 4][d + 3] = s4_3;
+            state[h][vq * 8 + 5][d + 0] = s5_0;
+            state[h][vq * 8 + 5][d + 1] = s5_1;
+            state[h][vq * 8 + 5][d + 2] = s5_2;
+            state[h][vq * 8 + 5][d + 3] = s5_3;
+            state[h][vq * 8 + 6][d + 0] = s6_0;
+            state[h][vq * 8 + 6][d + 1] = s6_1;
+            state[h][vq * 8 + 6][d + 2] = s6_2;
+            state[h][vq * 8 + 6][d + 3] = s6_3;
+            state[h][vq * 8 + 7][d + 0] = s7_0;
+            state[h][vq * 8 + 7][d + 1] = s7_1;
+            state[h][vq * 8 + 7][d + 2] = s7_2;
+            state[h][vq * 8 + 7][d + 3] = s7_3;
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+// --------------------------------------------------------------------- full attention ---
+
+/// The norms and RoPE of q and k, and the store of k and v, for the n tokens of the chunk, as
+/// `gated_norm_rope_and_store`: token t is at position start + t. Block (t, h) does head h of q,
+/// then the heads of k.
+fn pf_gated_norm_rope_and_store(q_out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &mut Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &mut Tensor<f16, [?, ?, ?], Memory::HBM>, qkvg : &Tensor<f32, [?, ?], Memory::HBM>, q_norm : &Tensor<f32, [?], Memory::HBM>, k_norm : &Tensor<f32, [?], Memory::HBM>, cos : &Tensor<f32, [?, ?], Memory::HBM>, sin : &Tensor<f32, [?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32, rot : i32, eps : f32) -> void {
+  let half = rot / 2;
+  assert(k_cache.extent(0) >= start + n && v_cache.extent(0) >= start + n && cos.extent(0) >= start + n && sin.extent(0) >= start + n, "pf_gated_norm_rope_and_store: the caches and the angles need rows for the chunk");
+  spawn on(Topology::Device) {
+    for t in 0..n across blocks {
+      for h in 0..q_heads + kv_heads across blocks {
+        let mut x = unsafe { Tensor<f32, [256], Memory::SMEM>::uninit() };
+        let mut part = unsafe { Tensor<f32, [256], Memory::SMEM>::uninit() };
+        for i in 0..256 across lanes {
+          let a = qkvg[t][h * 256 + i];
+          x[i] = a;
+          part[i] = a * a;
+        }
+        let ss = lanes::sum(&part, 256);
+        let inv = 1.0 / (ss / 256.0 + eps).sqrt();
+        for i in 0..256 across lanes {
+          let pos = start + t;
+          let mut w = q_norm[i];
+          if h >= q_heads {
+            w = k_norm[i];
+          }
+          let a = x[i] * inv * w;
+          let mut r = a;
+          if i < rot {
+            let mut j = i;
+            let mut sign : f32 = -1.0;
+            let mut partner = i + half;
+            if i >= half {
+              j = i - half;
+              sign = 1.0;
+              partner = i - half;
+            }
+            let mut wp = q_norm[partner];
+            if h >= q_heads {
+              wp = k_norm[partner];
+            }
+            let b = x[partner] * inv * wp;
+            r = a * cos[pos][j] + sign * b * sin[pos][j];
+          }
+          if h < q_heads {
+            q_out[t][h][i] = r;
+          } else {
+            k_cache[pos][h - q_heads][i] = r as f16;
+            v_cache[pos][h - q_heads][i] = qkvg[t][(kv_heads + h) * 256 + i] as f16;
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// The attention of tokens first to first + m - 1 of the chunk, as `gated_attention_parts` for each:
+/// block (tt, h, w) is a SIMD group for head h of token first + tt, at position start + first + tt.
+/// It does the blocks of 32 positions w, w + ATT_GROUPS, ... up to that position.
+fn pf_gated_attention_parts(part : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, start : i32, first : i32, m : i32, q_heads : i32, group : i32, scale : f32) -> void {
+  spawn on(Topology::Device) {
+    for tt in 0..m across blocks {
+      for h in 0..q_heads across blocks {
+        for w in 0..8 across blocks {
+          let mut stats = unsafe { Tensor<f32, [1, 2], Memory::SMEM>::uninit() };
+          for s in 0..1 across subgroups {
+            for l in 0..32 across lanes(32) {
+              let t = first + tt;
+              let pos = start + t;
+              let g = h / group;
+              let d = 8 * l;
+              let q0 = q[t][h][d] * scale;
+              let q1 = q[t][h][d + 1] * scale;
+              let q2 = q[t][h][d + 2] * scale;
+              let q3 = q[t][h][d + 3] * scale;
+              let q4 = q[t][h][d + 4] * scale;
+              let q5 = q[t][h][d + 5] * scale;
+              let q6 = q[t][h][d + 6] * scale;
+              let q7 = q[t][h][d + 7] * scale;
+              let mut big : f32 = -3.0e38;
+              let mut total : f32 = 0.0;
+              let mut o0 : f32 = 0.0;
+              let mut o1 : f32 = 0.0;
+              let mut o2 : f32 = 0.0;
+              let mut o3 : f32 = 0.0;
+              let mut o4 : f32 = 0.0;
+              let mut o5 : f32 = 0.0;
+              let mut o6 : f32 = 0.0;
+              let mut o7 : f32 = 0.0;
+              let chunks = (pos + 32) / 32;
+              let mut c = w;
+              while c < chunks {
+                let r0 = c * 32;
+                let mut mine : f32 = -3.0e38;
+                for r in 0..32 {
+                  let row = r0 + r;
+                  let mut kept = row;
+                  if row > pos {
+                    kept = pos;
+                  }
+                  let k0 = half4_at(k_cache, kept, g, d, 0);
+                  let k1 = half4_at(k_cache, kept, g, d, 1);
+                  let k2 = half4_at(k_cache, kept, g, d, 2);
+                  let k3 = half4_at(k_cache, kept, g, d, 3);
+                  let k4 = half4_at(k_cache, kept, g, d + 4, 0);
+                  let k5 = half4_at(k_cache, kept, g, d + 4, 1);
+                  let k6 = half4_at(k_cache, kept, g, d + 4, 2);
+                  let k7 = half4_at(k_cache, kept, g, d + 4, 3);
+                  let mut score = simd_sum(((k0 * q0 + k1 * q1) + (k2 * q2 + k3 * q3)) + ((k4 * q4 + k5 * q5) + (k6 * q6 + k7 * q7)));
+                  if row > pos {
+                    score = -3.0e38;
+                  }
+                  if r == l {
+                    mine = score;
+                  }
+                }
+                let top = big.max(simd_max(mine));
+                let shrink = (big - top).fast_exp();
+                let p = (mine - top).fast_exp();
+                total = total * shrink + simd_sum(p);
+                o0 = o0 * shrink;
+                o1 = o1 * shrink;
+                o2 = o2 * shrink;
+                o3 = o3 * shrink;
+                o4 = o4 * shrink;
+                o5 = o5 * shrink;
+                o6 = o6 * shrink;
+                o7 = o7 * shrink;
+                for r in 0..32 {
+                  let row = r0 + r;
+                  let mut kept = row;
+                  if row > pos {
+                    kept = pos;
+                  }
+                  let pr = simd_value(p, r);
+                  o0 = o0 + half4_at(v_cache, kept, g, d, 0) * pr;
+                  o1 = o1 + half4_at(v_cache, kept, g, d, 1) * pr;
+                  o2 = o2 + half4_at(v_cache, kept, g, d, 2) * pr;
+                  o3 = o3 + half4_at(v_cache, kept, g, d, 3) * pr;
+                  o4 = o4 + half4_at(v_cache, kept, g, d + 4, 0) * pr;
+                  o5 = o5 + half4_at(v_cache, kept, g, d + 4, 1) * pr;
+                  o6 = o6 + half4_at(v_cache, kept, g, d + 4, 2) * pr;
+                  o7 = o7 + half4_at(v_cache, kept, g, d + 4, 3) * pr;
+                }
+                big = top;
+                c = c + 8;
+              }
+              part[tt][h][w][d] = o0;
+              part[tt][h][w][d + 1] = o1;
+              part[tt][h][w][d + 2] = o2;
+              part[tt][h][w][d + 3] = o3;
+              part[tt][h][w][d + 4] = o4;
+              part[tt][h][w][d + 5] = o5;
+              part[tt][h][w][d + 6] = o6;
+              part[tt][h][w][d + 7] = o7;
+              if l < 2 {
+                let mut x = big;
+                if l == 1 {
+                  x = total;
+                }
+                stats[s][l] = x;
+              }
+            }
+            for l in 0..2 across lanes(32) {
+              part[tt][h][w][256 + l] = stats[s][l];
+            }
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// Merges the 8 parts of each head of tokens first to first + m - 1, and multiplies by sigmoid of
+/// the gate, as `gated_attention_merge`.
+fn pf_gated_attention_merge(y : &mut Tensor<f32, [?, ?], Memory::HBM>, part : &Tensor<f32, [?, ?, ?, ?], Memory::HBM>, qkvg : &Tensor<f32, [?, ?], Memory::HBM>, first : i32, m : i32, q_heads : i32, gate_at : i32) -> void {
+  spawn on(Topology::Device) {
+    for tt in 0..m across blocks {
+      for h in 0..q_heads across blocks {
+        for dq in 0..8 across blocks {
+          for s in 0..1 across subgroups {
+            for l in 0..32 across lanes(32) {
+              let t = first + tt;
+              let d = dq * 32 + l;
+              let mut big : f32 = -3.0e38;
+              for c in 0..8 {
+                big = big.max(part[tt][h][c][256]);
+              }
+              let mut total : f32 = 0.0;
+              let mut acc : f32 = 0.0;
+              for c in 0..8 {
+                let w = (part[tt][h][c][256] - big).fast_exp();
+                total = total + w * part[tt][h][c][257];
+                acc = acc + w * part[tt][h][c][d];
+              }
+              let gate = qkvg[t][gate_at + h * 256 + d];
+              y[t][h * 256 + d] = acc / total / (1.0 + (0.0 - gate).fast_exp());
+            }
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// The gated attention of the n tokens of the chunk, ATT_TOKENS at a time: y[t] for each token.
+fn pf_gated_attention(y : &mut Tensor<f32, [?, ?], Memory::HBM>, parts : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, qkvg : &Tensor<f32, [?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32) -> void {
+  let mut first = 0;
+  while first < n {
+    let m = i32::min(ATT_TOKENS, n - first);
+    pf_gated_attention_parts(parts, q, k_cache, v_cache, start, first, m, q_heads, q_heads / kv_heads, 0.0625);
+    pf_gated_attention_merge(y, parts, qkvg, first, m, q_heads, (q_heads + 2 * kv_heads) * 256);
+    first = first + m;
+  }
+  return;
+}
+
+// ------------------------------------------------------------------------------ experts ---
+
+/// x[t] += sigmoid(router[t][at]) * out[t], for t below n: the shared expert times its gate.
+fn pf35_add_shared(x : &mut Tensor<f32, [?, ?], Memory::HBM>, out : &Tensor<f32, [?, ?], Memory::HBM>, router : &Tensor<f32, [?, ?], Memory::HBM>, at : i32, n : i32, dim : i32) -> void {
+  spawn on(Topology::Device) {
+    for t in 0..n across blocks {
+      for b in 0..(dim + 255) / 256 across blocks {
+        for l in 0..256 across lanes {
+          let i = b * 256 + l;
+          if i < dim {
+            let g = 1.0 / (1.0 + (0.0 - router[t][at]).fast_exp());
+            x[t][i] = x[t][i] + g * out[t][i];
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// The experts and the shared expert of a layer, for the n tokens of the chunk: x += the experts of
+/// each token, for the norm of x in xn, as `pf_experts`, and the shared expert times its gate.
+fn pf35_experts(p : &mut Prefill35, layer : &Qwen35Layer, c : &Config, n : i32, tiles : i32) -> void {
+  let k = c.experts_per_token;
+  let experts = c.num_experts;
+  let inter = c.moe_intermediate_size;
+  let shared = c.shared_expert_inter;
+  pf_mm_bf16(&mut p.router, &layer.router, &p.xn, &p.rows, &p.zeros, 0, &p.no_bias, false, false, experts + 1, c.hidden_size, tiles);
+  pf_top_k(&mut p.ids, &mut p.wts, &p.router, n, experts, k);
+  let e_tiles = p.e_rows.len() / 16;
+  pf_count_experts(&mut p.e_counts, &mut p.e_lane_counts, &p.ids, n, k, experts);
+  pf_place_experts(&p.e_rows, &p.slot, &p.e_counts, &p.e_lane_counts, &p.ids, n, k, experts);
+  pf_expert_bases(&mut p.e_bases, &p.e_counts, experts, e_tiles);
+  pf_mm(&mut p.e_gu, &layer.gate_up, &p.xn, &p.e_rows, &p.e_bases, 2 * inter, &p.no_bias, false, false, 2 * inter, c.hidden_size, e_tiles);
+  pf_silu_mul(&mut p.e_h, &p.e_gu, e_tiles * 16, inter);
+  pf_mm(&mut p.e_out, &layer.down, &p.e_h, &p.e_ident, &p.e_bases, c.hidden_size, &p.no_bias, false, false, c.hidden_size, inter, e_tiles);
+  pf_combine(&mut p.x, &p.e_out, &p.wts, &p.slot, n, k, c.hidden_size);
+  pf_mm(&mut p.s_gu, &layer.shared_gate_up, &p.xn, &p.rows, &p.zeros, 0, &p.no_bias, false, false, 2 * shared, c.hidden_size, tiles);
+  pf_silu_mul(&mut p.s_h, &p.s_gu, n, shared);
+  pf_mm(&mut p.s_out, &layer.shared_down, &p.s_h, &p.rows, &p.zeros, 0, &p.no_bias, false, false, c.hidden_size, shared, tiles);
+  pf35_add_shared(&mut p.x, &p.s_out, &p.router, experts, n, c.hidden_size);
+  return;
+}
+
+// ------------------------------------------------------------------------------- chunk ---
+
+/// Runs tokens start to start + n - 1 of the prompt, in `p.tokens`, through every layer. The state
+/// of each layer is updated, and the hidden states go to p.x.
+fn pf35_chunk(w : &Qwen35Weights, s : &mut Qwen35State, p : &mut Prefill35, start : i32, n : i32) -> void {
+  let c = &w.config;
+  let eps = c.rms_norm_eps as f32;
+  let tiles = (n + 15) / 16;
+  let kh = c.linear_k_heads;
+  let vh = c.linear_v_heads;
+  let z_at = (2 * kh + vh) * 128;
+  let b_at = z_at + vh * 128;
+  let a_at = b_at + vh;
+  let qkv_rows = (2 * c.num_q_heads + 2 * c.num_kv_heads) * 256;
+  pf_embed(&mut p.x, &w.embed, &p.tokens, n, c.hidden_size);
+  let mut l = 0;
+  for ls in s.layers.iter_mut() {
+    let layer = &w.layers[l];
+    pf35_rms_norm(&mut p.xn, &p.x, &layer.attn_norm, n, c.hidden_size, eps);
+    if layer.full_attention {
+      pf_mm(&mut p.proj, &layer.qkv, &p.xn, &p.rows, &p.zeros, 0, &p.no_bias, false, false, qkv_rows, c.hidden_size, tiles);
+      pf_gated_norm_rope_and_store(&mut p.q, &mut ls.k, &mut ls.v, &p.proj, &layer.q_norm, &layer.k_norm, &s.cos, &s.sin, start, n, c.num_q_heads, c.num_kv_heads, c.rotary_dim, eps);
+      pf_gated_attention(&mut p.y, &mut p.parts, &p.q, &ls.k, &ls.v, &p.proj, start, n, c.num_q_heads, c.num_kv_heads);
+      // The product goes to xn, which is free until the norm, as in `pf_chunk`.
+      pf_mm(&mut p.xn, &layer.attn_out, &p.y, &p.rows, &p.zeros, 0, &p.no_bias, false, false, c.hidden_size, c.num_q_heads * 256, tiles);
+    } else {
+      pf_mm(&mut p.proj, &layer.linear_in, &p.xn, &p.rows, &p.zeros, 0, &p.no_bias, false, false, a_at + vh, c.hidden_size, tiles);
+      pf_dn_conv(&mut p.dq, &mut p.dk, &mut p.dv, &ls.conv, &p.proj, &layer.conv, n, kh, vh);
+      pf_dn_conv_state(&mut ls.conv, &p.proj, n, 2 * kh + vh);
+      pf_dn_gates(&mut p.beta, &mut p.decay, &p.proj, &layer.neg_a, &layer.dt_bias, b_at, a_at, n, vh);
+      pf_dn_recur(&mut p.o, &mut ls.s, &p.dq, &p.dk, &p.dv, &p.beta, &p.decay, vh / kh, n, vh);
+      pf_dn_gated_norm(&mut p.y, &p.o, &p.proj, &layer.linear_norm, z_at, n, vh, eps);
+      pf_mm(&mut p.xn, &layer.linear_out, &p.y, &p.rows, &p.zeros, 0, &p.no_bias, false, false, c.hidden_size, vh * 128, tiles);
+    }
+    pf35_add_rms_norm(&mut p.x, &mut p.xn, &layer.mlp_norm, n, c.hidden_size, eps);
+    pf35_experts(p, layer, c, n, tiles);
+    l = l + 1;
+  }
+  return;
+}
+
+/// Runs the prompt through every layer, in chunks of up to CHUNK tokens, from position 0. The
+/// hidden state of the last token is then in `s.x`, as after `run_qwen35_layers`, so
+/// `predict_qwen35` gives the next token.
+fn prefill_qwen35(w : &Qwen35Weights, s : &mut Qwen35State, prompt : &Vec<i32>) -> void {
+  let c = &w.config;
+  let count = prompt.len();
+  assert(count > 0 && count <= s.max_seq, "prefill_qwen35: the prompt must have tokens and fit in the state");
+  let chunk = i32::min(CHUNK, (count + 15) / 16 * 16);
+  let mut p = new_prefill35(c, chunk);
+  let mut start = 0;
+  let mut last = 0;
+  while start < count {
+    let n = i32::min(chunk, count - start);
+    let mut ids = Tensor<i32>([chunk]);
+    let mut rows = Tensor<i32>([p.rows.len()]);
+    for t in 0..p.rows.len() {
+      rows[t] = -1;
+      if t < n {
+        rows[t] = t;
+      }
+    }
+    for t in 0..chunk {
+      if t < n {
+        ids[t] = prompt[start + t];
+      } else {
+        ids[t] = 0;
+      }
+    }
+    p.tokens = transfer(ids, Memory::HBM);
+    p.rows = transfer(rows, Memory::HBM);
+    pf35_chunk(w, s, &mut p, start, n);
+    last = n;
+    start = start + n;
+  }
+  pf_take_row(&mut s.x, &p.x, last - 1, c.hidden_size);
+  return;
+}
