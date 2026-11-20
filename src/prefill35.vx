@@ -29,7 +29,7 @@ import qwen::weights;
 /// The tensors of a chunk, made once. `rows`, `zeros` and the `e_` tensors are those of `Prefill`.
 /// `proj` is the output of `qkv` or `linear_in` for each token, and `y` the input of `attn_out` or
 /// `linear_out`. The `d` tensors are those of the DeltaNet, and the `s_` tensors those of the shared
-/// expert. `router` has the logits of the experts, then that of the gate of the shared expert.
+/// expert. `router` has the logits of the experts, then that of the gate of the shared expert, and zeros to a whole number of blocks of 64.
 struct Prefill35 {
   chunk : i32,
   tokens : Tensor<i32, [?], Memory::HBM>,
@@ -96,7 +96,7 @@ fn new_prefill35(c : &Config, chunk : i32) -> Prefill35 {
     beta: transfer(Tensor<f32>([chunk, vh]), Memory::HBM),
     decay: transfer(Tensor<f32>([chunk, vh]), Memory::HBM),
     o: transfer(Tensor<f32>([chunk, vh, 16, 8]), Memory::HBM),
-    router: transfer(Tensor<f32>([cap, experts + 1]), Memory::HBM),
+    router: transfer(Tensor<f32>([cap, (experts + 1 + 63) / 64 * 64]), Memory::HBM),
     ids: transfer(Tensor<i32>([chunk, k]), Memory::HBM),
     wts: transfer(Tensor<f32>([chunk, k]), Memory::HBM),
     e_rows: transfer(Tensor<i32>([positions]), Memory::HBM),
@@ -989,7 +989,13 @@ fn pf35_experts(p : &mut Prefill35, layer : &Qwen35Layer, c : &Config, n : i32, 
   let experts = c.num_experts;
   let inter = c.moe_intermediate_size;
   let shared = c.shared_expert_inter;
-  pf_mm_bf16(&mut p.router, &layer.router, &p.xn, &p.rows, &p.zeros, 0, &p.no_bias, false, false, experts + 1, c.hidden_size, tiles);
+  // With Q4_0 experts, whose products round to f16, the router rounds to f16 too, in the faster
+  // kernel. A bf16 file keeps the f32 products.
+  if layer.gate_up.dtype == U4 {
+    pf_mm_bf16_mlir(&mut p.router, &layer.router, &p.xn, &p.rows, &p.zeros, 0, experts + 1, c.hidden_size, tiles);
+  } else {
+    pf_mm_bf16(&mut p.router, &layer.router, &p.xn, &p.rows, &p.zeros, 0, &p.no_bias, false, false, experts + 1, c.hidden_size, tiles);
+  }
   pf_top_k(&mut p.ids, &mut p.wts, &p.router, n, experts, k);
   let e_tiles = p.e_rows.len() / 16;
   pf_count_experts(&mut p.e_counts, &mut p.e_lane_counts, &p.ids, n, k, experts);
@@ -997,7 +1003,7 @@ fn pf35_experts(p : &mut Prefill35, layer : &Qwen35Layer, c : &Config, n : i32, 
   pf_expert_bases(&mut p.e_bases, &p.e_counts, experts, e_tiles);
   pf_live_positions(&mut p.e_ident, &p.e_rows);
   pf_mm(&mut p.e_gu, &layer.gate_up, &p.xn, &p.e_rows, &p.e_bases, 2 * inter, &p.no_bias, false, false, 2 * inter, c.hidden_size, e_tiles);
-  pf_silu_mul(&mut p.e_h, &p.e_gu, e_tiles * 16, inter);
+  pf_silu_mul_live(&mut p.e_h, &p.e_gu, &p.e_ident, e_tiles * 16, inter);
   pf_mm(&mut p.e_out, &layer.down, &p.e_h, &p.e_ident, &p.e_bases, c.hidden_size, &p.no_bias, false, false, c.hidden_size, inter, e_tiles);
   pf_combine(&mut p.x, &p.e_out, &p.wts, &p.slot, n, k, c.hidden_size);
   pf_mm(&mut p.s_gu, &layer.shared_gate_up, &p.xn, &p.rows, &p.zeros, 0, &p.no_bias, false, false, 2 * shared, c.hidden_size, tiles);

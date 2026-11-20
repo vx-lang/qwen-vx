@@ -3,16 +3,18 @@
 # See LICENSE for license information.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 """Prints pf_mm_q4_mlir of src/prefill.vx: the Q4_0 product of a chunk as one threadgroup mlir! block.
+With --bf16, prints pf_mm_bf16_mlir: the same product for a bf16 matrix, whose weights go to f16.
 
 The design is that of llama.cpp's kernel_mul_mm_id (ggml/src/ggml-metal/kernels/mul_mm.metal),
 MIT License, Copyright (c) 2023-2026 The ggml authors. Edit this script, not the generated MLIR:
 
-    python3 scripts/mlir_kernels/expert_product.py
+    python3 scripts/mlir_kernels/expert_product.py [--bf16]
 
 prints the function; replace it in src/prefill.vx.
 """
 import sys
 mode = 'app'
+bf16 = '--bf16' in sys.argv[1:]
 hint = True
 ACC = '!gpu.mma_matrix<8x8xf32, "COp">'
 AOP = '!gpu.mma_matrix<8x8xf16, "AOp">'
@@ -20,13 +22,16 @@ BOP = '!gpu.mma_matrix<8x8xf16, "BOp">'
 L = []
 e = L.append
 name = 'pf_mm_q4_mlir' if mode == 'app' else ('mm_mlir2h' if hint else 'mm_mlir2')
-e(f'fn {name}(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, list : &Tensor<i32, [?], Memory::HBM>, bases : &Tensor<i32, [?], Memory::HBM>, stride : i32, rows : i32, cols : i32, tiles : i32) -> void {{')
+if bf16:
+    name = 'pf_mm_bf16_mlir'
+WT = 'w : &Tensor<bf16, [?], Memory::HBM>' if bf16 else 'w : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>'
+e(f'fn {name}(y : &mut Tensor<f32, [?, ?], Memory::HBM>, {WT}, x : &Tensor<f32, [?, ?], Memory::HBM>, list : &Tensor<i32, [?], Memory::HBM>, bases : &Tensor<i32, [?], Memory::HBM>, stride : i32, rows : i32, cols : i32, tiles : i32) -> void {{')
 e('  spawn on(Topology::Device) {')
-e('    for rb in 0..rows / 64 across blocks {')
+e('    for rb in 0..(rows + 63) / 64 across blocks {' if bf16 else '    for rb in 0..rows / 64 across blocks {')
 e('      for tb in 0..(tiles + 1) / 2 across blocks {' if mode == 'app' else '      for tb in 0..tiles across blocks {')
 e('        let mut sw = unsafe { Tensor<f16, [2048], Memory::SMEM>::uninit() };')
 e('        let mut sx = unsafe { Tensor<f16, [1024], Memory::SMEM>::uninit() };')
-e('        let _d = mlir!( threads : 128, inputs : (%sw = &mut sw : memref<2048xf16, 3>, %sx = &mut sx : memref<1024xf16, 3>, %y = y : memref<?x?xf32>, %w = w : memref<?xi32>, %sc = scales : memref<?xf16>, %x = x : memref<?x?xf32>, %list = list : memref<?xi32>, %bases = bases : memref<?xi32>, %stride = stride : i32, %cols = cols : i32, %rb = rb : i32, %tb = tb : i32), returns : i32, dialects : ['+('"arith", "memref", "scf", "gpu", "vector", "vx"' if hint else '"arith", "memref", "scf", "gpu", "vector"')+'], ensures : [writes_only(sw), writes_only(sx), reads_only(w), reads_only(scales), reads_only(x), reads_only(list), reads_only(bases), writes_only(y[tb * 32..tb * 32 + 32][rb * 64..rb * 64 + 64])]) {')
+e('        let _d = mlir!( threads : 128, inputs : (%sw = &mut sw : memref<2048xf16, 3>, %sx = &mut sx : memref<1024xf16, 3>, %y = y : memref<?x?xf32>, ' + ('%w = w : memref<?xbf16>, %rows = rows : i32' if bf16 else '%w = w : memref<?xi32>, %sc = scales : memref<?xf16>') + ', %x = x : memref<?x?xf32>, %list = list : memref<?xi32>, %bases = bases : memref<?xi32>, %stride = stride : i32, %cols = cols : i32, %rb = rb : i32, %tb = tb : i32), returns : i32, dialects : ['+('"arith", "memref", "scf", "gpu", "vector", "vx"' if hint else '"arith", "memref", "scf", "gpu", "vector"')+'], ensures : [writes_only(sw), writes_only(sx), reads_only(w), ' + ('' if bf16 else 'reads_only(scales), ') + 'reads_only(x), reads_only(list), reads_only(bases), writes_only(y[tb * 32..tb * 32 + 32][rb * 64..rb * 64 + 64])]) {')
 b = lambda s: e('          ' + s)
 consts = {}
 def c(n):
@@ -64,10 +69,20 @@ b('%rb64 = arith.muli %rbi, %k64 : index')
 b('%r = arith.addi %rb64, %rl : index')
 b('%bs = arith.muli %base, %stridei : index')
 b('%row = arith.addi %bs, %r : index')
-b('%rw = arith.muli %row, %WPR : index')
-b('%kh2 = arith.muli %kh, %k2 : index')
-b('%wbase = arith.addi %rw, %kh2 : index')
-b('%sbase = arith.muli %row, %G : index')
+if bf16:
+    # A row past the last reads row 0 of the matrix and gets zeros.
+    b('%rowsi = arith.index_cast %rows : i32 to index')
+    b('%rok = arith.cmpi ult, %r, %rowsi : index')
+    b('%rowc = arith.select %rok, %row, %k0 : index')
+    b('%rw = arith.muli %rowc, %colsi : index')
+    b('%kh16 = arith.muli %kh, %k16 : index')
+    b('%wbase = arith.addi %rw, %kh16 : index')
+    b('%hz = arith.constant dense<0.0> : vector<4xf16>')
+else:
+    b('%rw = arith.muli %row, %WPR : index')
+    b('%kh2 = arith.muli %kh, %k2 : index')
+    b('%wbase = arith.addi %rw, %kh2 : index')
+    b('%sbase = arith.muli %row, %G : index')
 b(f'%kh1024 = arith.muli %kh, {c(1024)} : index')
 b('%swd = arith.addi %kh1024, %rl : index')          # sw[(kh * 16 + k) * 64 + rl]
 # inputs: lane copies 8 columns cl = (l % 4) * 8 of token tl = sg * 8 + l / 4
@@ -108,15 +123,28 @@ accs = ', '.join(f'%a{i} = %z' for i in range(8))
 accty = ', '.join([ACC] * 8)
 b(f'%res:8 = scf.for %g = %k0 to %Gl step %k1 iter_args({accs}) -> ({accty}) {{')
 d = lambda s: e('            ' + s)
-d('%g4 = arith.muli %g, %k4 : index')
-d('%wa = arith.addi %wbase, %g4 : index')
-d('%q = vector.load %w[%wa] {alignment = 8} : memref<?xi32>, vector<2xi32>')
-d('%sa = arith.addi %sbase, %g : index')
-d('%s = memref.load %sc[%sa] : memref<?xf16>')
-d('%m = arith.mulf %s, %m8 : f16')
-d('%sv = vector.broadcast %s : f16 to vector<4xf16>')
-d('%mv = vector.broadcast %m : f16 to vector<4xf16>')
-for wi in range(2):
+if bf16:
+    # Lane l loads columns kh * 16 to + 15 of its row, as 4 vectors of 4.
+    d('%g32w = arith.muli %g, %k32 : index')
+    d('%wa = arith.addi %wbase, %g32w : index')
+    for wi in range(2):
+        for hi in range(2):
+            t = f'{wi}{hi}'
+            d(f'%wa{t} = arith.addi %wa, {c(wi * 8 + hi * 4)} : index')
+            d(f'%b{t} = vector.load %w[%wa{t}] {{alignment = 8}} : memref<?xbf16>, vector<4xbf16>')
+            d(f'%we{t} = arith.extf %b{t} : vector<4xbf16> to vector<4xf32>')
+            d(f'%t{t} = arith.truncf %we{t} : vector<4xf32> to vector<4xf16>')
+            d(f'%d{t} = arith.select %rok, %t{t}, %hz : vector<4xf16>')
+if not bf16:
+    d('%g4 = arith.muli %g, %k4 : index')
+    d('%wa = arith.addi %wbase, %g4 : index')
+    d('%q = vector.load %w[%wa] {alignment = 8} : memref<?xi32>, vector<2xi32>')
+    d('%sa = arith.addi %sbase, %g : index')
+    d('%s = memref.load %sc[%sa] : memref<?xf16>')
+    d('%m = arith.mulf %s, %m8 : f16')
+    d('%sv = vector.broadcast %s : f16 to vector<4xf16>')
+    d('%mv = vector.broadcast %m : f16 to vector<4xf16>')
+for wi in range(0 if bf16 else 2):
     d(f'%q{wi} = vector.extract %q[{wi}] : i32 from vector<2xi32>')
     d(f'%qb{wi} = vector.broadcast %q{wi} : i32 to vector<4xi32>')
     for hi, sh in enumerate(['%shl', '%shh']):
