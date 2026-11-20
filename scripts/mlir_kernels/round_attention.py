@@ -10,6 +10,7 @@ work for each of its n queries that the block of `vec_attention_parts` does for 
 order, but it reads each row of K and V once for all of them. A query skips the blocks of 32
 positions after its own position, and a row after its position gets the score -3e38 and so the
 weight 0, as in `vec_attention_parts`. The rows after the last query are not read.
+round_attention_merge, which merges the parts, is Vx code in src/round.vx.
 
     python3 scripts/mlir_kernels/round_attention.py
 
@@ -143,85 +144,6 @@ def parts(n):
     e('}')
 
 
-def merge():
-    """`vec_attention_merge` for query t0 + t, t below n, with its parts at part[h][w][132 (t0 + t) ..]."""
-    e('')
-    e('/// `vec_attention_merge` for queries t0 to t0 + n - 1, whose parts are at part[h][w][132 t ..]: out[t][h]')
-    e('/// gets the attention of head h of query t.')
-    e('fn round_attention_merge(out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, part : &Tensor<f32, [?, ?, ?], Memory::HBM>, parts : i32, t0 : i32, n : i32, q_heads : i32) -> void {')
-    e('  spawn on(Topology::Device) {')
-    e('    for i in 0..n across blocks {')
-    e('      for h in 0..q_heads across blocks {')
-    e('        let t = t0 + i;')
-    e('        let _d = mlir!( threads : 128, inputs : (%out = out : memref<?x?x?xf32>, %part = part : memref<?x?x?xf32>, %parts = parts : i32, %h = h : i32, %t = t : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(part), writes_only(out[t][h])]) {')
-    b = lambda s: e('          ' + s)
-    for c in [0, 1, 2, 3, 4, 16, 32, 64, 96, 128, 129, 132]:
-        b(f'%c{c} = arith.constant {c} : index')
-    b('%neg = arith.constant -3.0e38 : f32')
-    b('%zero = arith.constant 0.0 : f32')
-    b('%one = arith.constant 1.0 : f32')
-    b('%tid = gpu.thread_id x')
-    b('%sg = arith.divui %tid, %c32 : index')
-    b('%l = arith.remui %tid, %c32 : index')
-    b('%hi = arith.index_cast %h : i32 to index')
-    b('%ti = arith.index_cast %t : i32 to index')
-    b('%base = arith.muli %ti, %c132 : index')
-    b('%bm = arith.addi %base, %c128 : index')
-    b('%bs = arith.addi %base, %c129 : index')
-    b('%np = arith.index_cast %parts : i32 to index')
-    b('%last = arith.subi %np, %c1 : index')
-    for j in range(4):
-        b(f'%p{j} = arith.addi %l, %c{32 * j} : index')
-        b(f'%live{j} = arith.cmpi ult, %p{j}, %np : index')
-        b(f'%pc{j} = arith.minui %p{j}, %last : index')
-        b(f'%mr{j} = memref.load %part[%hi, %pc{j}, %bm] : memref<?x?x?xf32>')
-        b(f'%m{j} = arith.select %live{j}, %mr{j}, %neg : f32')
-    b('%m01 = arith.maxnumf %m0, %m1 : f32')
-    b('%m23 = arith.maxnumf %m2, %m3 : f32')
-    b('%mx = arith.maxnumf %m01, %m23 : f32')
-    b('%big = gpu.subgroup_reduce maxnumf %mx : (f32) -> f32')
-    for j in range(4):
-        b(f'%dm{j} = arith.subf %m{j}, %big : f32')
-        b(f'%w{j} = math.exp %dm{j} : f32')
-        b(f'%s{j} = memref.load %part[%hi, %pc{j}, %bs] : memref<?x?x?xf32>')
-        b(f'%ws{j} = arith.mulf %w{j}, %s{j} : f32')
-        b(f'%wv{j} = vector.broadcast %w{j} : f32 to vector<4xf32>')
-    b('%t01 = arith.addf %ws0, %ws1 : f32')
-    b('%t23 = arith.addf %ws2, %ws3 : f32')
-    b('%ts = arith.addf %t01, %t23 : f32')
-    b('%total = gpu.subgroup_reduce add %ts : (f32) -> f32')
-    b('%inv = arith.divf %one, %total : f32')
-    b('%lane0 = arith.cmpi eq, %l, %c0 : index')
-    b('%sg4 = arith.muli %sg, %c4 : index')
-    b('%vz4 = arith.constant dense<0.0> : vector<4xf32>')
-    b('scf.for %n = %c0 to %c128 step %c16 {')
-    c = lambda s: e('            ' + s)
-    c('%d = arith.addi %n, %sg4 : index')
-    c('%pd = arith.addi %base, %d : index')
-    acc = '%vz4'
-    for j in range(4):
-        c(f'%x{j} = vector.load %part[%hi, %pc{j}, %pd] {{alignment = 16}} : memref<?x?x?xf32>, vector<4xf32>')
-        c(f'%a{j} = vector.fma %x{j}, %wv{j}, {acc} : vector<4xf32>')
-        acc = f'%a{j}'
-    for i in range(4):
-        c(f'%e{i} = vector.extract {acc}[{i}] : f32 from vector<4xf32>')
-        c(f'%r{i} = gpu.subgroup_reduce add %e{i} : (f32) -> f32')
-        c(f'%o{i} = arith.mulf %r{i}, %inv : f32')
-    c('scf.if %lane0 {')
-    for i in range(4):
-        c(f'  %d{i} = arith.addi %d, %c{i} : index')
-        c(f'  memref.store %o{i}, %out[%ti, %hi, %d{i}] : memref<?x?x?xf32>')
-    c('}')
-    b('}')
-    b('macro.yield %h : i32')
-    e('        };')
-    e('      }')
-    e('    }')
-    e('  }')
-    e('  return;')
-    e('}')
-
-
 def dispatch():
     """Calls the kernel of the parts for n queries."""
     e('')
@@ -243,5 +165,4 @@ def dispatch():
 dispatch()
 for n in range(1, MAX_N + 1):
     parts(n)
-merge()
 print('\n'.join(L))
