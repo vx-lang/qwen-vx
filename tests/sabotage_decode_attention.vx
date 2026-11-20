@@ -1,0 +1,520 @@
+// Throwaway: broken copies of vec_attention_parts, each run through the checks of
+// tests/decode_attention.vx. Each line must show some values off.
+//
+// RUN: vxc %s --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx | grep off; false
+import core::num;
+import qwen::attention;
+
+fn parts_no_mask(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, pos : i32, q_heads : i32, group : i32, nwg : i32, scale : f32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..q_heads across blocks {
+      for w in 0..nwg across blocks {
+        let mut stats = unsafe { Tensor<f32, [1, 2], Memory::SMEM>::uninit() };
+        for s in 0..1 across subgroups {
+          for l in 0..32 across lanes(32) {
+            let g = h / group;
+            let d = 4 * l;
+            let q0 = q[h][d] * scale;
+            let q1 = q[h][d + 1] * scale;
+            let q2 = q[h][d + 2] * scale;
+            let q3 = q[h][d + 3] * scale;
+            let mut big : f32 = -3.0e38;
+            let mut total : f32 = 0.0;
+            let mut o0 : f32 = 0.0;
+            let mut o1 : f32 = 0.0;
+            let mut o2 : f32 = 0.0;
+            let mut o3 : f32 = 0.0;
+            let chunks = (pos + 32) / 32;
+            let mut c = w;
+            while c < chunks {
+              let r0 = c * 32;
+              let mut mine : f32 = -3.0e38;
+              for r in 0..32 {
+                let row = r0 + r;
+                let mut kept = row;
+                if row > pos {
+                  kept = pos;
+                }
+                let mut score = lane_sum(dot4(k_cache, kept, g, d, q0, q1, q2, q3));
+                if r == l {
+                  mine = score;
+                }
+              }
+              let top = big.max(lane_max(mine));
+              let shrink = (big - top).fast_exp();
+              let p = (mine - top).fast_exp();
+              total = total * shrink + lane_sum(p);
+              o0 = o0 * shrink;
+              o1 = o1 * shrink;
+              o2 = o2 * shrink;
+              o3 = o3 * shrink;
+              for r in 0..32 {
+                let row = r0 + r;
+                let mut kept = row;
+                if row > pos {
+                  kept = pos;
+                }
+                let pr = lane_value(p, r);
+                o0 = fused(half_at(v_cache, kept, g, d, 0), pr, o0);
+                o1 = fused(half_at(v_cache, kept, g, d, 1), pr, o1);
+                o2 = fused(half_at(v_cache, kept, g, d, 2), pr, o2);
+                o3 = fused(half_at(v_cache, kept, g, d, 3), pr, o3);
+              }
+              big = top;
+              c = c + nwg;
+            }
+            part[h][w][d] = o0;
+            part[h][w][d + 1] = o1;
+            part[h][w][d + 2] = o2;
+            part[h][w][d + 3] = o3;
+            // Every lane has the same largest score and sum of the weights. Lanes 0 and 1 keep them for the
+            // next loop.
+            if l < 2 {
+              let mut x = big;
+              if l == 1 {
+                x = total;
+              }
+              stats[s][l] = x;
+            }
+          }
+          for l in 0..2 across lanes(32) {
+            part[h][w][128 + l] = stats[s][l];
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+fn parts_no_clamp(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, pos : i32, q_heads : i32, group : i32, nwg : i32, scale : f32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..q_heads across blocks {
+      for w in 0..nwg across blocks {
+        let mut stats = unsafe { Tensor<f32, [1, 2], Memory::SMEM>::uninit() };
+        for s in 0..1 across subgroups {
+          for l in 0..32 across lanes(32) {
+            let g = h / group;
+            let d = 4 * l;
+            let q0 = q[h][d] * scale;
+            let q1 = q[h][d + 1] * scale;
+            let q2 = q[h][d + 2] * scale;
+            let q3 = q[h][d + 3] * scale;
+            let mut big : f32 = -3.0e38;
+            let mut total : f32 = 0.0;
+            let mut o0 : f32 = 0.0;
+            let mut o1 : f32 = 0.0;
+            let mut o2 : f32 = 0.0;
+            let mut o3 : f32 = 0.0;
+            let chunks = (pos + 32) / 32;
+            let mut c = w;
+            while c < chunks {
+              let r0 = c * 32;
+              let mut mine : f32 = -3.0e38;
+              for r in 0..32 {
+                let row = r0 + r;
+                let kept = row;
+                let mut score = lane_sum(dot4(k_cache, kept, g, d, q0, q1, q2, q3));
+                if row > pos {
+                  score = -3.0e38;
+                }
+                if r == l {
+                  mine = score;
+                }
+              }
+              let top = big.max(lane_max(mine));
+              let shrink = (big - top).fast_exp();
+              let p = (mine - top).fast_exp();
+              total = total * shrink + lane_sum(p);
+              o0 = o0 * shrink;
+              o1 = o1 * shrink;
+              o2 = o2 * shrink;
+              o3 = o3 * shrink;
+              for r in 0..32 {
+                let row = r0 + r;
+                let kept = row;
+                let pr = lane_value(p, r);
+                o0 = fused(half_at(v_cache, kept, g, d, 0), pr, o0);
+                o1 = fused(half_at(v_cache, kept, g, d, 1), pr, o1);
+                o2 = fused(half_at(v_cache, kept, g, d, 2), pr, o2);
+                o3 = fused(half_at(v_cache, kept, g, d, 3), pr, o3);
+              }
+              big = top;
+              c = c + nwg;
+            }
+            part[h][w][d] = o0;
+            part[h][w][d + 1] = o1;
+            part[h][w][d + 2] = o2;
+            part[h][w][d + 3] = o3;
+            // Every lane has the same largest score and sum of the weights. Lanes 0 and 1 keep them for the
+            // next loop.
+            if l < 2 {
+              let mut x = big;
+              if l == 1 {
+                x = total;
+              }
+              stats[s][l] = x;
+            }
+          }
+          for l in 0..2 across lanes(32) {
+            part[h][w][128 + l] = stats[s][l];
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+fn parts_no_rescale(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, pos : i32, q_heads : i32, group : i32, nwg : i32, scale : f32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..q_heads across blocks {
+      for w in 0..nwg across blocks {
+        let mut stats = unsafe { Tensor<f32, [1, 2], Memory::SMEM>::uninit() };
+        for s in 0..1 across subgroups {
+          for l in 0..32 across lanes(32) {
+            let g = h / group;
+            let d = 4 * l;
+            let q0 = q[h][d] * scale;
+            let q1 = q[h][d + 1] * scale;
+            let q2 = q[h][d + 2] * scale;
+            let q3 = q[h][d + 3] * scale;
+            let mut big : f32 = -3.0e38;
+            let mut total : f32 = 0.0;
+            let mut o0 : f32 = 0.0;
+            let mut o1 : f32 = 0.0;
+            let mut o2 : f32 = 0.0;
+            let mut o3 : f32 = 0.0;
+            let chunks = (pos + 32) / 32;
+            let mut c = w;
+            while c < chunks {
+              let r0 = c * 32;
+              let mut mine : f32 = -3.0e38;
+              for r in 0..32 {
+                let row = r0 + r;
+                let mut kept = row;
+                if row > pos {
+                  kept = pos;
+                }
+                let mut score = lane_sum(dot4(k_cache, kept, g, d, q0, q1, q2, q3));
+                if row > pos {
+                  score = -3.0e38;
+                }
+                if r == l {
+                  mine = score;
+                }
+              }
+              let top = big.max(lane_max(mine));
+              let shrink = (big - top).fast_exp();
+              let p = (mine - top).fast_exp();
+              total = total * shrink + lane_sum(p);
+              for r in 0..32 {
+                let row = r0 + r;
+                let mut kept = row;
+                if row > pos {
+                  kept = pos;
+                }
+                let pr = lane_value(p, r);
+                o0 = fused(half_at(v_cache, kept, g, d, 0), pr, o0);
+                o1 = fused(half_at(v_cache, kept, g, d, 1), pr, o1);
+                o2 = fused(half_at(v_cache, kept, g, d, 2), pr, o2);
+                o3 = fused(half_at(v_cache, kept, g, d, 3), pr, o3);
+              }
+              big = top;
+              c = c + nwg;
+            }
+            part[h][w][d] = o0;
+            part[h][w][d + 1] = o1;
+            part[h][w][d + 2] = o2;
+            part[h][w][d + 3] = o3;
+            // Every lane has the same largest score and sum of the weights. Lanes 0 and 1 keep them for the
+            // next loop.
+            if l < 2 {
+              let mut x = big;
+              if l == 1 {
+                x = total;
+              }
+              stats[s][l] = x;
+            }
+          }
+          for l in 0..2 across lanes(32) {
+            part[h][w][128 + l] = stats[s][l];
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+fn parts_own_weight(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, pos : i32, q_heads : i32, group : i32, nwg : i32, scale : f32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..q_heads across blocks {
+      for w in 0..nwg across blocks {
+        let mut stats = unsafe { Tensor<f32, [1, 2], Memory::SMEM>::uninit() };
+        for s in 0..1 across subgroups {
+          for l in 0..32 across lanes(32) {
+            let g = h / group;
+            let d = 4 * l;
+            let q0 = q[h][d] * scale;
+            let q1 = q[h][d + 1] * scale;
+            let q2 = q[h][d + 2] * scale;
+            let q3 = q[h][d + 3] * scale;
+            let mut big : f32 = -3.0e38;
+            let mut total : f32 = 0.0;
+            let mut o0 : f32 = 0.0;
+            let mut o1 : f32 = 0.0;
+            let mut o2 : f32 = 0.0;
+            let mut o3 : f32 = 0.0;
+            let chunks = (pos + 32) / 32;
+            let mut c = w;
+            while c < chunks {
+              let r0 = c * 32;
+              let mut mine : f32 = -3.0e38;
+              for r in 0..32 {
+                let row = r0 + r;
+                let mut kept = row;
+                if row > pos {
+                  kept = pos;
+                }
+                let mut score = lane_sum(dot4(k_cache, kept, g, d, q0, q1, q2, q3));
+                if row > pos {
+                  score = -3.0e38;
+                }
+                if r == l {
+                  mine = score;
+                }
+              }
+              let top = big.max(lane_max(mine));
+              let shrink = (big - top).fast_exp();
+              let p = (mine - top).fast_exp();
+              total = total * shrink + lane_sum(p);
+              o0 = o0 * shrink;
+              o1 = o1 * shrink;
+              o2 = o2 * shrink;
+              o3 = o3 * shrink;
+              for r in 0..32 {
+                let row = r0 + r;
+                let mut kept = row;
+                if row > pos {
+                  kept = pos;
+                }
+                let pr = lane_value(p, l);
+                o0 = fused(half_at(v_cache, kept, g, d, 0), pr, o0);
+                o1 = fused(half_at(v_cache, kept, g, d, 1), pr, o1);
+                o2 = fused(half_at(v_cache, kept, g, d, 2), pr, o2);
+                o3 = fused(half_at(v_cache, kept, g, d, 3), pr, o3);
+              }
+              big = top;
+              c = c + nwg;
+            }
+            part[h][w][d] = o0;
+            part[h][w][d + 1] = o1;
+            part[h][w][d + 2] = o2;
+            part[h][w][d + 3] = o3;
+            // Every lane has the same largest score and sum of the weights. Lanes 0 and 1 keep them for the
+            // next loop.
+            if l < 2 {
+              let mut x = big;
+              if l == 1 {
+                x = total;
+              }
+              stats[s][l] = x;
+            }
+          }
+          for l in 0..2 across lanes(32) {
+            part[h][w][128 + l] = stats[s][l];
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+fn parts_swapped_stats(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, pos : i32, q_heads : i32, group : i32, nwg : i32, scale : f32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..q_heads across blocks {
+      for w in 0..nwg across blocks {
+        let mut stats = unsafe { Tensor<f32, [1, 2], Memory::SMEM>::uninit() };
+        for s in 0..1 across subgroups {
+          for l in 0..32 across lanes(32) {
+            let g = h / group;
+            let d = 4 * l;
+            let q0 = q[h][d] * scale;
+            let q1 = q[h][d + 1] * scale;
+            let q2 = q[h][d + 2] * scale;
+            let q3 = q[h][d + 3] * scale;
+            let mut big : f32 = -3.0e38;
+            let mut total : f32 = 0.0;
+            let mut o0 : f32 = 0.0;
+            let mut o1 : f32 = 0.0;
+            let mut o2 : f32 = 0.0;
+            let mut o3 : f32 = 0.0;
+            let chunks = (pos + 32) / 32;
+            let mut c = w;
+            while c < chunks {
+              let r0 = c * 32;
+              let mut mine : f32 = -3.0e38;
+              for r in 0..32 {
+                let row = r0 + r;
+                let mut kept = row;
+                if row > pos {
+                  kept = pos;
+                }
+                let mut score = lane_sum(dot4(k_cache, kept, g, d, q0, q1, q2, q3));
+                if row > pos {
+                  score = -3.0e38;
+                }
+                if r == l {
+                  mine = score;
+                }
+              }
+              let top = big.max(lane_max(mine));
+              let shrink = (big - top).fast_exp();
+              let p = (mine - top).fast_exp();
+              total = total * shrink + lane_sum(p);
+              o0 = o0 * shrink;
+              o1 = o1 * shrink;
+              o2 = o2 * shrink;
+              o3 = o3 * shrink;
+              for r in 0..32 {
+                let row = r0 + r;
+                let mut kept = row;
+                if row > pos {
+                  kept = pos;
+                }
+                let pr = lane_value(p, r);
+                o0 = fused(half_at(v_cache, kept, g, d, 0), pr, o0);
+                o1 = fused(half_at(v_cache, kept, g, d, 1), pr, o1);
+                o2 = fused(half_at(v_cache, kept, g, d, 2), pr, o2);
+                o3 = fused(half_at(v_cache, kept, g, d, 3), pr, o3);
+              }
+              big = top;
+              c = c + nwg;
+            }
+            part[h][w][d] = o0;
+            part[h][w][d + 1] = o1;
+            part[h][w][d + 2] = o2;
+            part[h][w][d + 3] = o3;
+            // Every lane has the same largest score and sum of the weights. Lanes 0 and 1 keep them for the
+            // next loop.
+            if l < 2 {
+              let mut x = total;
+              if l == 1 {
+                x = big;
+              }
+              stats[s][l] = x;
+            }
+          }
+          for l in 0..2 across lanes(32) {
+            part[h][w][128 + l] = stats[s][l];
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+const Q_HEADS : i32 = 32;
+const KV_HEADS : i32 = 4;
+
+/// A number in [-1, 1) from the state `s` of a linear congruential generator.
+fn random(s : &mut i64) -> f32 {
+  *s = (*s * 1103515245 + 12345) % 2147483648;
+  return (*s as f32) / 1073741824.0 - 1.0;
+}
+
+fn check(s : &mut i64, pos : i32, which : i32) -> void {
+  let rows = pos + 32;
+  let mut qh = Tensor<f32>([Q_HEADS, 128]);
+  let mut kh = Tensor<f16>([rows, KV_HEADS, 128]);
+  let mut vh = Tensor<f16>([rows, KV_HEADS, 128]);
+  for h in 0..Q_HEADS {
+    for d in 0..128 {
+      qh[h][d] = 4.0 * random(s);
+    }
+  }
+  for r in 0..rows {
+    for g in 0..KV_HEADS {
+      for d in 0..128 {
+        if r <= pos {
+          kh[r][g][d] = random(s) as f16;
+          vh[r][g][d] = random(s) as f16;
+        } else {
+          kh[r][g][d] = 8.0 as f16;
+          vh[r][g][d] = f16::nan();
+        }
+      }
+    }
+  }
+  let q = transfer(&qh, Memory::HBM);
+  let k = transfer(&kh, Memory::HBM);
+  let v = transfer(&vh, Memory::HBM);
+  let mut part = transfer(vec_attention_scratch(Q_HEADS), Memory::HBM);
+  let mut out = transfer(Tensor<f32>([Q_HEADS, 128]), Memory::HBM);
+  let mut nwg = 32;
+  if 2 * nwg * 32 < pos + 1 {
+    nwg = nwg * 2;
+  }
+  let sc = 1.0 / (128.0 as f32).sqrt();
+  if which == 0 {
+    parts_no_mask(&mut part, &q, &k, &v, pos, Q_HEADS, Q_HEADS / KV_HEADS, nwg, sc);
+  } else if which == 1 {
+    parts_no_clamp(&mut part, &q, &k, &v, pos, Q_HEADS, Q_HEADS / KV_HEADS, nwg, sc);
+  } else if which == 2 {
+    parts_no_rescale(&mut part, &q, &k, &v, pos, Q_HEADS, Q_HEADS / KV_HEADS, nwg, sc);
+  } else if which == 3 {
+    parts_own_weight(&mut part, &q, &k, &v, pos, Q_HEADS, Q_HEADS / KV_HEADS, nwg, sc);
+  } else if which == 4 {
+    parts_swapped_stats(&mut part, &q, &k, &v, pos, Q_HEADS, Q_HEADS / KV_HEADS, nwg, sc);
+  }
+  vec_attention_merge(&mut out, &part, nwg, Q_HEADS);
+  let got = transfer(&out, Memory::CPU_DRAM);
+  let scale = 1.0 / (128.0 as f64).sqrt();
+  let mut score = Tensor<f64>([pos + 1]);
+  let mut off = 0;
+  for h in 0..Q_HEADS {
+    let g = h / (Q_HEADS / KV_HEADS);
+    let mut big : f64 = -1.0e300;
+    for r in 0..pos + 1 {
+      let mut dot : f64 = 0.0;
+      for d in 0..128 {
+        dot = dot + (qh[h][d] as f64) * (kh[r][g][d] as f64);
+      }
+      score[r] = dot * scale;
+      big = big.max(score[r]);
+    }
+    let mut total : f64 = 0.0;
+    for r in 0..pos + 1 {
+      score[r] = (score[r] - big).exp();
+      total = total + score[r];
+    }
+    for d in 0..128 {
+      let mut acc : f64 = 0.0;
+      for r in 0..pos + 1 {
+        acc = acc + score[r] * (vh[r][g][d] as f64);
+      }
+      let want = acc / total;
+      // Written so that a NaN counts as off.
+      if !(((got[h][d] as f64) - want).abs() <= 1.0e-5 * (1.0 + want.abs())) {
+        off = off + 1;
+      }
+    }
+  }
+  println!("kernel {} pos {}: {} off", which, pos, off);
+  return;
+}
+
+fn main() -> i32 {
+  let mut s : i64 = 11;
+  for which in 0..5 {
+    check(&mut s, 0, which);
+    check(&mut s, 40, which);
+    check(&mut s, 1000, which);
+    check(&mut s, 2100, which);
+    check(&mut s, 8000, which);
+  }
+  return 0;
+}
