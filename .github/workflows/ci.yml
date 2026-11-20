@@ -2,9 +2,9 @@
 # blocks with `threads` of the program run only on a GPU.
 name: CI
 
+# Only pull requests: a macOS minute costs more than a Linux one, and a pull request merges only
+# after its tests pass.
 on:
-  push:
-    branches: [main]
   pull_request:
 
 permissions:
