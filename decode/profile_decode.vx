@@ -9,7 +9,7 @@
 // out, after a warm-up. `skip` is a mask of the parts to leave out. The results of a run with a
 // part left out are wrong, but its time shows the cost of that part. See README.md.
 //
-//   vxc decode/profile_decode.vx --package qwen=src --host default \
+//   vxc -O2 decode/profile_decode.vx --package qwen=src --host default \
 //       --machine ~/.vx/current/fleet/m4-uma.vx -- qwen3-30b-q4.vxw
 import core::convert;
 import std::nn;
