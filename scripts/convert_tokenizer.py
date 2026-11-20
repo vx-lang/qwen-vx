@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert the tokenizer.json of a Qwen2 or Qwen3 model into the tokenizer file of the Qwen app.
+"""Convert the tokenizer.json of a Qwen2, Qwen3 or Qwen3.5 model into the tokenizer file of the Qwen app.
 
     python3 scripts/convert_tokenizer.py ~/models/Qwen2.5-Coder-0.5B-Instruct qwen.vxt
 
@@ -9,7 +9,7 @@ The Vx program `src/tokenizer.vx` reads the file. It turns text into token ids a
 1. It splits out each added token, such as <|im_start|>, where the text has it. When two added
    tokens start at the same place, the longer one wins.
 2. It applies Unicode NFC normalization to the text between the added tokens.
-3. It splits that text with the pre-tokenizer regex of tokenizer.json (below as PATTERN).
+3. It splits that text with the pre-tokenizer regex of tokenizer.json (one of PATTERNS below).
 4. It turns each piece into its UTF-8 bytes, and each byte into its token.
 5. It merges the pair of neighbor tokens with the lowest merge rank, again and again, until no
    pair of the piece has a merge. Of equal pairs, the leftmost goes first.
@@ -27,7 +27,8 @@ The file is little-endian. It starts with 32 i64 words:
     2      the number of token ids, n_tokens
     3      the number of merges
     4      the number of added tokens
-    5-7    the number of ranges of letters (\\p{L}), numbers (\\p{N}) and white space (\\s)
+    5-7    the number of ranges of letters, numbers (\\p{N}) and white space (\\s). Letters are
+           \\p{L}, and also the marks (\\p{M}) with the regex of Qwen3.5.
     8      the number of code points with a canonical decomposition
     9      the number of code points in all those decompositions
     10     the number of code points with a canonical combining class above 0
@@ -76,10 +77,17 @@ MAGIC = b"VXQTOK01"
 VERSION = 1
 HEADER_WORDS = 32
 
-# The pre-tokenizer regex of the Qwen2 and Qwen3 tokenizers. `tokenizer.vx` matches it with
-# hand-written code, so this script refuses a tokenizer with another one.
-PATTERN = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*"
-           r"|\s*[\r\n]+|\s+(?!\S)|\s+")
+# The pre-tokenizer regexes of the Qwen2 and Qwen3 tokenizers, and of the Qwen3.5 tokenizers.
+# `tokenizer.vx` matches them with hand-written code, so this script refuses another regex. The
+# second regex adds the marks (\p{M}) to the class of letters, so the file has them in the table
+# of letters. The optional first character of `[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+` may be a mark,
+# but a mark there gives the same piece as a mark in the class.
+QWEN2_PATTERN = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*"
+                 r"|\s*[\r\n]+|\s+(?!\S)|\s+")
+QWEN35_PATTERN = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*"
+                  r"|\s*[\r\n]+|\s+(?!\S)|\s+")
+# Whether the class of letters of each regex has the marks.
+PATTERNS = {QWEN2_PATTERN: False, QWEN35_PATTERN: True}
 
 # The code points of the Unicode property White_Space, which \s matches.
 WHITE_SPACE = [(0x09, 0x0D), (0x20, 0x20), (0x85, 0x85), (0xA0, 0xA0), (0x1680, 0x1680),
@@ -122,12 +130,13 @@ def bytes_to_unicode():
 
 
 def check_structure(t):
-    """Asserts that tokenizer.json describes the tokenizer that `tokenizer.vx` computes."""
+    """Asserts that tokenizer.json describes the tokenizer that `tokenizer.vx` computes. Returns
+    whether the class of letters of its regex has the marks."""
     assert t["normalizer"] == {"type": "NFC"}, f"the normalizer must be NFC, not {t['normalizer']}"
     pre = t["pre_tokenizer"]
     assert pre["type"] == "Sequence" and len(pre["pretokenizers"]) == 2, "the pre-tokenizer must be a split and a byte-level step"
     split, byte_level = pre["pretokenizers"]
-    assert split["type"] == "Split" and split["pattern"] == {"Regex": PATTERN}, "the pre-tokenizer has another regex"
+    assert split["type"] == "Split" and split["pattern"].get("Regex") in PATTERNS, "the pre-tokenizer has another regex"
     assert split["behavior"] == "Isolated" and not split["invert"], "the split must keep each match as a piece"
     assert byte_level["type"] == "ByteLevel" and not byte_level["add_prefix_space"] and not byte_level["use_regex"], "the byte-level step must add no space and use no regex"
     model = t["model"]
@@ -136,6 +145,7 @@ def check_structure(t):
     assert not model.get("continuing_subword_prefix") and not model.get("end_of_word_suffix"), "the BPE model must have no prefix or suffix"
     for a in t["added_tokens"]:
         assert not (a["normalized"] or a["lstrip"] or a["rstrip"] or a["single_word"]), f"the added token {a['content']} must match the text as it is"
+    return PATTERNS[split["pattern"]["Regex"]]
 
 
 def ranges(points):
@@ -149,8 +159,9 @@ def ranges(points):
     return out
 
 
-def unicode_tables():
-    """The character classes of the regex, and the tables of NFC."""
+def unicode_tables(marks_are_letters=False):
+    """The character classes of the regex, and the tables of NFC. With `marks_are_letters`, the
+    class of letters has the marks (\\p{M})."""
     letters, numbers = [], []
     decomposed, combining, compositions = {}, {}, {}
     old_marks = {cp for first, last in OLD_NFC_MARKS for cp in range(first, last + 1)}
@@ -159,7 +170,7 @@ def unicode_tables():
             continue
         c = chr(cp)
         category = unicodedata.category(c)
-        if category.startswith("L"):
+        if category.startswith("L") or (marks_are_letters and category.startswith("M")):
             letters.append(cp)
         elif category.startswith("N"):
             numbers.append(cp)
@@ -181,7 +192,7 @@ def unicode_tables():
 
 def build(t):
     """The bytes of the tokenizer file for the parsed tokenizer.json `t`."""
-    check_structure(t)
+    marks_are_letters = check_structure(t)
     to_char = bytes_to_unicode()
     to_byte = {c: b for b, c in to_char.items()}
     vocab = t["model"]["vocab"]
@@ -204,7 +215,7 @@ def build(t):
         merges[(vocab[left] << 20) | vocab[right]] = (rank, vocab[left + right])
     merge_pairs = sorted(merges)
 
-    letters, numbers, spaces, decomposed, combining, compositions = unicode_tables()
+    letters, numbers, spaces, decomposed, combining, compositions = unicode_tables(marks_are_letters)
     starts, blob = [], bytearray()
     for i in range(n_tokens):
         starts.append(len(blob))

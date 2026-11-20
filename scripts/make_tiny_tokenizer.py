@@ -116,7 +116,7 @@ def tokenizer_json():
         ],
         "normalizer": {"type": "NFC"},
         "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
-            {"type": "Split", "pattern": {"Regex": convert_tokenizer.PATTERN}, "behavior": "Isolated", "invert": False},
+            {"type": "Split", "pattern": {"Regex": convert_tokenizer.QWEN2_PATTERN}, "behavior": "Isolated", "invert": False},
             byte_level,
         ]},
         "post_processor": byte_level,

@@ -23,6 +23,7 @@ import json
 import os
 import random
 import shutil
+import struct
 import subprocess
 import sys
 import sysconfig
@@ -32,6 +33,7 @@ import unittest
 from pathlib import Path
 
 import convert_tokenizer
+import make_tiny_tokenizer
 
 try:
     from tokenizers import Tokenizer
@@ -40,7 +42,8 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parent.parent
 MODELS = [Path("~/models/Qwen2.5-Coder-0.5B-Instruct").expanduser(),
-          Path("~/models/Qwen3-Coder-30B-A3B-Instruct").expanduser()]
+          Path("~/models/Qwen3-Coder-30B-A3B-Instruct").expanduser(),
+          Path("~/models/Qwen3.6-35B-A3B").expanduser()]
 SPECIALS = ["<|endoftext|>", "<|im_start|>", "<|im_end|>", "<|fim_prefix|>", "<think>", "</tool_call>"]
 
 
@@ -178,17 +181,65 @@ class TokenizerAgainstHuggingFace(unittest.TestCase):
     def test_qwen3_coder(self):
         self.check_model(MODELS[1])
 
+    def test_qwen36(self):
+        self.check_model(MODELS[2])
+
+
+def letter_ranges(data):
+    """The ranges of the class of letters in the bytes of a tokenizer file."""
+    count, offset = struct.unpack_from("<q", data, 5 * 8)[0], struct.unpack_from("<q", data, 21 * 8)[0]
+    values = struct.unpack_from(f"<{2 * count}i", data, offset)
+    return list(zip(values[0::2], values[1::2]))
+
+
+class RegexOfQwen35(unittest.TestCase):
+
+    def tiny_tokenizer(self, pattern):
+        t = make_tiny_tokenizer.tokenizer_json()
+        t["pre_tokenizer"]["pretokenizers"][0]["pattern"] = {"Regex": pattern}
+        return t
+
+    def test_marks_join_the_letters(self):
+        """With the regex of Qwen3.5, the class of letters in the file has \\p{L} and \\p{M}. With the
+        regex of Qwen2, it has only \\p{L}."""
+        def code_points(ranges):
+            return {c for first, last in ranges for c in range(first, last + 1)}
+
+        def category(c):
+            return unicodedata.category(chr(c))[0]
+
+        qwen2 = code_points(letter_ranges(convert_tokenizer.build(self.tiny_tokenizer(convert_tokenizer.QWEN2_PATTERN))))
+        qwen35 = code_points(letter_ranges(convert_tokenizer.build(self.tiny_tokenizer(convert_tokenizer.QWEN35_PATTERN))))
+        self.assertEqual({category(c) for c in qwen2}, {"L"})
+        self.assertEqual({category(c) for c in qwen35 - qwen2}, {"M"})
+        self.assertLessEqual(qwen2, qwen35)
+        self.assertEqual(len([c for c in range(0x110000) if not 0xD800 <= c <= 0xDFFF and category(c) == "M"]), len(qwen35 - qwen2))
+
+    def test_another_regex_is_refused(self):
+        with self.assertRaisesRegex(AssertionError, "the pre-tokenizer has another regex"):
+            convert_tokenizer.build(self.tiny_tokenizer(convert_tokenizer.QWEN2_PATTERN.replace(r"\p{N}", r"\d")))
+
 
 @unittest.skipIf(Tokenizer is None, "needs the tokenizers package")
 class UnicodeTablesAgainstHuggingFace(unittest.TestCase):
 
     def test_classes_equal_those_of_the_regex_engine(self):
-        """The regex engine of `tokenizers` puts each code point in the class that the file says."""
-        path = next((m / "tokenizer.json" for m in MODELS if (m / "tokenizer.json").is_file()), None)
-        if path is None:
+        """For each regex, the regex engine of `tokenizers` puts each code point in the class that
+        the file says."""
+        paths = {}
+        for m in MODELS:
+            if (m / "tokenizer.json").is_file():
+                t = json.loads((m / "tokenizer.json").read_text(encoding="utf-8"))
+                paths.setdefault(convert_tokenizer.check_structure(t), m / "tokenizer.json")
+        if not paths:
             self.skipTest("needs a Qwen tokenizer.json")
+        for marks_are_letters, path in sorted(paths.items()):
+            with self.subTest(path=str(path)):
+                self.check_classes(path, marks_are_letters)
+
+    def check_classes(self, path, marks_are_letters):
         pre = Tokenizer.from_file(str(path)).pre_tokenizer
-        letters, numbers, spaces, *_ = convert_tokenizer.unicode_tables()
+        letters, numbers, spaces, *_ = convert_tokenizer.unicode_tables(marks_are_letters)
 
         def inside(ranges, c):
             i = bisect.bisect_right(ranges, (c, 0x110000)) - 1
