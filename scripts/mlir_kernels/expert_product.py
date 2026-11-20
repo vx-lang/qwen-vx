@@ -95,6 +95,13 @@ b('%z = gpu.subgroup_mma_constant_matrix %zf : ' + ACC)
 # the MMA operands of this subgroup: tokens th * 16.., rows rh * 32..
 b(f'%th512 = arith.muli %th, {c(512)} : index')       # sx[(th * 16) * 32]
 b('%rh32 = arith.muli %rh, %k32 : index')              # sw[rh * 32]
+# The tokens of an expert come first in its tiles, so when token 16 of the block is padding, so are
+# tokens 16 to 31, and the subgroups of those tokens (th = 1) skip their multiplies.
+b('%tb16 = arith.addi %tb32, %k16 : index')
+b('%from16 = memref.load %list[%tb16] : memref<?xi32>')
+b('%live16 = arith.cmpi sge, %from16, %zi : i32')
+b('%th0 = arith.cmpi eq, %th, %k0 : index')
+b('%busy = arith.ori %th0, %live16 : i1')
 accs = ', '.join(f'%a{i} = %z' for i in range(8))
 accty = ', '.join([ACC] * 8)
 b(f'%res:8 = scf.for %g = %k0 to %Gl step %k1 iter_args({accs}) -> ({accty}) {{')
@@ -138,6 +145,9 @@ for k in range(16):
 d('vector.store %h0, %sx[%sxd] {alignment = 8} : memref<1024xf16, 3>, vector<4xf16>')
 d('vector.store %h1, %sx[%sxd4] {alignment = 8} : memref<1024xf16, 3>, vector<4xf16>')
 d('gpu.barrier')
+d(f'%mm:8 = scf.if %busy -> ({accty}) {{')
+d0 = d
+d = lambda s: d0('  ' + s)
 prev = [f'%a{i}' for i in range(8)]
 for k8 in (0, 8, 16, 24):
     if hint:
@@ -160,6 +170,11 @@ for k8 in (0, 8, 16, 24):
             cur.append(f'%r{n}_{k8}')
     prev = cur
 d('scf.yield ' + ', '.join(prev) + ' : ' + accty)
+d = d0
+d('} else {')
+d('  scf.yield ' + ', '.join(f'%a{i}' for i in range(8)) + ' : ' + accty)
+d('}')
+d('scf.yield ' + ', '.join(f'%mm#{i}' for i in range(8)) + ' : ' + accty)
 b('}')
 b('%th16 = arith.muli %th, %k16 : index')
 b('%yr0 = arith.addi %tb32, %th16 : index')

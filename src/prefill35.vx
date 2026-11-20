@@ -995,6 +995,7 @@ fn pf35_experts(p : &mut Prefill35, layer : &Qwen35Layer, c : &Config, n : i32, 
   pf_count_experts(&mut p.e_counts, &mut p.e_lane_counts, &p.ids, n, k, experts);
   pf_place_experts(&p.e_rows, &p.slot, &p.e_counts, &p.e_lane_counts, &p.ids, n, k, experts);
   pf_expert_bases(&mut p.e_bases, &p.e_counts, experts, e_tiles);
+  pf_live_positions(&mut p.e_ident, &p.e_rows);
   pf_mm(&mut p.e_gu, &layer.gate_up, &p.xn, &p.e_rows, &p.e_bases, 2 * inter, &p.no_bias, false, false, 2 * inter, c.hidden_size, e_tiles);
   pf_silu_mul(&mut p.e_h, &p.e_gu, e_tiles * 16, inter);
   pf_mm(&mut p.e_out, &layer.down, &p.e_h, &p.e_ident, &p.e_bases, c.hidden_size, &p.no_bias, false, false, c.hidden_size, inter, e_tiles);
