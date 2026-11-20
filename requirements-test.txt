@@ -1,0 +1,5 @@
+# The Python packages of tests/run.sh: the tests in scripts/test_*.py and FileCheck for the RUN
+# lines. CI installs this file. FileCheck of LLVM, when it is on PATH, comes first.
+numpy==2.5.5
+ml_dtypes==0.7.0
+filecheck==1.0.6
