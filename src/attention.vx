@@ -13,8 +13,9 @@
 //
 // `vec_attention`, for head_dim 128, has the design of llama.cpp's flash attention for one token
 // (kernel_flash_attn_ext_vec and kernel_flash_attn_ext_vec_reduce), MIT License, Copyright (c) 2023-2026
-// The ggml authors. scripts/mlir_kernels/decode_attention.py writes its kernels: change that script, not
-// the MLIR.
+// The ggml authors. Its kernels are Vx code. Small `mlir!` functions do the operations that Vx v0.0.5
+// cannot write in a kernel: a sum, a largest value or a value across the lanes of a SIMD group, a load of
+// 4 halves in 8 bytes, and a fused multiply-add.
 import core::num;
 import std::nn;
 
@@ -74,95 +75,156 @@ fn vec_attention_scratch(q_heads : i32) -> Tensor<f32, [?, ?, ?]> {
   return Tensor<f32>([q_heads, 128, 132]);
 }
 
+/// The sum of `x` over the 32 lanes of a SIMD group. Each lane gets the sum.
+fn lane_sum(x : f32) on Topology::Device -> f32
+ensures writes_only()
+{
+  return mlir!( inputs : (%x = x : f32), returns : f32, dialects : ["gpu"], ensures : [writes_only()]) {
+    %r = gpu.subgroup_reduce add %x : (f32) -> f32
+    macro.yield %r : f32
+  };
+}
+
+/// The largest `x` over the 32 lanes of a SIMD group. Each lane gets it.
+fn lane_max(x : f32) on Topology::Device -> f32
+ensures writes_only()
+{
+  return mlir!( inputs : (%x = x : f32), returns : f32, dialects : ["gpu"], ensures : [writes_only()]) {
+    %r = gpu.subgroup_reduce maxnumf %x : (f32) -> f32
+    macro.yield %r : f32
+  };
+}
+
+/// The value of `x` in lane `src` of the SIMD group.
+fn lane_value(x : f32, src : i32) on Topology::Device -> f32
+ensures writes_only()
+{
+  return mlir!( inputs : (%x = x : f32, %src = src : i32), returns : f32, dialects : ["arith", "gpu"], ensures : [writes_only()]) {
+    %w = arith.constant 32 : i32
+    %r, %ok = gpu.shuffle idx %x, %src, %w : f32
+    macro.yield %r : f32
+  };
+}
+
+/// t[row][g][d + j] for j 0 to 3, from one 8-byte load of the 4 halves at d, a multiple of 4. The compiler
+/// merges the loads of the 4 calls for one d into one.
+fn half_at(t : &Tensor<f16, [?, ?, ?], Memory::HBM>, row : i32, g : i32, d : i32, j : i32) on Topology::Device -> f32
+ensures reads_only(t)
+{
+  return mlir!( inputs : (%t = t : memref<?x?x?xf16>, %row = row : i32, %g = g : i32, %d = d : i32, %j = j : i32), returns : f32, dialects : ["arith", "vector"], ensures : [reads_only(t)]) {
+    %r = arith.index_cast %row : i32 to index
+    %gi = arith.index_cast %g : i32 to index
+    %di = arith.index_cast %d : i32 to index
+    %ji = arith.index_cast %j : i32 to index
+    %h = vector.load %t[%r, %gi, %di] {
+      alignment = 8
+    } : memref<?x?x?xf16>, vector<4xf16>
+    %x = vector.extract %h[%ji] : f16 from vector<4xf16>
+    %f = arith.extf %x : f16 to f32
+    macro.yield %f : f32
+  };
+}
+
+/// a b + c with one rounding. `mul_add` of Vx v0.0.5 does this, but its parallel checker does not know
+/// that `mul_add` writes no memory, so a kernel cannot call it.
+fn fused(a : f32, b : f32, c : f32) on Topology::Device -> f32
+ensures writes_only()
+{
+  return mlir!( inputs : (%a = a : f32, %b = b : f32, %c = c : f32), returns : f32, dialects : ["math"], ensures : [writes_only()]) {
+    %r = math.fma %a, %b, %c : f32
+    macro.yield %r : f32
+  };
+}
+
 /// The parts of `vec_attention`, as llama.cpp's kernel_flash_attn_ext_vec. Block (h, w) is a SIMD group for
 /// query head h. It does the blocks of 32 positions w, w + nwg, w + 2 nwg, ... up to `pos`, and writes
 /// part[h][w]. Lane l owns values 4 l to 4 l + 3 of the head, so that the 32 lanes read a row of K or V in
-/// one 256-byte load. For each row, the lanes add up their parts of q . k; then each lane keeps the score
-/// of one row, and the lanes take the weights of the rows from each other for the sum of V. A part is the
-/// sum of V, not divided, then the largest score and the sum of the weights.
+/// one 256-byte load. For each row, the lanes add up their parts of q . k, and lane r of the block keeps
+/// the score of row r. Each lane then takes the weight of each row from the lane that keeps it, for the
+/// sum of V. A part is the sum of V, not divided, then the largest score and the sum of the weights.
 fn vec_attention_parts(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, pos : i32, q_heads : i32, group : i32, nwg : i32, scale : f32) -> void {
   spawn on(Topology::Device) {
     for h in 0..q_heads across blocks {
       for w in 0..nwg across blocks {
-        let g = h / group;
-        let _d = mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
-          %c0 = arith.constant 0 : index
-          %c1 = arith.constant 1 : index
-          %c4 = arith.constant 4 : index
-          %c32 = arith.constant 32 : index
-          %c128 = arith.constant 128 : index
-          %c129 = arith.constant 129 : index
-          %c32i = arith.constant 32 : i32
-          %neg = arith.constant -3.0e38 : f32
-          %zero = arith.constant 0.0 : f32
-          %vz4 = arith.constant dense<0.0> : vector<4xf32>
-          %l = gpu.thread_id x
-          %l4 = arith.muli %l, %c4 : index
-          %hi = arith.index_cast %h : i32 to index
-          %wi = arith.index_cast %w : i32 to index
-          %gi = arith.index_cast %g : i32 to index
-          %posi = arith.index_cast %pos : i32 to index
-          %nwgi = arith.index_cast %nwg : i32 to index
-          %g128 = arith.muli %gi, %c128 : index
-          %kd = arith.addi %g128, %l4 : index
-          %P = memref.dim %k3, %c0 : memref<?x?x?xf16>
-          %KH = memref.dim %k3, %c1 : memref<?x?x?xf16>
-          %Wd = arith.muli %KH, %c128 : index
-          %k = memref.reinterpret_cast %k3 to offset: [0], sizes: [%P, %Wd], strides: [%Wd, 1] : memref<?x?x?xf16> to memref<?x?xf16, strided<[?, 1]>>
-          %v = memref.reinterpret_cast %v3 to offset: [0], sizes: [%P, %Wd], strides: [%Wd, 1] : memref<?x?x?xf16> to memref<?x?xf16, strided<[?, 1]>>
-          %qv = vector.load %q[%hi, %l4] {alignment = 16} : memref<?x?xf32>, vector<4xf32>
-          %scv = vector.broadcast %scale : f32 to vector<4xf32>
-          %qs = arith.mulf %qv, %scv : vector<4xf32>
-          %nkv = arith.addi %posi, %c32 : index
-          %chunks = arith.divui %nkv, %c32 : index
-          %st:3 = scf.for %ic = %wi to %chunks step %nwgi iter_args(%M = %neg, %S = %zero, %o = %vz4) -> (f32, f32, vector<4xf32>) {
-            %r0 = arith.muli %ic, %c32 : index
-            %my = scf.for %cc = %c0 to %c32 step %c1 iter_args(%m = %neg) -> (f32) {
-              %row = arith.addi %r0, %cc : index
-              %rowc = arith.minui %row, %posi : index
-              %kh = vector.load %k[%rowc, %kd] {alignment = 8} : memref<?x?xf16, strided<[?, 1]>>, vector<4xf16>
-              %kf = arith.extf %kh : vector<4xf16> to vector<4xf32>
-              %pr = arith.mulf %kf, %qs : vector<4xf32>
-              %pl = vector.reduction <add>, %pr : vector<4xf32> into f32
-              %sc = gpu.subgroup_reduce add %pl : (f32) -> f32
-              %live = arith.cmpi ule, %row, %posi : index
-              %scm = arith.select %live, %sc, %neg : f32
-              %mine = arith.cmpi eq, %cc, %l : index
-              %m2 = arith.select %mine, %scm, %m : f32
-              scf.yield %m2 : f32
+        let mut stats = unsafe { Tensor<f32, [1, 2], Memory::SMEM>::uninit() };
+        for s in 0..1 across subgroups {
+          for l in 0..32 across lanes(32) {
+            let g = h / group;
+            let d = 4 * l;
+            let q0 = q[h][d] * scale;
+            let q1 = q[h][d + 1] * scale;
+            let q2 = q[h][d + 2] * scale;
+            let q3 = q[h][d + 3] * scale;
+            let mut big : f32 = -3.0e38;
+            let mut total : f32 = 0.0;
+            let mut o0 : f32 = 0.0;
+            let mut o1 : f32 = 0.0;
+            let mut o2 : f32 = 0.0;
+            let mut o3 : f32 = 0.0;
+            let chunks = (pos + 32) / 32;
+            let mut c = w;
+            while c < chunks {
+              let r0 = c * 32;
+              let mut mine : f32 = -3.0e38;
+              for r in 0..32 {
+                let row = r0 + r;
+                let mut kept = row;
+                if row > pos {
+                  kept = pos;
+                }
+                let k0 = half_at(k_cache, kept, g, d, 0);
+                let k1 = half_at(k_cache, kept, g, d, 1);
+                let k2 = half_at(k_cache, kept, g, d, 2);
+                let k3 = half_at(k_cache, kept, g, d, 3);
+                let mut score = lane_sum(k0 * q0 + k1 * q1 + k2 * q2 + k3 * q3);
+                if row > pos {
+                  score = -3.0e38;
+                }
+                if r == l {
+                  mine = score;
+                }
+              }
+              let top = big.max(lane_max(mine));
+              let shrink = (big - top).fast_exp();
+              let p = (mine - top).fast_exp();
+              total = total * shrink + lane_sum(p);
+              o0 = o0 * shrink;
+              o1 = o1 * shrink;
+              o2 = o2 * shrink;
+              o3 = o3 * shrink;
+              for r in 0..32 {
+                let row = r0 + r;
+                let mut kept = row;
+                if row > pos {
+                  kept = pos;
+                }
+                let pr = lane_value(p, r);
+                o0 = fused(half_at(v_cache, kept, g, d, 0), pr, o0);
+                o1 = fused(half_at(v_cache, kept, g, d, 1), pr, o1);
+                o2 = fused(half_at(v_cache, kept, g, d, 2), pr, o2);
+                o3 = fused(half_at(v_cache, kept, g, d, 3), pr, o3);
+              }
+              big = top;
+              c = c + nwg;
             }
-            %bm = gpu.subgroup_reduce maxnumf %my : (f32) -> f32
-            %Mn = arith.maxnumf %M, %bm : f32
-            %dm = arith.subf %M, %Mn : f32
-            %ms = math.exp %dm : f32
-            %dp = arith.subf %my, %Mn : f32
-            %p = math.exp %dp : f32
-            %bs = gpu.subgroup_reduce add %p : (f32) -> f32
-            %Ss = arith.mulf %S, %ms : f32
-            %Sn = arith.addf %Ss, %bs : f32
-            %msv = vector.broadcast %ms : f32 to vector<4xf32>
-            %o1 = arith.mulf %o, %msv : vector<4xf32>
-            %o2 = scf.for %cc = %c0 to %c32 step %c1 iter_args(%oa = %o1) -> (vector<4xf32>) {
-              %row = arith.addi %r0, %cc : index
-              %rowc = arith.minui %row, %posi : index
-              %vh = vector.load %v[%rowc, %kd] {alignment = 8} : memref<?x?xf16, strided<[?, 1]>>, vector<4xf16>
-              %vf = arith.extf %vh : vector<4xf16> to vector<4xf32>
-              %cci = arith.index_cast %cc : index to i32
-              %pc, %pv = gpu.shuffle idx %p, %cci, %c32i : f32
-              %pcv = vector.broadcast %pc : f32 to vector<4xf32>
-              %on = vector.fma %vf, %pcv, %oa : vector<4xf32>
-              scf.yield %on : vector<4xf32>
+            part[h][w][d] = o0;
+            part[h][w][d + 1] = o1;
+            part[h][w][d + 2] = o2;
+            part[h][w][d + 3] = o3;
+            // Every lane has the same largest score and sum of the weights. Lanes 0 and 1 keep them for the
+            // next loop.
+            if l < 2 {
+              let mut x = big;
+              if l == 1 {
+                x = total;
+              }
+              stats[s][l] = x;
             }
-            scf.yield %Mn, %Sn, %o2 : f32, f32, vector<4xf32>
           }
-          vector.store %st#2, %part[%hi, %wi, %l4] : memref<?x?x?xf32>, vector<4xf32>
-          %lane0 = arith.cmpi eq, %l, %c0 : index
-          scf.if %lane0 {
-            memref.store %st#0, %part[%hi, %wi, %c128] : memref<?x?x?xf32>
-            memref.store %st#1, %part[%hi, %wi, %c129] : memref<?x?x?xf32>
+          for l in 0..2 across lanes(32) {
+            part[h][w][128 + l] = stats[s][l];
           }
-          macro.yield %h : i32
-        };
+        }
       }
     }
   }
@@ -176,9 +238,7 @@ fn vec_attention_merge(out : &mut Tensor<f32, [?, ?], Memory::HBM>, part : &Tens
   spawn on(Topology::Device) {
     for h in 0..q_heads across blocks {
       for dq in 0..4 across blocks {
-        let mut top = unsafe {
-          Tensor<f32, [1, 32], Memory::SMEM>::uninit()
-        };
+        let mut top = unsafe { Tensor<f32, [1, 32], Memory::SMEM>::uninit() };
         for s in 0..1 across subgroups {
           for l in 0..32 across lanes(32) {
             let mut m : f32 = -3.0e38;
