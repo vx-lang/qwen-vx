@@ -17,6 +17,12 @@ come from splitmix64, which NumPy computes for all of them at once. They have Hu
 and go through `convert.py`. --hugging-face also writes them as a Hugging Face folder, for
 `check_against_mlx.py`.
 
+With --qwen35, the model has the layers of Qwen3.6-35B-A3B, and its head sizes, so that it runs the
+same kernels: hidden size 256, 4 layers of which the last has full attention and the others a Gated
+DeltaNet, 4 query heads and 2 key-value heads of 256, 2 key heads and 4 value heads of 128 in a
+DeltaNet, and 8 experts of which each token uses 2, and a shared expert. Its weights come from
+splitmix64 too, and --hugging-face works as for --moe.
+
 Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
 See LICENSE for license information.
 SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
@@ -78,6 +84,46 @@ MOE_CONFIG = {
     "rope_theta": 1000000.0,
     "rms_norm_eps": 1e-6,
     "torch_dtype": "bfloat16",
+}
+QWEN35_TEXT_CONFIG = {
+    "model_type": "qwen3_5_moe_text",
+    "hidden_size": 256,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 256,
+    "linear_num_key_heads": 2,
+    "linear_num_value_heads": 4,
+    "linear_key_head_dim": 128,
+    "linear_value_head_dim": 128,
+    "linear_conv_kernel_dim": 4,
+    "full_attention_interval": 4,
+    "layer_types": ["linear_attention"] * 3 + ["full_attention"],
+    "num_experts": 8,
+    "num_experts_per_tok": 2,
+    "moe_intermediate_size": 128,
+    "shared_expert_intermediate_size": 128,
+    "norm_topk_prob": True,
+    "vocab_size": 256,
+    "max_position_embeddings": 64,
+    "eos_token_id": 255,
+    "rms_norm_eps": 1e-6,
+    "hidden_act": "silu",
+    "attn_output_gate": True,
+    "attention_bias": False,
+    "tie_word_embeddings": False,
+    "partial_rotary_factor": 0.25,
+    # The sections of the multimodal RoPE add up to half of the 64 rotary values.
+    "rope_parameters": {"rope_type": "default", "rope_theta": 10000000, "partial_rotary_factor": 0.25,
+                        "mrope_section": [11, 11, 10], "mrope_interleaved": True},
+    "dtype": "bfloat16",
+}
+# The config.json of the tiny Qwen3.5 MoE model, which keeps the text model in text_config.
+QWEN35_CONFIG = {
+    "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+    "model_type": "qwen3_5_moe",
+    "tie_word_embeddings": False,
+    "text_config": QWEN35_TEXT_CONFIG,
 }
 SEED = 0x2545F4914F6CDD1D
 
@@ -190,6 +236,67 @@ def tiny_moe_model():
     return tensors
 
 
+def tiny_qwen35_model():
+    """The tensors of the tiny Qwen3.5 MoE model, as bf16 bits with their Hugging Face names."""
+    c = QWEN35_TEXT_CONFIG
+    hidden, head_dim, inter = c["hidden_size"], c["head_dim"], c["moe_intermediate_size"]
+    heads, kv_heads, experts = c["num_attention_heads"], c["num_key_value_heads"], c["num_experts"]
+    k_total = c["linear_num_key_heads"] * c["linear_key_head_dim"]
+    v_heads = c["linear_num_value_heads"]
+    v_total = v_heads * c["linear_value_head_dim"]
+    shared = c["shared_expert_intermediate_size"]
+    src = "model.language_model."
+    shapes = {src + "embed_tokens.weight": (c["vocab_size"], hidden)}
+    for layer, kind in enumerate(c["layer_types"]):
+        p = f"{src}layers.{layer}."
+        shapes[p + "input_layernorm.weight"] = (hidden,)
+        if kind == "full_attention":
+            shapes[p + "self_attn.q_proj.weight"] = (heads * head_dim * 2, hidden)
+            shapes[p + "self_attn.k_proj.weight"] = (kv_heads * head_dim, hidden)
+            shapes[p + "self_attn.v_proj.weight"] = (kv_heads * head_dim, hidden)
+            shapes[p + "self_attn.o_proj.weight"] = (hidden, heads * head_dim)
+            shapes[p + "self_attn.q_norm.weight"] = (head_dim,)
+            shapes[p + "self_attn.k_norm.weight"] = (head_dim,)
+        else:
+            shapes[p + "linear_attn.in_proj_qkv.weight"] = (2 * k_total + v_total, hidden)
+            shapes[p + "linear_attn.in_proj_z.weight"] = (v_total, hidden)
+            shapes[p + "linear_attn.in_proj_b.weight"] = (v_heads, hidden)
+            shapes[p + "linear_attn.in_proj_a.weight"] = (v_heads, hidden)
+            shapes[p + "linear_attn.conv1d.weight"] = (2 * k_total + v_total, 1, c["linear_conv_kernel_dim"])
+            shapes[p + "linear_attn.A_log"] = (v_heads,)
+            shapes[p + "linear_attn.dt_bias"] = (v_heads,)
+            shapes[p + "linear_attn.norm.weight"] = (c["linear_value_head_dim"],)
+            shapes[p + "linear_attn.out_proj.weight"] = (hidden, v_total)
+        shapes[p + "post_attention_layernorm.weight"] = (hidden,)
+        shapes[p + "mlp.gate.weight"] = (experts, hidden)
+        shapes[p + "mlp.experts.gate_up_proj"] = (experts, 2 * inter, hidden)
+        shapes[p + "mlp.experts.down_proj"] = (experts, hidden, inter)
+        shapes[p + "mlp.shared_expert.gate_proj.weight"] = (shared, hidden)
+        shapes[p + "mlp.shared_expert.up_proj.weight"] = (shared, hidden)
+        shapes[p + "mlp.shared_expert.down_proj.weight"] = (hidden, shared)
+        shapes[p + "mlp.shared_expert_gate.weight"] = (1, hidden)
+    shapes[src + "norm.weight"] = (hidden,)
+    shapes["lm_head.weight"] = (c["vocab_size"], hidden)
+    # The ranges of the weights whose kind needs another one than (-0.1, 0.1).
+    ranges = {"conv1d.weight": (-0.5, 0.5), "A_log": (-1.0, 1.0), "dt_bias": (-1.0, 1.0), "linear_attn.norm.weight": (0.9, 1.1)}
+    tensors, start = {}, 0
+    for name, shape in shapes.items():
+        count = int(np.prod(shape))
+        low, high = next((r for suffix, r in ranges.items() if name.endswith(suffix)), (-0.1, 0.1))
+        values = splitmix64_uniform(start, count, low, high).reshape(shape)
+        if name.endswith("norm.weight") and not name.endswith("linear_attn.norm.weight"):
+            # The model multiplies by 1 + w. MLX adds the 1 in bf16, so keep 1 + w exact there:
+            # a multiple of 1/128.
+            values = np.round(values * 128) / np.float32(128)
+        elif name.endswith("experts.gate_up_proj") or name.endswith("experts.down_proj"):
+            values *= np.asarray([EXPERT_SIZES[e % len(EXPERT_SIZES)] for e in range(experts)], dtype=np.float32)[:, None, None]
+        elif name.endswith("mlp.gate.weight"):
+            values *= np.float32(ROUTER_SIZE)
+        start += count
+        tensors[name] = ("bf16", qwen_weights.f32_to_bf16(values.astype(np.float32)))
+    return tensors
+
+
 def write_hugging_face_folder(directory, config, tensors):
     """Write config.json and model.safetensors, with bf16 tensors given as uint16 bits."""
     os.makedirs(directory, exist_ok=True)
@@ -216,19 +323,21 @@ def main():
     weight_format.add_argument("--q4", action="store_true", help="store the weight matrices as Q4_0 codes")
     parser.add_argument("--q6-lm-head", action="store_true", help="with --q4, store lm_head as 6-bit codes, not f8e4m3")
     parser.add_argument("--moe", action="store_true", help="write the tiny mixture-of-experts model")
-    parser.add_argument("--hugging-face", metavar="DIR", help="also write the MoE model as a Hugging Face folder")
+    parser.add_argument("--qwen35", action="store_true", help="write the tiny model with the layers of Qwen3.6-35B-A3B")
+    parser.add_argument("--hugging-face", metavar="DIR", help="also write the MoE or Qwen3.5 model as a Hugging Face folder")
     parser.add_argument("--max-positions", type=int, help="the positions of the model, 64 if not given; the weights do not change")
     parser.add_argument("--vocab-size", type=int, help="the tokens of the dense model, 256 if not given, for a bigger tokenizer; other weights come out")
     args = parser.parse_args()
-    assert not (args.moe and args.vocab_size), "--vocab-size is for the dense model"
+    assert not (args.moe and args.qwen35), "give --moe or --qwen35, not both"
+    assert not ((args.moe or args.qwen35) and args.vocab_size), "--vocab-size is for the dense model"
     assert not args.q6_lm_head or args.q4, "--q6-lm-head needs --q4"
-    if args.moe:
-        hf = tiny_moe_model()
+    if args.moe or args.qwen35:
+        hf_config, hf = (MOE_CONFIG, tiny_moe_model()) if args.moe else (QWEN35_CONFIG, tiny_qwen35_model())
         if args.hugging_face:
-            write_hugging_face_folder(args.hugging_face, MOE_CONFIG, hf)
-        config, tensors = convert.convert_tensors(qwen_weights.config_from_json(MOE_CONFIG), hf)
+            write_hugging_face_folder(args.hugging_face, hf_config, hf)
+        config, tensors = convert.convert_tensors(qwen_weights.config_from_json(hf_config), hf)
     else:
-        assert not args.hugging_face, "--hugging-face needs --moe"
+        assert not args.hugging_face, "--hugging-face needs --moe or --qwen35"
         config = CONFIG if not args.vocab_size else dict(CONFIG, vocab_size=args.vocab_size)
         config, tensors = config, tiny_model(config)
     if args.max_positions:

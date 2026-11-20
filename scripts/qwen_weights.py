@@ -4,19 +4,24 @@ The weight file holds 8-byte little-endian words, so a Vx program can read it wi
 and `f64` loads and needs no JSON parser:
 
     word 0       magic, the bytes b"VXQWEN01"
-    word 1       format version, 1
+    word 1       format version, 1 or 2
     word 2       number of tensors
     word 3       alignment of each tensor, in bytes
     word 4       byte offset of the tensor table
-    words 5-20   the integers of CONFIG_INTS, in that order
-    words 21-22  rope_theta and rms_norm_eps, as f64
+    words 5-20   version 1: the first 16 integers of CONFIG_INTS, in that order
+    words 21-22  version 1: rope_theta and rms_norm_eps, as f64
+    words 5-36   version 2: the integers of CONFIG_INTS, in that order, then zeros
+    words 37-38  version 2: rope_theta and rms_norm_eps, as f64
+
+A model of `arch` 0 (Qwen2, Qwen3 MoE) gets version 1, and a model of `arch` 1 (Qwen3.5 MoE, which
+Qwen3.6 also uses) gets version 2.
 
 The tensor table has one entry of 16 words (128 bytes) per tensor: the name in words 0-7 (ASCII,
 padded with zero bytes), the dtype code, the rank, four dimensions (unused ones are 0), the byte
 offset of the data and its size in bytes. The tensors come in the order of `tensor_names`.
 
 `weight_format` says how the file stores the weight matrices of MATRICES. Each other tensor is
-bf16 in every format.
+bf16 in every format, except the f32 tensors of arch 1 below.
 
     0, bf16    each weight matrix is bf16.
     1, fp8     each weight matrix is f8e4m3 codes, one byte for each weight. The tensor after it,
@@ -40,6 +45,33 @@ row for each expert, and the matrices `experts_gate_up` and `experts_down` in pl
 and `down`. These hold expert e after expert e - 1. An expert has 2 * moe_intermediate_size rows
 in `experts_gate_up`, its gate rows and then its up rows, and hidden_size rows in `experts_down`.
 
+In arch 1, layer l has full attention when (l + 1) % full_attention_interval is 0, and a Gated
+DeltaNet (a linear attention) otherwise. Each RMSNorm of the model multiplies by 1 + w, and the file
+holds 1 + w as f32, so that a program multiplies by the weight as for arch 0. A layer with full
+attention has:
+
+    qkv          the rows of q, k and v, then the rows of the gate of each query head. The
+                 attention output of head h is multiplied by sigmoid of gate head h.
+    q_norm, k_norm, attn_out
+                 as in arch 0. RoPE turns only the first rotary_dim values of each head.
+
+A Gated DeltaNet layer has, with K = linear_k_heads * linear_k_dim and V = linear_v_heads *
+linear_v_dim:
+
+    linear_in    rows [q K | k K | v V | z V | b linear_v_heads | a linear_v_heads], one matrix.
+    conv         f32 [2K + V, conv_width], the causal convolution of q, k and v. Column
+                 conv_width - 1 multiplies the current token, and column 0 the oldest.
+    neg_A        f32 [linear_v_heads], -exp(A_log).
+    dt_bias      f32 [linear_v_heads].
+    linear_norm  f32 [linear_v_dim], the RMSNorm of each head of the output. It multiplies by w,
+                 not by 1 + w.
+    linear_out   [hidden_size, V].
+
+Each layer of arch 1 also has a shared expert. Its `router` has one more row, the gate of the
+shared expert, and `shared_gate_up` and `shared_down` hold the shared expert as one expert of
+`experts_gate_up` and `experts_down`, with shared_expert_intermediate_size in place of
+moe_intermediate_size.
+
 Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
 See LICENSE for license information.
 SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
@@ -54,7 +86,6 @@ from pathlib import Path
 import numpy as np
 
 MAGIC = b"VXQWEN01"
-VERSION = 1
 TABLE_OFFSET = 4096
 ENTRY_BYTES = 128
 # A Metal buffer over mapped file memory must start on a page, and an Apple Silicon page is 16 KiB.
@@ -77,10 +108,22 @@ CONFIG_INTS = [
     "experts_per_token",
     "moe_intermediate_size",
     "qk_norm",
+    # Version 2 only. A version 1 file reads them as V1_DEFAULTS.
+    "arch",
+    "full_attention_interval",
+    "linear_k_heads",
+    "linear_v_heads",
+    "linear_k_dim",
+    "linear_v_dim",
+    "conv_width",
+    "rotary_dim",
+    "shared_expert_intermediate_size",
 ]
-# The header has room for 16 integers.
-CONFIG_INT_SLOTS = 16
-assert len(CONFIG_INTS) <= CONFIG_INT_SLOTS
+# The integers that the header of each version has room for.
+CONFIG_INT_SLOTS = {1: 16, 2: 32}
+assert len(CONFIG_INTS) <= CONFIG_INT_SLOTS[2]
+V1_DEFAULTS = dict.fromkeys(CONFIG_INTS[CONFIG_INT_SLOTS[1] :], 0)
+ARCHS = {"qwen": 0, "qwen3_5": 1}
 WEIGHT_FORMATS = {"bf16": 0, "fp8": 1, "q4_0": 2, "q4_0_q6": 3}
 
 DTYPE_CODES = {"f32": 0, "bf16": 1, "f8e4m3": 2, "f16": 3, "u4": 4, "u2": 5}
@@ -91,7 +134,8 @@ DTYPE_BITS = {"f32": 32, "bf16": 16, "f8e4m3": 8, "f16": 16, "u4": 4, "u2": 2}
 STORAGE = {"f32": np.float32, "bf16": np.uint16, "f8e4m3": np.uint8, "f16": np.float16, "u4": np.uint8, "u2": np.uint8}
 
 # The weight matrices that an fp8 or q4_0 file quantizes. The kinds of a layer end the name.
-MATRICES = ("qkv", "attn_out", "gate_up", "down", "experts_gate_up", "experts_down", "lm_head")
+MATRICES = ("qkv", "attn_out", "gate_up", "down", "experts_gate_up", "experts_down", "lm_head",
+            "linear_in", "linear_out", "shared_gate_up", "shared_down")
 BLOCK = 128
 Q4_GROUP = 32
 # A 6-bit matrix has one f16 scale for each Q6_GROUP weights of a row.
@@ -134,6 +178,29 @@ def matrix_dtype(config, name):
     return "f8e4m3" if weight_format else "bf16"
 
 
+def file_version(config):
+    """The format version of the weight file of a model: 1 for arch 0, and 2 for arch 1."""
+    return 2 if config.get("arch", 0) else 1
+
+
+def has_full_attention(config, layer):
+    """Whether layer `layer` has full attention, and not a Gated DeltaNet."""
+    return not config.get("arch", 0) or (layer + 1) % config["full_attention_interval"] == 0
+
+
+def layer_names(config, layer):
+    """The names of the tensors of one layer of an arch 1 model, in file order."""
+    prefix = f"layers.{layer}."
+    if has_full_attention(config, layer):
+        kinds = ["attn_norm", "qkv", "q_norm", "k_norm", "attn_out"]
+    else:
+        kinds = ["attn_norm", "linear_in", "conv", "neg_A", "dt_bias", "linear_norm", "linear_out"]
+    kinds += ["mlp_norm", "router", "experts_gate_up", "experts_down"]
+    if config["shared_expert_intermediate_size"]:
+        kinds += ["shared_gate_up", "shared_down"]
+    return [prefix + kind for kind in kinds]
+
+
 def tensor_names(config):
     """The names of the tensors in the weight file, in file order."""
     assert config["weight_format"] in WEIGHT_FORMATS.values(), f"weight format {config['weight_format']}"
@@ -141,6 +208,9 @@ def tensor_names(config):
     names = ["embed"]
     for layer in range(config["num_layers"]):
         prefix = f"layers.{layer}."
+        if config.get("arch", 0):
+            names += layer_names(config, layer)
+            continue
         names += [prefix + "attn_norm", prefix + "qkv"]
         if config["qkv_bias"]:
             names.append(prefix + "qkv_bias")
@@ -177,6 +247,9 @@ def tensor_shapes(config):
         shapes["lm_head"] = (config["vocab_size"], hidden)
     for layer in range(config["num_layers"]):
         prefix = f"layers.{layer}."
+        if config.get("arch", 0):
+            shapes.update(arch1_layer_shapes(config, layer))
+            continue
         shapes[prefix + "attn_norm"] = (hidden,)
         shapes[prefix + "qkv"] = (qkv_rows, hidden)
         if config["qkv_bias"]:
@@ -208,6 +281,42 @@ def tensor_shapes(config):
     return shapes
 
 
+def arch1_layer_shapes(config, layer):
+    """The shape of each tensor of one layer of an arch 1 model, by name."""
+    prefix = f"layers.{layer}."
+    hidden, head_dim, q_heads = config["hidden_size"], config["head_dim"], config["num_q_heads"]
+    k_total = config["linear_k_heads"] * config["linear_k_dim"]
+    v_heads = config["linear_v_heads"]
+    v_total = v_heads * config["linear_v_dim"]
+    shared = config["shared_expert_intermediate_size"]
+    shapes = {
+        "attn_norm": (hidden,),
+        "mlp_norm": (hidden,),
+        "router": (config["num_experts"] + (1 if shared else 0), hidden),
+        "experts_gate_up": (config["num_experts"] * 2 * config["moe_intermediate_size"], hidden),
+        "experts_down": (config["num_experts"] * hidden, config["moe_intermediate_size"]),
+    }
+    if shared:
+        shapes.update(shared_gate_up=(2 * shared, hidden), shared_down=(hidden, shared))
+    if has_full_attention(config, layer):
+        shapes.update(
+            qkv=(2 * q_heads * head_dim + 2 * config["num_kv_heads"] * head_dim, hidden),
+            q_norm=(head_dim,),
+            k_norm=(head_dim,),
+            attn_out=(hidden, q_heads * head_dim),
+        )
+    else:
+        shapes.update(
+            linear_in=(2 * k_total + 2 * v_total + 2 * v_heads, hidden),
+            conv=(2 * k_total + v_total, config["conv_width"]),
+            neg_A=(v_heads,),
+            dt_bias=(v_heads,),
+            linear_norm=(config["linear_v_dim"],),
+            linear_out=(hidden, v_total),
+        )
+    return {prefix + kind: shape for kind, shape in shapes.items()}
+
+
 def storage_shape(dtype, shape):
     """The shape of the NumPy array that holds a tensor of this dtype and shape."""
     per_byte = {"u4": 2, "u2": 4}.get(dtype, 1)
@@ -231,12 +340,16 @@ def write_weight_file(path, config, tensors):
     # The data starts at the first aligned offset after the tensor table.
     data_start = -(-(TABLE_OFFSET + ENTRY_BYTES * len(names)) // ALIGNMENT) * ALIGNMENT
     header = bytearray(data_start)
-    words = [VERSION, len(names), ALIGNMENT, TABLE_OFFSET]
-    words += [int(config[field]) for field in CONFIG_INTS]
-    words += [0] * (CONFIG_INT_SLOTS - len(CONFIG_INTS))
+    version = file_version(config)
+    fields = CONFIG_INTS[: CONFIG_INT_SLOTS[version]]
+    if version == 1:
+        assert all(config.get(field, 0) == 0 for field in V1_DEFAULTS), "a version 1 file has no room for these fields"
+    words = [version, len(names), ALIGNMENT, TABLE_OFFSET]
+    words += [int(config[field]) for field in fields]
+    words += [0] * (CONFIG_INT_SLOTS[version] - len(fields))
     header[0:8] = MAGIC
     struct.pack_into(f"<{len(words)}q", header, 8, *words)
-    struct.pack_into("<2d", header, 8 * (5 + CONFIG_INT_SLOTS), config["rope_theta"], config["rms_norm_eps"])
+    struct.pack_into("<2d", header, 8 * (5 + CONFIG_INT_SLOTS[version]), config["rope_theta"], config["rms_norm_eps"])
 
     offset = data_start
     with open(path, "wb") as out:
@@ -266,11 +379,14 @@ def read_weight_file(path):
     """
     data = np.memmap(path, dtype=np.uint8, mode="r")
     assert bytes(data[0:8]) == MAGIC, f"{path}: not a weight file of the Qwen app"
-    words = struct.unpack_from(f"<{4 + CONFIG_INT_SLOTS}q", data, 8)
-    version, count, alignment, table = words[:4]
-    assert version == VERSION, f"{path}: format version {version}, expected {VERSION}"
-    config = dict(zip(CONFIG_INTS, words[4 : 4 + len(CONFIG_INTS)]))
-    config["rope_theta"], config["rms_norm_eps"] = struct.unpack_from("<2d", data, 8 * (5 + CONFIG_INT_SLOTS))
+    (version,) = struct.unpack_from("<q", data, 8)
+    assert version in CONFIG_INT_SLOTS, f"{path}: format version {version}, expected 1 or 2"
+    slots = CONFIG_INT_SLOTS[version]
+    words = struct.unpack_from(f"<{4 + slots}q", data, 8)
+    count, alignment, table = words[1:4]
+    config = dict(V1_DEFAULTS)
+    config.update(zip(CONFIG_INTS[:slots], words[4:]))
+    config["rope_theta"], config["rms_norm_eps"] = struct.unpack_from("<2d", data, 8 * (5 + slots))
     tensors = {}
     for index in range(count):
         start = table + index * ENTRY_BYTES
@@ -608,7 +724,10 @@ def config_from_hugging_face(model_dir):
 
 
 def config_from_json(hf):
-    """The config of the weight file, from the `config.json` of a Qwen2 or a Qwen3 MoE model."""
+    """The config of the weight file, from the `config.json` of a Qwen2, a Qwen3 MoE or a Qwen3.5
+    MoE model."""
+    if hf["model_type"] == "qwen3_5_moe":
+        return config_from_qwen3_5(hf)
     assert hf["model_type"] in ("qwen2", "qwen3_moe"), f"model_type {hf['model_type']} is not supported yet"
     moe = hf["model_type"] == "qwen3_moe"
     if moe:
@@ -636,4 +755,53 @@ def config_from_json(hf):
         "qk_norm": int(moe),
         "rope_theta": float(hf["rope_theta"]),
         "rms_norm_eps": float(hf["rms_norm_eps"]),
+    }
+
+
+def config_from_qwen3_5(hf):
+    """The config of the weight file, from the `config.json` of a Qwen3.5 MoE model, such as
+    Qwen3.6-35B-A3B. The file keeps only the text model: no vision tower and no MTP layer."""
+    text = hf["text_config"]
+    assert text["model_type"] == "qwen3_5_moe_text", f"text model_type {text['model_type']}"
+    interval = text["full_attention_interval"]
+    kinds = ["full_attention" if (l + 1) % interval == 0 else "linear_attention" for l in range(text["num_hidden_layers"])]
+    assert text.get("layer_types", kinds) == kinds, "the layers must have full attention at every interval"
+    assert text["attn_output_gate"], "the attention output must have a gate"
+    assert not text["attention_bias"], "Q, K and V of a Qwen3.5 model have no bias"
+    assert text["hidden_act"] == "silu", f"activation {text['hidden_act']}"
+    assert text["linear_num_value_heads"] % text["linear_num_key_heads"] == 0, "v heads must share k heads evenly"
+    rope = text["rope_parameters"]
+    assert rope.get("rope_type", "default") == "default", f"RoPE type {rope.get('rope_type')}"
+    head_dim = text["head_dim"]
+    eos = text.get("eos_token_id")
+    return {
+        "hidden_size": text["hidden_size"],
+        "intermediate_size": 0,
+        "num_layers": text["num_hidden_layers"],
+        "num_q_heads": text["num_attention_heads"],
+        "num_kv_heads": text["num_key_value_heads"],
+        "head_dim": head_dim,
+        "vocab_size": text["vocab_size"],
+        "max_positions": text["max_position_embeddings"],
+        "tied_embeddings": int(hf.get("tie_word_embeddings", text.get("tie_word_embeddings", False))),
+        "qkv_bias": 0,
+        "eos_token_id": eos[0] if isinstance(eos, list) else eos,
+        "weight_format": WEIGHT_FORMATS["bf16"],
+        "num_experts": text["num_experts"],
+        "experts_per_token": text["num_experts_per_tok"],
+        "moe_intermediate_size": text["moe_intermediate_size"],
+        "qk_norm": 1,
+        "arch": ARCHS["qwen3_5"],
+        "full_attention_interval": interval,
+        "linear_k_heads": text["linear_num_key_heads"],
+        "linear_v_heads": text["linear_num_value_heads"],
+        "linear_k_dim": text["linear_key_head_dim"],
+        "linear_v_dim": text["linear_value_head_dim"],
+        "conv_width": text["linear_conv_kernel_dim"],
+        # The text model gives the same position to the three sections of the multimodal RoPE, so
+        # it is plain RoPE on the first rotary_dim values of each head.
+        "rotary_dim": int(head_dim * rope.get("partial_rotary_factor", 1.0)),
+        "shared_expert_intermediate_size": text["shared_expert_intermediate_size"],
+        "rope_theta": float(rope["rope_theta"]),
+        "rms_norm_eps": float(text["rms_norm_eps"]),
     }

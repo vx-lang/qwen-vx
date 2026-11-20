@@ -139,13 +139,13 @@ of Qwen3-Coder-30B-A3B.
 
 | Script | What it does |
 | --- | --- |
-| `scripts/convert.py` | Converts a Hugging Face Qwen2 or Qwen3 MoE folder into a weight file. |
+| `scripts/convert.py` | Converts a Hugging Face Qwen2, Qwen3 MoE or Qwen3.5 MoE folder into a weight file. |
 | `scripts/reference.py` | Computes the logits and the greedy tokens with NumPy, in float32. |
 | `scripts/check_against_mlx.py` | Compares `reference.py` with MLX on the same model. |
 | `scripts/compare.py` | Compares the output of the Vx program with the output of `reference.py`. |
-| `scripts/make_tiny_model.py` | Writes a tiny model with random weights. |
+| `scripts/make_tiny_model.py` | Writes a tiny model with random weights: dense, `--moe`, or `--qwen35` with the layers of Qwen3.6-35B-A3B. |
 | `scripts/qwen_weights.py` | Reads and writes the weight file. Its first comment describes the format. |
-| `scripts/test_qwen_weights.py` | Tests the f8e4m3, Q4_0 and 6-bit codes, their scales and the quantized weight files. |
+| `scripts/test_qwen_weights.py` | Tests the f8e4m3, Q4_0 and 6-bit codes, their scales, the quantized weight files and the files of Qwen3.5 MoE models. |
 | `scripts/importance.py` | Measures the importance matrix of a bf16 model, for `convert.py --importance`. |
 | `scripts/test_importance.py` | Tests `importance.py`. |
 | `scripts/convert_tokenizer.py` | Converts a tokenizer.json into a tokenizer file. Its first comment describes the format. |
