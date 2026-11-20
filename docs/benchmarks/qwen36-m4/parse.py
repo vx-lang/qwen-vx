@@ -7,7 +7,7 @@
 OUT is the folder that run.sh wrote. The token counts of the prompts come from prompts/tokens.csv.
 A number is missing from a row when its log does not have it, for example after a failed run.
 With --choose, the script prints the fastest draft length of each program in table T, as
-DRAFT=… MTP_N=… LOOKUP_N=…, for run.sh.
+DRAFT=… MTP_N=…, for run.sh.
 
 Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
 See LICENSE for license information.
@@ -27,12 +27,12 @@ PROGRAMS = {
     "vx": "qwen-vx",
     "vxdraft": "qwen-vx --draft",
     "completion": "llama-completion",
-    "lookup": "llama-lookup",
+    "cache": "llama.cpp ngram-cache",
     "ngram": "llama.cpp ngram-mod",
     "mtp": "llama.cpp draft-mtp",
 }
 # The variable of run.sh that takes the chosen draft length of each program.
-CHOICES = {"vxdraft": "DRAFT", "mtp": "MTP_N", "lookup": "LOOKUP_N"}
+CHOICES = {"vxdraft": "DRAFT", "mtp": "MTP_N"}
 KINDS = ["edit", "complete", "write", "explain"]
 SETS = {"T": "twelve", "C": "heldout"}
 
@@ -58,7 +58,7 @@ def parse_log(program, text):
         r["timed_tokens"] = num(perf + r"eval time = *[0-9.]+ ms / *(\d+) runs", text, int)
         r["prompt_ms"] = num(perf + r"prompt eval time = *([0-9.]+) ms", text)
         r["llama_prompt_tokens"] = num(perf + r"prompt eval time = *[0-9.]+ ms / *(\d+) tokens", text, int)
-    else:  # llama-lookup and llama-speculative-simple print the same lines
+    else:  # llama-speculative-simple
         m = re.search(r"decoded +(\d+) tokens in +([0-9.]+) seconds", text)
         if m:
             r["timed_tokens"] = int(m[1])
@@ -73,14 +73,28 @@ def parse_log(program, text):
     return r
 
 
-def generated_text(path):
-    """The output of the app after the line of the compiler, without its lines of times and drafts."""
+LOG_LINE = re.compile(r"\d+\.\d+\.\d+\.\d+ [A-Z] ")
+
+
+def answer(path):
+    """The text that a program wrote after the chat prompt, without the lines of times and drafts."""
     lines = path.read_text(errors="replace").split("\n")
-    start = next((i + 1 for i, line in enumerate(lines) if line.startswith("[JIT] Compiling to native object")), None)
-    assert start is not None, f"{path} has no line of the compiler"
-    lines = [re.sub(r"rounds=\d+ drafted=\d+ accepted=\d+;", "", line) for line in lines[start:]
-             if not line.startswith("time ")]
-    return "\n".join(lines).rstrip("\n")
+    start = next((i + 2 for i, line in enumerate(lines) if line == "</think>"), None)
+    assert start is not None, f"{path} has no chat prompt"
+    out = []
+    for line in lines[start:]:
+        if line.startswith("time ") or LOG_LINE.match(line):
+            break
+        out.append(re.sub(r"rounds=\d+ drafted=\d+ accepted=\d+;", "", line))
+    return "\n".join(out).rstrip("\n")
+
+
+def agree(a, b):
+    """The number of characters at the start of a and b that are the same."""
+    n = 0
+    while n < min(len(a), len(b)) and a[n] == b[n]:
+        n += 1
+    return n
 
 
 def read_rows(out):
@@ -105,7 +119,8 @@ def read_rows(out):
         else:  # T.edit1.r1.vxdraft7
             table, prompt, rnd = parts[0], f"{SETS[parts[0]]}/{parts[1]}", parts[2]
             program, setting = re.fullmatch(r"([a-z]+)(\d*)", parts[3]).groups()
-        r = parse_log(program, (out / "logs" / f"{name}.txt").read_text(errors="replace"))
+        text = (out / "logs" / f"{name}.txt").read_text(errors="replace")
+        r = parse_log(program, text)
         n = tokens[prompt]
         if r.get("prompt_ms_per_token") is not None:
             r["prompt_ms"] = r["prompt_ms_per_token"] * n
@@ -118,6 +133,7 @@ def read_rows(out):
             first_prompt_ms=runs[0] if runs else None, later_prompt_ms=" ".join(f"{x:.1f}" for x in runs[1:]),
             ms_per_token=r.get("ms_per_token"), timed_tokens=r.get("timed_tokens"), checks=r.get("checks"),
             drafted=r.get("drafted"), accepted=r.get("accepted"), flash_attn=flash, threads=r.get("threads"),
+            errors=len(re.findall(r"^\d+\.\d+\.\d+\.\d+ E ", text, re.M)),
             log=f"logs/{name}.txt", **m,
         ))
     return rows
@@ -141,7 +157,10 @@ def spread(xs, fmt="{:.2f}"):
 
 
 def timed(rows, table, program=None, setting=None):
+    """The runs of the summary: no failed runs, no runs with error lines, and no runs with drafts that
+    wrote other text than the runs without drafts."""
     return [r for r in rows if r["table"] == table and r["rc"] == 0 and r["ms_per_token"] is not None
+            and not r["errors"] and r.get("same_text") is not False
             and (program is None or r["program"] == program) and (setting is None or r["setting"] == setting)]
 
 
@@ -166,14 +185,35 @@ def choose(rows):
     return " ".join(words)
 
 
-def same_text(out, rows, table):
-    """For each run with --draft, whether its text is that of the run without drafts."""
-    same = []
-    for r in timed(rows, table, PROGRAMS["vxdraft"]):
-        plain = out / re.sub(r"\.vxdraft\d+\.txt$", ".vx.txt", r["log"])
-        if plain.exists():
-            same.append(generated_text(plain) == generated_text(out / r["log"]))
-    return same
+def plain_log(r):
+    """The log of the run without drafts of the same program, prompt and round, for a run with drafts."""
+    if r["table"] not in SETS or r["program"] in (PROGRAMS["vx"], PROGRAMS["completion"]):
+        return None
+    plain = "vx" if r["program"] == PROGRAMS["vxdraft"] else "completion"
+    return re.sub(r"\.[a-z]+\d*\.txt$", f".{plain}.txt", r["log"])
+
+
+def mark_same_text(out, rows):
+    """Whether each run with drafts wrote the text of the run without drafts. qwen-vx --draft must
+    write the same text. A program of llama.cpp may generate a few more tokens with drafts, so its
+    text must start with the whole text of llama-completion."""
+    for r in rows:
+        r["same_text"] = ""
+        log = plain_log(r)
+        if log is None or r["rc"] != 0 or not (out / log).exists():
+            continue
+        a, b = answer(out / log), answer(out / r["log"])
+        r["same_text"] = a == b if r["program"] == PROGRAMS["vxdraft"] else b.startswith(a)
+
+
+def say_same_text(say, rows, table):
+    for p in PROGRAMS.values():
+        rr = [r for r in rows if r["table"] == table and r["program"] == p and r["same_text"] != ""]
+        if rr:
+            plain = "qwen-vx" if p == PROGRAMS["vxdraft"] else "llama-completion"
+            differ = [r["log"] for r in rr if not r["same_text"]]
+            say(f"- {p}: the text of {plain} in {len(rr) - len(differ)} of {len(rr)} runs"
+                + (f". Other text, out of the summary: {', '.join(differ)}" if differ else ""))
 
 
 def summary(out, rows):
@@ -182,6 +222,10 @@ def summary(out, rows):
     bad = [r["log"] for r in rows if r["rc"] != 0]
     if bad:
         say("Failed runs: " + ", ".join(bad))
+        say("")
+    errors = [r["log"] for r in rows if r["errors"]]
+    if errors:
+        say("Runs with error lines, out of the summary: " + ", ".join(errors))
         say("")
     wrong = sorted({r["prompt"] for r in rows if r["llama_prompt_tokens"] not in (None, r["prompt_tokens"])})
     if wrong:
@@ -241,9 +285,8 @@ def summary(out, rows):
             rr = timed(rows, "T", program, setting)
             acc, dr = sum(r["accepted"] or 0 for r in rr), sum(r["drafted"] or 0 for r in rr)
             say(f"| {program} | {setting} | {v:.2f} | {f'{acc} / {dr} ({100 * acc / dr:.0f}%)' if dr else ''} |")
-        same = same_text(out, rows, "T")
         say("")
-        say(f"- qwen-vx text with and without drafts: the same in {sum(same)} of {len(same)} pairs")
+        say_same_text(say, rows, "T")
         say("")
 
     programs = [p for p in PROGRAMS.values() if timed(rows, "C", p)]
@@ -294,9 +337,22 @@ def summary(out, rows):
                 acc, dr = sum(r["accepted"] or 0 for r in rr), sum(r["drafted"] or 0 for r in rr)
                 cells.append(f"{acc} / {dr} ({100 * acc / dr:.0f}%)" if dr else "")
             say(f"| {kind or 'all 12'} | " + " | ".join(cells) + " |")
-        same = same_text(out, rows, "C")
         say("")
-        say(f"- qwen-vx text with and without drafts: the same in {sum(same)} of {len(same)} pairs")
+        say_same_text(say, rows, "C")
+        say("")
+        say("### qwen-vx and llama-completion: where the text starts to differ")
+        say("")
+        say("The characters at the start of the generated text that are the same, round 1. The weight files "
+            "differ in the token embedding and the output matrix, so the greedy text of the two programs can differ.")
+        say("")
+        say("| Prompt | Same characters | Characters of llama-completion |")
+        say("| --- | ---: | ---: |")
+        for prompt in sorted({r["prompt"] for r in rows if r["table"] == "C"}):
+            pair = {r["program"]: r for r in rows if r["table"] == "C" and r["prompt"] == prompt and r["round"] == "1"
+                    and r["rc"] == 0}
+            if PROGRAMS["vx"] in pair and PROGRAMS["completion"] in pair:
+                a = answer(out / pair[PROGRAMS["completion"]]["log"])
+                say(f"| {prompt.split('/')[1]} | {agree(a, answer(out / pair[PROGRAMS['vx']]['log']))} | {len(a)} |")
         say("")
 
     for name in ("llama-bench-pp", "llama-bench-tg"):
@@ -315,6 +371,7 @@ def main():
         sys.exit(__doc__.split("\n\n")[1])
     out = Path(sys.argv[1])
     rows = read_rows(out)
+    mark_same_text(out, rows)
     if sys.argv[2:] == ["--choose"]:
         print(choose(rows))
         return
