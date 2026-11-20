@@ -19,7 +19,9 @@
 // --prompt-file FILE. The program prints the prompt and the text that it generates. It stops at a
 // special token, such as <|im_end|>, or after --steps tokens. --chat puts the prompt in the chat
 // format of the Instruct models and prints only the reply. --lines prints the lines of --tokens
-// in place of the text.
+// in place of the text. Qwen3.5 and Qwen3.6 think before they reply by default; with --chat, the
+// prompt turns the thinking off, as the chat template does with enable_thinking=false, unless
+// --think is given.
 import core::convert;
 import std::time;
 import std::vec;
@@ -57,6 +59,7 @@ struct Options {
   lines : bool,
   draft : *const i8,
   has_draft : bool,
+  think : bool,
 }
 
 /// The options of `argv`. Asserts that they are complete and that they fit together.
@@ -66,13 +69,16 @@ fn parse_options(argc : i32, argv : *mut *mut i8) -> Options {
   let mut o = Options {
     weights: unsafe { argv[1] }, tokens: empty, tokenizer: empty, prompt: empty, prompt_file: empty,
     steps: empty, has_tokens: false, has_tokenizer: false, has_prompt: false, has_prompt_file: false,
-    has_steps: false, context: empty, has_context: false, requests: empty, has_requests: false, replies: empty, has_replies: false, session: false, chat: false, lines: false, draft: empty, has_draft: false,
+    has_steps: false, context: empty, has_context: false, requests: empty, has_requests: false, replies: empty, has_replies: false, session: false, chat: false, lines: false, draft: empty, has_draft: false, think: false,
   };
   let mut i = 2;
   while i < argc {
     let name = unsafe { argv[i] };
     if same(name, "--chat") {
       o.chat = true;
+      i = i + 1;
+    } else if same(name, "--think") {
+      o.think = true;
       i = i + 1;
     } else if same(name, "--session") {
       o.session = true;
@@ -124,6 +130,7 @@ fn parse_options(argc : i32, argv : *mut *mut i8) -> Options {
   let no_text = !o.has_prompt && !o.has_prompt_file;
   assert((o.has_tokens && no_text) || (o.has_tokenizer && !o.has_tokens && one_text), "give: WEIGHTS --tokens 1,2,3 --steps N, or WEIGHTS --tokenizer FILE (--prompt TEXT | --prompt-file FILE) [--chat] [--lines] --steps N");
   assert(o.has_tokenizer || (!o.chat && !o.lines), "--chat and --lines need --tokenizer");
+  assert(o.chat || !o.think, "--think needs --chat");
   return o;
 }
 
@@ -185,6 +192,17 @@ fn same(a : *const i8, b : *const i8) -> bool {
   return unsafe { strcmp(a, b) } == 0;
 }
 
+/// The bytes of `a` and then those of `b`, in new memory.
+fn join_text(a : &Text, b : &Text) -> Text {
+  let length = a.length + b.length;
+  let bytes : *mut i8 = unsafe { malloc((length + 1) as usize) };
+  copy_bytes(bytes, a.bytes, a.length);
+  copy_bytes(offset_mut(bytes, a.length), b.bytes, b.length);
+  return Text {
+    bytes: bytes, length: length
+  };
+}
+
 /// The token ids of the prompt: the numbers of --tokens, or the tokens of the text.
 fn prompt_ids(o : &Options, t : &Tokenizer) -> Vec<i32> {
   if o.has_tokens {
@@ -195,7 +213,20 @@ fn prompt_ids(o : &Options, t : &Tokenizer) -> Vec<i32> {
   } else {
     read_text_file(o.prompt_file)
   };
-  let full = if o.chat {
+  let full = if o.chat && weight_file_arch(o.weights) == 1 {
+    // The chat template of Qwen3.5 and Qwen3.6 opens the reply with a <think> block.
+    let reply = if o.think {
+      c_text("<think>
+")
+    } else {
+      c_text("<think>
+
+</think>
+
+")
+    };
+    join_text(&chat_text(&text), &reply)
+  } else if o.chat {
     chat_text(&text)
   } else {
     text
@@ -358,7 +389,7 @@ fn generate_with_drafts(w : &Weights, s : &mut State, t : &Tokenizer, text_mode 
 
 /// `main` for a Qwen3.5 or Qwen3.6 model (weight file v2, arch 1). The prompt runs in chunks
 /// (src/prefill35.vx). There are no drafts yet (#89). Prints the same lines as `main`.
-fn run_qwen35(path : *const i8, t : &Tokenizer, text_mode : bool, prompt : &Vec<i32>, steps : i32) -> i32 {
+fn run_qwen35(path : *const i8, t : &Tokenizer, text_mode : bool, chat : bool, prompt : &Vec<i32>, steps : i32) -> i32 {
   let w = load_qwen35_weights(path);
   let count = prompt.len();
   let mut s = new_qwen35_state(&w.config, count + steps);
@@ -377,8 +408,10 @@ fn run_qwen35(path : *const i8, t : &Tokenizer, text_mode : bool, prompt : &Vec<
     });
   }
   if text_mode {
-    for i in 0..count {
-      write_token(t, prompt[i]);
+    if !chat {
+      for i in 0..count {
+        write_token(t, prompt[i]);
+      }
     }
   } else {
     print!("prompt=");
@@ -463,7 +496,7 @@ fn main(argc : i32, argv : *mut *mut i8) -> i32 {
   assert(steps > 0, "--steps must be at least 1");
 
   if weight_file_arch(o.weights) == 1 {
-    return run_qwen35(o.weights, &t, text_mode, &prompt, steps);
+    return run_qwen35(o.weights, &t, text_mode, o.chat, &prompt, steps);
   }
   let w = load_weights(o.weights);
   let mut s = new_state(&w.config, count + steps);
