@@ -1,0 +1,206 @@
+//===- deltanet.vx - Qwen app -----------------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// `deltanet_step` (src/deltanet.vx) against the same math on the CPU, for 6 tokens, with random
+// values and the shapes of Qwen3.6-35B-A3B: 16 heads of q and k, 32 of v, 128 values each. A value
+// is off when it differs from the CPU value by more than 2e-4 (1 + |value|).
+//
+// RUN: vxc %s --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx | FileCheck %s
+//
+// CHECK: {{^}}step 0: 0 off{{$}}
+// CHECK: {{^}}step 1: 0 off{{$}}
+// CHECK: {{^}}step 2: 0 off{{$}}
+// CHECK: {{^}}step 3: 0 off{{$}}
+// CHECK: {{^}}step 4: 0 off{{$}}
+// CHECK: {{^}}step 5: 0 off{{$}}
+// CHECK: {{^}}state: 0 off{{$}}
+// CHECK: {{^}}conv state: 0 off{{$}}
+import core::convert;
+import core::num;
+import std::nn;
+import std::vec;
+import qwen::deltanet;
+
+const K_HEADS : i32 = 16;
+const V_HEADS : i32 = 32;
+const STEPS : i32 = 6;
+
+/// A number in [-1, 1) from the state `s` of a linear congruential generator.
+fn random(s : &mut i64) -> f32 {
+  *s = (*s * 1103515245 + 12345) % 2147483648;
+  return (*s as f32) / 1073741824.0 - 1.0;
+}
+
+fn off(a : f32, b : f32) -> bool {
+  return (a - b).abs() > 0.0002 * (1.0 + b.abs());
+}
+
+fn silu(x : f32) -> f32 {
+  return x / (1.0 + (0.0 - x).exp());
+}
+
+fn main() -> i32 {
+  let mut seed : i64 = 7;
+  let s = &mut seed;
+  let heads = 2 * K_HEADS + V_HEADS;
+  let channels = heads * 128;
+  let z_at = channels;
+  let b_at = z_at + V_HEADS * 128;
+  let a_at = b_at + V_HEADS;
+  let width = a_at + V_HEADS;
+  let eps : f32 = 0.000001;
+
+  let mut hconv = Tensor<f32>([channels * 4]);
+  for c in 0..channels {
+    for t in 0..4 {
+      hconv[c * 4 + t] = random(s) * 0.5;
+    }
+  }
+  let mut hneg_a = Tensor<f32>([V_HEADS]);
+  let mut hdt = Tensor<f32>([V_HEADS]);
+  for j in 0..V_HEADS {
+    hneg_a[j] = 0.0 - (random(s) * 2.0).exp();
+    hdt[j] = random(s) * 2.0;
+  }
+  let mut hnorm = Tensor<f32>([128]);
+  for i in 0..128 {
+    hnorm[i] = 1.0 + random(s) * 0.5;
+  }
+  let conv = transfer(&hconv, Memory::HBM);
+  let neg_a = transfer(&hneg_a, Memory::HBM);
+  let dt_bias = transfer(&hdt, Memory::HBM);
+  let norm = transfer(&hnorm, Memory::HBM);
+
+  let mut conv_state = deltanet_conv_state(K_HEADS, V_HEADS);
+  let mut state = deltanet_state(V_HEADS);
+  let mut t = deltanet_scratch(K_HEADS, V_HEADS);
+  let mut y = transfer(Tensor<f32>([V_HEADS * 128]), Memory::HBM);
+
+  // The CPU state: the last 3 inputs of each channel, and S[h][k][v] as in transformers.
+  let mut cs = Vec<f32>::new();
+  for i in 0..channels * 3 {
+    cs.push(0.0);
+  }
+  let mut cS = Vec<f32>::new();
+  for i in 0..V_HEADS * 128 * 128 {
+    cS.push(0.0);
+  }
+  let group = V_HEADS / K_HEADS;
+
+  for step in 0..STEPS {
+    let mut hproj = Tensor<f32>([width]);
+    for i in 0..width {
+      hproj[i] = random(s) * 2.0;
+    }
+    let proj = transfer(&hproj, Memory::HBM);
+    deltanet_step(&mut y, &mut conv_state, &mut state, &mut t, &proj, &conv, &neg_a, &dt_bias, &norm, z_at, b_at, a_at, K_HEADS, V_HEADS, eps);
+
+    // The CPU: the convolution and the SiLU.
+    let mut x = Vec<f32>::new();
+    for c in 0..channels {
+      let x0 = cs[c * 3];
+      let x1 = cs[c * 3 + 1];
+      let x2 = cs[c * 3 + 2];
+      let x3 = hproj[c];
+      x.push(silu(hconv[c * 4] * x0 + hconv[c * 4 + 1] * x1 + hconv[c * 4 + 2] * x2 + hconv[c * 4 + 3] * x3));
+      cs[c * 3] = x1;
+      cs[c * 3 + 1] = x2;
+      cs[c * 3 + 2] = x3;
+    }
+    // The L2 norms of q and k, and the scale of q.
+    for h in 0..2 * K_HEADS {
+      let mut ss : f32 = 0.0;
+      for i in 0..128 {
+        ss = ss + x[h * 128 + i] * x[h * 128 + i];
+      }
+      let inv = 1.0 / (ss + 0.000001).sqrt();
+      for i in 0..128 {
+        let mut a = x[h * 128 + i] * inv;
+        if h < K_HEADS {
+          a = a * (1.0 / (128.0 as f32).sqrt());
+        }
+        x[h * 128 + i] = a;
+      }
+    }
+    let mut yc = Vec<f32>::new();
+    for h in 0..V_HEADS {
+      let g = h / group;
+      let q_at = g * 128;
+      let k_at = (K_HEADS + g) * 128;
+      let v_at = (2 * K_HEADS + h) * 128;
+      let beta = 1.0 / (1.0 + (0.0 - hproj[b_at + h]).exp());
+      let xa = hproj[a_at + h] + hdt[h];
+      let mut sp = xa;
+      if xa <= 20.0 {
+        sp = xa.exp().ln_1p();
+      }
+      let decay = (hneg_a[h] * sp).exp();
+      let base = h * 128 * 128;
+      for i in 0..128 * 128 {
+        cS[base + i] = cS[base + i] * decay;
+      }
+      let mut o = Vec<f32>::new();
+      for v in 0..128 {
+        let mut mem : f32 = 0.0;
+        for k in 0..128 {
+          mem = mem + cS[base + k * 128 + v] * x[k_at + k];
+        }
+        let delta = (x[v_at + v] - mem) * beta;
+        let mut out : f32 = 0.0;
+        for k in 0..128 {
+          let n = cS[base + k * 128 + v] + x[k_at + k] * delta;
+          cS[base + k * 128 + v] = n;
+          out = out + n * x[q_at + k];
+        }
+        o.push(out);
+      }
+      let mut ss : f32 = 0.0;
+      for v in 0..128 {
+        ss = ss + o[v] * o[v];
+      }
+      let inv = 1.0 / (ss / 128.0 + eps).sqrt();
+      for v in 0..128 {
+        yc.push(o[v] * inv * hnorm[v] * silu(hproj[z_at + h * 128 + v]));
+      }
+    }
+
+    let hy = transfer(&y, Memory::CPU_DRAM);
+    let mut count = 0;
+    for i in 0..V_HEADS * 128 {
+      if off(hy[i], yc[i]) {
+        count = count + 1;
+      }
+    }
+    println!("step {}: {} off", step, count);
+  }
+
+  let hs = transfer(&state, Memory::CPU_DRAM);
+  let mut count = 0;
+  for h in 0..V_HEADS {
+    for v in 0..128 {
+      for k in 0..128 {
+        if off(hs[h][v][k], cS[h * 128 * 128 + k * 128 + v]) {
+          count = count + 1;
+        }
+      }
+    }
+  }
+  println!("state: {} off", count);
+  let hc = transfer(&conv_state, Memory::CPU_DRAM);
+  count = 0;
+  for h in 0..heads {
+    for i in 0..128 {
+      for j in 0..3 {
+        if hc[h][i][j] != cs[(h * 128 + i) * 3 + j] {
+          count = count + 1;
+        }
+      }
+    }
+  }
+  println!("conv state: {} off", count);
+  return 0;
+}

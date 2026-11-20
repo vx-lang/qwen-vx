@@ -1,0 +1,257 @@
+//===- gated_attention.vx - Qwen app ----------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// The full attention of one token in a layer of Qwen3.5 and Qwen3.6 (#89), between the product
+// `qkv` and the product `attn_out`, with the math of `modeling_qwen3_5_moe.py` of transformers:
+//
+// - `qkvg`, the output of `qkv`, has q (q_heads x 256), k (kv_heads x 256), v (kv_heads x 256),
+//   then the gate (q_heads x 256).
+// - q and k get an RMS norm for each head, times their norm weights, which the weight file stores
+//   as 1 + w. RoPE then turns the first `rot` values of each head (rotate_half inside those
+//   values), and leaves the others.
+// - Attention with the scale 1/sqrt(256) over the KV cache, which is f16 [position, kv_head, 256].
+// - The output is multiplied by sigmoid(gate).
+//
+// The attention has the design of `vec_attention` (llama.cpp's kernel_flash_attn_ext_vec, MIT
+// License, Copyright (c) 2023-2026 The ggml authors), for 256 values a head: each block is a SIMD
+// group of one head of q, and lane l owns values 8 l to 8 l + 7.
+import core::num;
+import std::nn;
+import qwen::simd;
+
+/// The norms and RoPE of q and k at position `pos`, and the store of k and v into the caches. Block h
+/// does head h of q, then the heads of k. `cos` and `sin` have rot / 2 values for each position.
+fn gated_norm_rope_and_store(q_out : &mut Tensor<f32, [?, ?], Memory::HBM>, k_cache : &mut Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &mut Tensor<f16, [?, ?, ?], Memory::HBM>, qkvg : &Tensor<f32, [?], Memory::HBM>, q_norm : &Tensor<f32, [?], Memory::HBM>, k_norm : &Tensor<f32, [?], Memory::HBM>, cos : &Tensor<f32, [?, ?], Memory::HBM>, sin : &Tensor<f32, [?, ?], Memory::HBM>, pos : i32, q_heads : i32, kv_heads : i32, rot : i32, eps : f32) -> void {
+  let half = rot / 2;
+  assert(q_out.extent(0) == q_heads && q_out.extent(1) == 256, "gated_norm_rope_and_store: q_out must be [q_heads, 256]");
+  assert(k_cache.extent(0) > pos && k_cache.extent(1) == kv_heads && k_cache.extent(2) == 256 && v_cache.extent(0) > pos && v_cache.extent(1) == kv_heads && v_cache.extent(2) == 256, "gated_norm_rope_and_store: the caches must be [positions, kv_heads, 256] with a row for pos");
+  assert(qkvg.len() >= (2 * q_heads + 2 * kv_heads) * 256 && q_norm.len() >= 256 && k_norm.len() >= 256, "gated_norm_rope_and_store: a tensor is too short");
+  assert(rot % 2 == 0 && rot <= 256 && pos < cos.extent(0) && pos < sin.extent(0) && half <= cos.extent(1) && half <= sin.extent(1), "gated_norm_rope_and_store: `cos` and `sin` need a row for `pos` with rot / 2 values");
+  spawn on(Topology::Device) {
+    for h in 0..q_heads + kv_heads across blocks {
+      let mut x = unsafe { Tensor<f32, [256], Memory::SMEM>::uninit() };
+      let mut part = unsafe { Tensor<f32, [256], Memory::SMEM>::uninit() };
+      for i in 0..256 across lanes {
+        let a = qkvg[h * 256 + i];
+        x[i] = a;
+        part[i] = a * a;
+      }
+      let ss = lanes::sum(&part, 256);
+      let inv = 1.0 / (ss / 256.0 + eps).sqrt();
+      for i in 0..256 across lanes {
+        let mut w = q_norm[i];
+        if h >= q_heads {
+          w = k_norm[i];
+        }
+        let a = x[i] * inv * w;
+        let mut r = a;
+        if i < rot {
+          // Value i, its partner, and the angle that they share.
+          let mut j = i;
+          let mut sign : f32 = -1.0;
+          let mut partner = i + half;
+          if i >= half {
+            j = i - half;
+            sign = 1.0;
+            partner = i - half;
+          }
+          let mut wp = q_norm[partner];
+          if h >= q_heads {
+            wp = k_norm[partner];
+          }
+          let b = x[partner] * inv * wp;
+          r = a * cos[pos][j] + sign * b * sin[pos][j];
+        }
+        if h < q_heads {
+          q_out[h][i] = r;
+        } else {
+          k_cache[pos][h - q_heads][i] = r as f16;
+          v_cache[pos][h - q_heads][i] = qkvg[(q_heads + kv_heads + h - q_heads) * 256 + i] as f16;
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// The attention of the token at position `pos`, times sigmoid(gate): y[h * 256 + d] for each head
+/// h of q. `part` is scratch space from `gated_attention_scratch`.
+fn gated_attention(y : &mut Tensor<f32, [?], Memory::HBM>, part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, qkvg : &Tensor<f32, [?], Memory::HBM>, pos : i32, q_heads : i32, kv_heads : i32) -> void {
+  assert(q.extent(0) == q_heads && q.extent(1) == 256 && q_heads % kv_heads == 0, "gated_attention: q must be [q_heads, 256], and q_heads a multiple of kv_heads");
+  assert(k_cache.extent(0) > pos && k_cache.extent(1) == kv_heads && k_cache.extent(2) == 256 && v_cache.extent(0) > pos && v_cache.extent(1) == kv_heads && v_cache.extent(2) == 256, "gated_attention: the caches must be [positions, kv_heads, 256] with a row for pos");
+  assert(part.extent(0) >= q_heads && part.extent(1) >= 64 && part.extent(2) == 260, "gated_attention: `part` is too small. Make it with gated_attention_scratch");
+  assert(y.len() >= q_heads * 256 && qkvg.len() >= (2 * q_heads + 2 * kv_heads) * 256, "gated_attention: a tensor is too short");
+  let mut nwg = 32;
+  if 2 * nwg * 32 < pos + 1 {
+    nwg = nwg * 2;
+  }
+  gated_attention_parts(part, q, k_cache, v_cache, pos, q_heads, q_heads / kv_heads, nwg, 0.0625);
+  gated_attention_merge(y, part, qkvg, nwg, q_heads, (q_heads + 2 * kv_heads) * 256);
+  return;
+}
+
+/// The scratch space of `gated_attention`, on the CPU: up to 64 parts for each head of q, each the sum
+/// of V (256 values), the largest score, and the sum of the weights.
+fn gated_attention_scratch(q_heads : i32) -> Tensor<f32, [?, ?, ?]> {
+  return Tensor<f32>([q_heads, 64, 260]);
+}
+
+/// The parts of `gated_attention`. Block (h, w) is a SIMD group for head h of q. It does the blocks of
+/// 32 positions w, w + nwg, w + 2 nwg, ... up to `pos`, and writes part[h][w]: the sum of V, not
+/// divided, then the largest score and the sum of the weights. For each row, the lanes add up their
+/// parts of q . k, and lane r keeps the score of row r. Each lane then takes the weight of each row
+/// from the lane that keeps it, for the sum of V.
+fn gated_attention_parts(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, pos : i32, q_heads : i32, group : i32, nwg : i32, scale : f32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..q_heads across blocks {
+      for w in 0..nwg across blocks {
+        let mut stats = unsafe { Tensor<f32, [1, 2], Memory::SMEM>::uninit() };
+        for s in 0..1 across subgroups {
+          for l in 0..32 across lanes(32) {
+            let g = h / group;
+            let d = 8 * l;
+            let q0 = q[h][d] * scale;
+            let q1 = q[h][d + 1] * scale;
+            let q2 = q[h][d + 2] * scale;
+            let q3 = q[h][d + 3] * scale;
+            let q4 = q[h][d + 4] * scale;
+            let q5 = q[h][d + 5] * scale;
+            let q6 = q[h][d + 6] * scale;
+            let q7 = q[h][d + 7] * scale;
+            let mut big : f32 = -3.0e38;
+            let mut total : f32 = 0.0;
+            let mut o0 : f32 = 0.0;
+            let mut o1 : f32 = 0.0;
+            let mut o2 : f32 = 0.0;
+            let mut o3 : f32 = 0.0;
+            let mut o4 : f32 = 0.0;
+            let mut o5 : f32 = 0.0;
+            let mut o6 : f32 = 0.0;
+            let mut o7 : f32 = 0.0;
+            let chunks = (pos + 32) / 32;
+            let mut c = w;
+            while c < chunks {
+              let r0 = c * 32;
+              let mut mine : f32 = -3.0e38;
+              for r in 0..32 {
+                let row = r0 + r;
+                let mut kept = row;
+                if row > pos {
+                  kept = pos;
+                }
+                let k0 = half4_at(k_cache, kept, g, d, 0);
+                let k1 = half4_at(k_cache, kept, g, d, 1);
+                let k2 = half4_at(k_cache, kept, g, d, 2);
+                let k3 = half4_at(k_cache, kept, g, d, 3);
+                let k4 = half4_at(k_cache, kept, g, d + 4, 0);
+                let k5 = half4_at(k_cache, kept, g, d + 4, 1);
+                let k6 = half4_at(k_cache, kept, g, d + 4, 2);
+                let k7 = half4_at(k_cache, kept, g, d + 4, 3);
+                let mut score = simd_sum(((k0 * q0 + k1 * q1) + (k2 * q2 + k3 * q3)) + ((k4 * q4 + k5 * q5) + (k6 * q6 + k7 * q7)));
+                if row > pos {
+                  score = -3.0e38;
+                }
+                if r == l {
+                  mine = score;
+                }
+              }
+              let top = big.max(simd_max(mine));
+              let shrink = (big - top).fast_exp();
+              let p = (mine - top).fast_exp();
+              total = total * shrink + simd_sum(p);
+              o0 = o0 * shrink;
+              o1 = o1 * shrink;
+              o2 = o2 * shrink;
+              o3 = o3 * shrink;
+              o4 = o4 * shrink;
+              o5 = o5 * shrink;
+              o6 = o6 * shrink;
+              o7 = o7 * shrink;
+              for r in 0..32 {
+                let row = r0 + r;
+                let mut kept = row;
+                if row > pos {
+                  kept = pos;
+                }
+                let pr = simd_value(p, r);
+                o0 = o0 + half4_at(v_cache, kept, g, d, 0) * pr;
+                o1 = o1 + half4_at(v_cache, kept, g, d, 1) * pr;
+                o2 = o2 + half4_at(v_cache, kept, g, d, 2) * pr;
+                o3 = o3 + half4_at(v_cache, kept, g, d, 3) * pr;
+                o4 = o4 + half4_at(v_cache, kept, g, d + 4, 0) * pr;
+                o5 = o5 + half4_at(v_cache, kept, g, d + 4, 1) * pr;
+                o6 = o6 + half4_at(v_cache, kept, g, d + 4, 2) * pr;
+                o7 = o7 + half4_at(v_cache, kept, g, d + 4, 3) * pr;
+              }
+              big = top;
+              c = c + nwg;
+            }
+            part[h][w][d] = o0;
+            part[h][w][d + 1] = o1;
+            part[h][w][d + 2] = o2;
+            part[h][w][d + 3] = o3;
+            part[h][w][d + 4] = o4;
+            part[h][w][d + 5] = o5;
+            part[h][w][d + 6] = o6;
+            part[h][w][d + 7] = o7;
+            // Every lane has the same largest score and sum of the weights. Lanes 0 and 1 keep them for
+            // the next loop.
+            if l < 2 {
+              let mut x = big;
+              if l == 1 {
+                x = total;
+              }
+              stats[s][l] = x;
+            }
+          }
+          for l in 0..2 across lanes(32) {
+            part[h][w][256 + l] = stats[s][l];
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// Merges the first `parts` parts of `gated_attention_parts` for each head of q, and multiplies by
+/// sigmoid of the gate, which starts at `gate_at` of `qkvg`. A block of 32 lanes does 32 values of one
+/// head, a value for each lane.
+fn gated_attention_merge(y : &mut Tensor<f32, [?], Memory::HBM>, part : &Tensor<f32, [?, ?, ?], Memory::HBM>, qkvg : &Tensor<f32, [?], Memory::HBM>, parts : i32, q_heads : i32, gate_at : i32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..q_heads across blocks {
+      for dq in 0..8 across blocks {
+        let mut top = unsafe { Tensor<f32, [1, 32], Memory::SMEM>::uninit() };
+        for s in 0..1 across subgroups {
+          for l in 0..32 across lanes(32) {
+            let mut m : f32 = -3.0e38;
+            let mut c = l;
+            while c < parts {
+              m = m.max(part[h][c][256]);
+              c = c + 32;
+            }
+            top[s][l] = m;
+          }
+          let big = lanes::max(&top[s], 32);
+          for l in 0..32 across lanes(32) {
+            let d = dq * 32 + l;
+            let mut total : f32 = 0.0;
+            let mut acc : f32 = 0.0;
+            for c in 0..parts {
+              let w = (part[h][c][256] - big).fast_exp();
+              total = total + w * part[h][c][257];
+              acc = acc + w * part[h][c][d];
+            }
+            let gate = qkvg[gate_at + h * 256 + d];
+            y[h * 256 + d] = acc / total / (1.0 + (0.0 - gate).fast_exp());
+          }
+        }
+      }
+    }
+  }
+  return;
+}

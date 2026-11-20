@@ -1,0 +1,239 @@
+//===- qwen35.vx - Qwen app -------------------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// One token of a Qwen3.5 or Qwen3.6 MoE decoder (arch 1 of weight file v2, #89) on the GPU. Each
+// layer is a Gated DeltaNet (src/deltanet.vx) or, every `full_attention_interval` layers, a gated
+// full attention (src/gated_attention.vx). Then a mixture of experts with a shared expert.
+//
+// `Qwen35State` holds every tensor that a token writes, and the state of each layer: the
+// convolution inputs and S of a DeltaNet layer, or the KV cache of a full attention layer. It is
+// made once, before the first token, so the token loop allocates nothing.
+import core::convert;
+import core::num;
+import std::nn;
+import std::vec;
+import qwen::deltanet;
+import qwen::gated_attention;
+import qwen::model;
+import qwen::products;
+import qwen::weights;
+
+/// The state of one layer. A DeltaNet layer has `conv` and `s`, a full attention layer `k` and `v`;
+/// the others have one value each.
+struct Qwen35LayerState {
+  conv : Tensor<f32, [?, ?, ?], Memory::HBM>,
+  s : Tensor<f32, [?, ?, ?], Memory::HBM>,
+  k : Tensor<f16, [?, ?, ?], Memory::HBM>,
+  v : Tensor<f16, [?, ?, ?], Memory::HBM>,
+}
+
+/// The tensors that a token writes, in GPU memory. `proj` is the output of `qkv` or `linear_in`, and
+/// `y` the input of `attn_out` or `linear_out`. `cos` and `sin` are [max_seq, rotary_dim / 2].
+struct Qwen35State {
+  max_seq : i32,
+  x : Tensor<f32, [?], Memory::HBM>,
+  xn : Tensor<f32, [?], Memory::HBM>,
+  proj : Tensor<f32, [?], Memory::HBM>,
+  y : Tensor<f32, [?], Memory::HBM>,
+  q : Tensor<f32, [?, ?], Memory::HBM>,
+  parts : Tensor<f32, [?, ?, ?], Memory::HBM>,
+  dn : DeltaNetScratch,
+  experts : Experts,
+  // The shared expert: its id (0), the sigmoid of its gate, and its SwiGLU output [1, inter].
+  shared_id : Tensor<i32, [?], Memory::HBM>,
+  shared_weight : Tensor<f32, [?], Memory::HBM>,
+  shared_mlp : Tensor<f32, [?, ?], Memory::HBM>,
+  logits : Tensor<f32, [?], Memory::HBM>,
+  cos : Tensor<f32, [?, ?], Memory::HBM>,
+  sin : Tensor<f32, [?, ?], Memory::HBM>,
+  layers : Vec<Qwen35LayerState>,
+}
+
+fn zeros_f32(n : i32) -> Tensor<f32, [?], Memory::HBM> {
+  let mut x = Tensor<f32>([n]);
+  for i in 0..n {
+    x[i] = 0.0;
+  }
+  return transfer(x, Memory::HBM);
+}
+
+/// The state for up to `max_seq` positions. The angles of RoPE are computed in f64, as in
+/// `reference.py`, and rounded to f32 once.
+fn new_qwen35_state(c : &Config, max_seq : i32) -> Qwen35State {
+  assert(c.arch == 1, "new_qwen35_state: the model is not a Qwen3.5 model");
+  assert(max_seq > 0 && max_seq <= c.max_positions, "max_seq must be between 1 and the max_positions of the model");
+  assert(c.head_dim == 256 && c.rotary_dim % 2 == 0 && c.rotary_dim <= 256, "the full attention needs heads of 256 values");
+  assert(c.linear_k_dim == 128 && c.linear_v_dim == 128 && c.conv_width == 4, "the DeltaNet needs heads of 128 values and a convolution of width 4");
+  let half = c.rotary_dim / 2;
+  let mut hcos = Tensor<f32>([max_seq, half]);
+  let mut hsin = Tensor<f32>([max_seq, half]);
+  for p in 0..max_seq {
+    for i in 0..half {
+      let angle = f64::from(p) / f64::powf(c.rope_theta, f64::from(2 * i) / f64::from(c.rotary_dim));
+      hcos[p][i] = f64::cos(angle) as f32;
+      hsin[p][i] = f64::sin(angle) as f32;
+    }
+  }
+  let mut layers = Vec<Qwen35LayerState>::new();
+  for l in 0..c.num_layers {
+    if (l + 1) % c.full_attention_interval == 0 {
+      layers.push(Qwen35LayerState {
+        conv: transfer(Tensor<f32>([1, 1, 1]), Memory::HBM),
+        s: transfer(Tensor<f32>([1, 1, 1]), Memory::HBM),
+        k: transfer(Tensor<f16>([max_seq, c.num_kv_heads, 256]), Memory::HBM),
+        v: transfer(Tensor<f16>([max_seq, c.num_kv_heads, 256]), Memory::HBM),
+      });
+    } else {
+      layers.push(Qwen35LayerState {
+        conv: deltanet_conv_state(c.linear_k_heads, c.linear_v_heads),
+        s: deltanet_state(c.linear_v_heads),
+        k: transfer(Tensor<f16>([1, 1, 1]), Memory::HBM),
+        v: transfer(Tensor<f16>([1, 1, 1]), Memory::HBM),
+      });
+    }
+  }
+  let qkv_rows = (2 * c.num_q_heads + 2 * c.num_kv_heads) * 256;
+  let in_rows = (2 * c.linear_k_heads + 2 * c.linear_v_heads) * 128 + 2 * c.linear_v_heads;
+  let mut shared_id = Tensor<i32>([1]);
+  shared_id[0] = 0;
+  return Qwen35State {
+    max_seq: max_seq,
+    x: transfer(Tensor<f32>([c.hidden_size]), Memory::HBM),
+    xn: transfer(Tensor<f32>([c.hidden_size]), Memory::HBM),
+    proj: transfer(Tensor<f32>([i32::max(qkv_rows, in_rows)]), Memory::HBM),
+    y: transfer(Tensor<f32>([i32::max(c.num_q_heads * 256, c.linear_v_heads * 128)]), Memory::HBM),
+    q: transfer(Tensor<f32>([c.num_q_heads, 256]), Memory::HBM),
+    parts: transfer(gated_attention_scratch(c.num_q_heads), Memory::HBM),
+    dn: deltanet_scratch(c.linear_k_heads, c.linear_v_heads),
+    experts: Experts {
+      router_logits: transfer(Tensor<f32>([c.num_experts + 1]), Memory::HBM),
+      ids: transfer(Tensor<i32>([c.experts_per_token]), Memory::HBM),
+      weights: transfer(Tensor<f32>([c.experts_per_token]), Memory::HBM),
+      mlp: transfer(Tensor<f32>([c.experts_per_token, c.moe_intermediate_size]), Memory::HBM),
+    },
+    shared_id: transfer(shared_id, Memory::HBM),
+    shared_weight: zeros_f32(1),
+    shared_mlp: transfer(Tensor<f32>([1, c.shared_expert_inter]), Memory::HBM),
+    logits: transfer(Tensor<f32>([c.vocab_size]), Memory::HBM),
+    cos: transfer(hcos, Memory::HBM),
+    sin: transfer(hsin, Memory::HBM),
+    layers: layers,
+  };
+}
+
+/// y = x / sqrt(mean(x^2) + eps) * w, with f32 weights, as `nn_rms_norm` does with bf16 weights.
+fn rms_norm_f32(y : &mut Tensor<f32, [?], Memory::HBM>, x : &Tensor<f32, [?], Memory::HBM>, w : &Tensor<f32, [?], Memory::HBM>, n : i32, eps : f32) -> void {
+  assert(n > 0 && y.len() >= n && x.len() >= n && w.len() >= n, "rms_norm_f32: a tensor has fewer than n values");
+  spawn on(Topology::Device) {
+    for b in 0..1 across blocks {
+      let mut part = unsafe { Tensor<f32, [1024], Memory::SMEM>::uninit() };
+      for l in 0..1024 across lanes {
+        let mut s : f32 = 0.0;
+        let mut i = l;
+        while i < n {
+          s = s + x[i] * x[i];
+          i = i + 1024;
+        }
+        part[l] = s;
+      }
+      let ss = lanes::sum(&part, 1024);
+      let inv = 1.0 / (ss / (n as f32) + eps).sqrt();
+      for l in 0..1024 across lanes {
+        for j in 0..(n + 1023) / 1024 {
+          let i = j * 1024 + l;
+          if i < n {
+            y[i] = x[i] * inv * w[i];
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// out[0] = sigmoid(logits[at]): the weight of the shared expert.
+fn shared_gate(out : &mut Tensor<f32, [?], Memory::HBM>, logits : &Tensor<f32, [?], Memory::HBM>, at : i32) -> void {
+  assert(out.len() >= 1 && logits.len() > at, "shared_gate: a tensor is too short");
+  spawn on(Topology::Device) {
+    for b in 0..1 across blocks {
+      for l in 0..1 across lanes {
+        out[l] = 1.0 / (1.0 + (0.0 - logits[at]).fast_exp());
+      }
+    }
+  }
+  return;
+}
+
+/// The experts and the shared expert of a layer: x += the sum of the chosen experts for xn, each
+/// times its weight, plus the shared expert times sigmoid(its gate).
+fn add_experts_shared(e : &mut Experts, x : &mut Tensor<f32, [?], Memory::HBM>, xn : &Tensor<f32, [?], Memory::HBM>, shared_weight : &mut Tensor<f32, [?], Memory::HBM>, shared_mlp : &mut Tensor<f32, [?, ?], Memory::HBM>, shared_id : &Tensor<i32, [?], Memory::HBM>, layer : &Qwen35Layer, c : &Config) -> void {
+  let k = c.experts_per_token;
+  let inter = c.moe_intermediate_size;
+  let shared = c.shared_expert_inter;
+  nn_matvec(&mut e.router_logits, &layer.router, xn, c.num_experts + 1, c.hidden_size);
+  nn_top_k(&mut e.ids, &mut e.weights, &e.router_logits, c.num_experts, k);
+  shared_gate(shared_weight, &e.router_logits, c.num_experts);
+  if layer.gate_up.dtype == U4 {
+    assert(layer.down.dtype == U4 && layer.shared_gate_up.dtype == U4 && layer.shared_down.dtype == U4, "the experts of a Qwen3.5 model must all be Q4_0, or all bf16");
+    moe_swiglu_q4_blocks(&mut e.mlp, &layer.gate_up.codes, &layer.gate_up.group_scales, &e.ids, xn, k, inter, c.hidden_size, c.num_experts);
+    moe_down_q4_add_blocks(x, &layer.down.codes, &layer.down.group_scales, &e.ids, &e.weights, &e.mlp, k, c.hidden_size, inter, c.num_experts);
+    moe_swiglu_q4_blocks(shared_mlp, &layer.shared_gate_up.codes, &layer.shared_gate_up.group_scales, shared_id, xn, 1, shared, c.hidden_size, 1);
+    moe_down_q4_add_blocks(x, &layer.shared_down.codes, &layer.shared_down.group_scales, shared_id, shared_weight, shared_mlp, 1, c.hidden_size, shared, 1);
+  } else {
+    assert(layer.gate_up.dtype == BF16 && layer.down.dtype == BF16 && layer.shared_gate_up.dtype == BF16 && layer.shared_down.dtype == BF16, "the experts of a Qwen3.5 model must all be Q4_0, or all bf16");
+    nn_moe_swiglu(&mut e.mlp, &layer.gate_up.bf16, &e.ids, xn, k, inter, c.hidden_size, c.num_experts);
+    nn_moe_down_add(x, &layer.down.bf16, &e.ids, &e.weights, &e.mlp, k, c.hidden_size, inter, c.num_experts);
+    nn_moe_swiglu(shared_mlp, &layer.shared_gate_up.bf16, shared_id, xn, 1, shared, c.hidden_size, 1);
+    nn_moe_down_add(x, &layer.shared_down.bf16, shared_id, shared_weight, shared_mlp, 1, c.hidden_size, shared, 1);
+  }
+  return;
+}
+
+/// Runs the token in `token` at position `pos` through every layer. The hidden state of the token
+/// is then in `s.x`, and the state of each layer is updated.
+fn run_qwen35_layers(w : &Qwen35Weights, s : &mut Qwen35State, token : &Tensor<i32, [?], Memory::HBM>, pos : i32) -> void {
+  let c = &w.config;
+  let eps = c.rms_norm_eps as f32;
+  assert(pos >= 0 && pos < s.max_seq, "the position is past the end of the KV cache");
+  let kh = c.linear_k_heads;
+  let vh = c.linear_v_heads;
+  let z_at = (2 * kh + vh) * 128;
+  let b_at = z_at + vh * 128;
+  let a_at = b_at + vh;
+  let qkv_rows = (2 * c.num_q_heads + 2 * c.num_kv_heads) * 256;
+  nn_embed(&mut s.x, &w.embed, token, c.hidden_size);
+  let mut l = 0;
+  for ls in s.layers.iter_mut() {
+    let layer = &w.layers[l];
+    assert(layer.full_attention == ((l + 1) % c.full_attention_interval == 0), "the full attention layers of the file are not every full_attention_interval layers");
+    rms_norm_f32(&mut s.xn, &s.x, &layer.attn_norm, c.hidden_size, eps);
+    if layer.full_attention {
+      matvec(&mut s.proj, &layer.qkv, &s.xn, qkv_rows, c.hidden_size);
+      gated_norm_rope_and_store(&mut s.q, &mut ls.k, &mut ls.v, &s.proj, &layer.q_norm, &layer.k_norm, &s.cos, &s.sin, pos, c.num_q_heads, c.num_kv_heads, c.rotary_dim, eps);
+      gated_attention(&mut s.y, &mut s.parts, &s.q, &ls.k, &ls.v, &s.proj, pos, c.num_q_heads, c.num_kv_heads);
+      matvec_add(&mut s.x, &layer.attn_out, &s.y, c.hidden_size, c.num_q_heads * 256);
+    } else {
+      matvec(&mut s.proj, &layer.linear_in, &s.xn, a_at + vh, c.hidden_size);
+      deltanet_step(&mut s.y, &mut ls.conv, &mut ls.s, &mut s.dn, &s.proj, &layer.conv, &layer.neg_a, &layer.dt_bias, &layer.linear_norm, z_at, b_at, a_at, kh, vh, eps);
+      matvec_add(&mut s.x, &layer.linear_out, &s.y, c.hidden_size, vh * 128);
+    }
+    rms_norm_f32(&mut s.xn, &s.x, &layer.mlp_norm, c.hidden_size, eps);
+    add_experts_shared(&mut s.experts, &mut s.x, &s.xn, &mut s.shared_weight, &mut s.shared_mlp, &s.shared_id, layer, c);
+    l = l + 1;
+  }
+  return;
+}
+
+/// The logits of the token whose hidden state is in `s.x`, and in `next` the index of the largest
+/// one. Both stay in GPU memory.
+fn predict_qwen35(w : &Qwen35Weights, s : &mut Qwen35State, next : &mut Tensor<i32, [?], Memory::HBM>) -> void {
+  let c = &w.config;
+  rms_norm_f32(&mut s.xn, &s.x, &w.final_norm, c.hidden_size, c.rms_norm_eps as f32);
+  matvec(&mut s.logits, &w.lm_head, &s.xn, c.vocab_size, c.hidden_size);
+  nn_argmax(next, &s.logits, c.vocab_size);
+  return;
+}

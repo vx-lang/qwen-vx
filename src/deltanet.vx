@@ -1,0 +1,225 @@
+//===- deltanet.vx - Qwen app -----------------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// One generated token through the Gated DeltaNet of a linear attention layer of Qwen3.5 and
+// Qwen3.6 (#89), after the product `linear_in` and before the product `linear_out`. The math is
+// that of `modeling_qwen3_5_moe.py` of transformers:
+//
+// - `proj`, the output of `linear_in`, has q (k_heads x 128), k (k_heads x 128), v (v_heads x 128),
+//   z (v_heads x 128), then b and a (v_heads each), at the offsets that the caller gives.
+// - q, k and v go through a causal depthwise convolution of width 4 and a SiLU. q and k then get an
+//   L2 norm for each head (eps 1e-6 inside the square root), and q is multiplied by 1/sqrt(128).
+// - beta = sigmoid(b), and the decay exp(g) with g = -exp(A_log) softplus(a + dt_bias). The weight
+//   file stores -exp(A_log) as `neg_a`.
+// - Head h of v uses head h / (v_heads / k_heads) of q and k. Its state S[k][v] decays, then
+//   S += k (beta (v - k . S)), and the output is q . S.
+// - The output gets an RMS norm for each head, times the norm weight, times silu(z).
+//
+// All the heads have 128 values. The state of a layer is `conv_state` [2 k_heads + v_heads, 128, 3],
+// the last 3 inputs of each channel of the convolution, oldest first, and `state` [v_heads, 128, 128]
+// as S[v][k]: the 128 values of k for one value of v are next to each other, so that the 32 lanes of
+// a SIMD group read them in one load. Both start at zero.
+import core::num;
+import std::nn;
+import qwen::simd;
+
+/// The scratch tensors of one token, in GPU memory: q and k after the convolution and the norm
+/// [k_heads, 128], v after the convolution [v_heads, 128], beta and the decay exp(g) of each head of
+/// v, and q . S [v_heads, 128].
+struct DeltaNetScratch {
+  q : Tensor<f32, [?, ?], Memory::HBM>,
+  k : Tensor<f32, [?, ?], Memory::HBM>,
+  v : Tensor<f32, [?, ?], Memory::HBM>,
+  beta : Tensor<f32, [?], Memory::HBM>,
+  decay : Tensor<f32, [?], Memory::HBM>,
+  o : Tensor<f32, [?, ?], Memory::HBM>,
+}
+
+fn deltanet_scratch(k_heads : i32, v_heads : i32) -> DeltaNetScratch {
+  return DeltaNetScratch {
+    q : transfer(Tensor<f32>([k_heads, 128]), Memory::HBM),
+    k : transfer(Tensor<f32>([k_heads, 128]), Memory::HBM),
+    v : transfer(Tensor<f32>([v_heads, 128]), Memory::HBM),
+    beta : transfer(Tensor<f32>([v_heads]), Memory::HBM),
+    decay : transfer(Tensor<f32>([v_heads]), Memory::HBM),
+    o : transfer(Tensor<f32>([v_heads, 128]), Memory::HBM),
+  };
+}
+
+/// A tensor of zeros in GPU memory.
+fn dn_zeros(a : i32, b : i32, c : i32) -> Tensor<f32, [?, ?, ?], Memory::HBM> {
+  let mut x = Tensor<f32>([a, b, c]);
+  for i in 0..a {
+    for j in 0..b {
+      for k in 0..c {
+        x[i][j][k] = 0.0;
+      }
+    }
+  }
+  return transfer(x, Memory::HBM);
+}
+
+/// The state of one layer at the start: zero.
+fn deltanet_conv_state(k_heads : i32, v_heads : i32) -> Tensor<f32, [?, ?, ?], Memory::HBM> {
+  return dn_zeros(2 * k_heads + v_heads, 128, 3);
+}
+
+fn deltanet_state(v_heads : i32) -> Tensor<f32, [?, ?, ?], Memory::HBM> {
+  return dn_zeros(v_heads, 128, 128);
+}
+
+/// The Gated DeltaNet of one token: `y` (v_heads x 128 values, the input of `linear_out`) from `proj`
+/// (the output of `linear_in`). z starts at `z_at` of `proj`, b at `b_at` and a at `a_at`. `conv` has
+/// 4 taps for each of the (2 k_heads + v_heads) x 128 channels, channel c at 4 c, oldest tap
+/// first. `neg_a` and `dt_bias` have v_heads values, and `norm` 128.
+fn deltanet_step(y : &mut Tensor<f32, [?], Memory::HBM>, conv_state : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, state : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, t : &mut DeltaNetScratch, proj : &Tensor<f32, [?], Memory::HBM>, conv : &Tensor<f32, [?], Memory::HBM>, neg_a : &Tensor<f32, [?], Memory::HBM>, dt_bias : &Tensor<f32, [?], Memory::HBM>, norm : &Tensor<f32, [?], Memory::HBM>, z_at : i32, b_at : i32, a_at : i32, k_heads : i32, v_heads : i32, eps : f32) -> void {
+  let channels = (2 * k_heads + v_heads) * 128;
+  assert(k_heads > 0 && v_heads % k_heads == 0 && v_heads <= 64, "deltanet_step: v_heads must be a multiple of k_heads, and at most 64");
+  assert(conv_state.extent(0) == 2 * k_heads + v_heads && conv_state.extent(1) == 128 && conv_state.extent(2) == 3, "deltanet_step: conv_state must be [2 k_heads + v_heads, 128, 3]");
+  assert(state.extent(0) == v_heads && state.extent(1) == 128 && state.extent(2) == 128, "deltanet_step: state must be [v_heads, 128, 128]");
+  assert(conv.len() == channels * 4, "deltanet_step: conv must have 4 taps for each channel");
+  assert(proj.len() >= channels && proj.len() >= z_at + v_heads * 128 && proj.len() >= b_at + v_heads && proj.len() >= a_at + v_heads, "deltanet_step: proj is too short for its offsets");
+  assert(neg_a.len() >= v_heads && dt_bias.len() >= v_heads && norm.len() >= 128 && y.len() >= v_heads * 128, "deltanet_step: a tensor is too short");
+  deltanet_conv(&mut t.q, &mut t.k, &mut t.v, conv_state, proj, conv, k_heads, v_heads);
+  deltanet_gates(&mut t.beta, &mut t.decay, proj, neg_a, dt_bias, b_at, a_at, v_heads);
+  deltanet_recur(&mut t.o, state, &t.q, &t.k, &t.v, &t.beta, &t.decay, v_heads / k_heads, v_heads);
+  deltanet_gated_norm(y, &t.o, proj, norm, z_at, v_heads, eps);
+  return;
+}
+
+/// The convolution and the SiLU of q, k and v, and the L2 norms of q and k. Block h does the 128
+/// channels of one head: heads 0 to k_heads - 1 of q, then those of k, then those of v. The channels
+/// of `proj` are in the same order, so channel i of block h is h * 128 + i.
+fn deltanet_conv(qn : &mut Tensor<f32, [?, ?], Memory::HBM>, kn : &mut Tensor<f32, [?, ?], Memory::HBM>, vv : &mut Tensor<f32, [?, ?], Memory::HBM>, conv_state : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, proj : &Tensor<f32, [?], Memory::HBM>, conv : &Tensor<f32, [?], Memory::HBM>, k_heads : i32, v_heads : i32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..2 * k_heads + v_heads across blocks {
+      let mut y = unsafe { Tensor<f32, [128], Memory::SMEM>::uninit() };
+      let mut part = unsafe { Tensor<f32, [128], Memory::SMEM>::uninit() };
+      for i in 0..128 across lanes {
+        let c = h * 128 + i;
+        let x0 = conv_state[h][i][0];
+        let x1 = conv_state[h][i][1];
+        let x2 = conv_state[h][i][2];
+        let x3 = proj[c];
+        let a = conv[c * 4] * x0 + conv[c * 4 + 1] * x1 + conv[c * 4 + 2] * x2 + conv[c * 4 + 3] * x3;
+        let s = a / (1.0 + (0.0 - a).fast_exp());
+        conv_state[h][i][0] = x1;
+        conv_state[h][i][1] = x2;
+        conv_state[h][i][2] = x3;
+        y[i] = s;
+        part[i] = s * s;
+      }
+      let ss = lanes::sum(&part, 128);
+      let inv = 1.0 / (ss + 0.000001).sqrt();
+      for i in 0..128 across lanes {
+        if h < k_heads {
+          qn[h][i] = y[i] * inv * 0.08838834764831845;
+        } else if h < 2 * k_heads {
+          kn[h - k_heads][i] = y[i] * inv;
+        } else {
+          vv[h - 2 * k_heads][i] = y[i];
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// beta = sigmoid(b) and the decay exp(neg_a softplus(a + dt_bias)) of each head of v. softplus(x)
+/// is x above 20, as in torch.
+fn deltanet_gates(beta : &mut Tensor<f32, [?], Memory::HBM>, decay : &mut Tensor<f32, [?], Memory::HBM>, proj : &Tensor<f32, [?], Memory::HBM>, neg_a : &Tensor<f32, [?], Memory::HBM>, dt_bias : &Tensor<f32, [?], Memory::HBM>, b_at : i32, a_at : i32, v_heads : i32) -> void {
+  spawn on(Topology::Device) {
+    for blk in 0..1 across blocks {
+      for j in 0..64 across lanes {
+        if j < v_heads {
+          let b = proj[b_at + j];
+          beta[j] = 1.0 / (1.0 + (0.0 - b).fast_exp());
+          let x = proj[a_at + j] + dt_bias[j];
+          let mut sp = x;
+          if x <= 20.0 {
+            sp = simd_log(1.0 + x.fast_exp());
+          }
+          decay[j] = (neg_a[j] * sp).fast_exp();
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// The update of the state and the output q . S, for each head h of v. Block (h, vq) is one SIMD
+/// group for values vq * 32 to vq * 32 + 31 of v. Lane l owns values 4 l to 4 l + 3 of k. For each
+/// value of v, the lanes add up k . S, then each lane updates its 4 values of S and the lanes add up
+/// q . S. Lane m keeps the output of value m.
+fn deltanet_recur(o : &mut Tensor<f32, [?, ?], Memory::HBM>, state : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, qn : &Tensor<f32, [?, ?], Memory::HBM>, kn : &Tensor<f32, [?, ?], Memory::HBM>, vv : &Tensor<f32, [?, ?], Memory::HBM>, beta : &Tensor<f32, [?], Memory::HBM>, decay : &Tensor<f32, [?], Memory::HBM>, group : i32, v_heads : i32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..v_heads across blocks {
+      for vq in 0..4 across blocks {
+        for s in 0..1 across subgroups {
+          for l in 0..32 across lanes(32) {
+            let g = h / group;
+            let d = 4 * l;
+            let q0 = qn[g][d];
+            let q1 = qn[g][d + 1];
+            let q2 = qn[g][d + 2];
+            let q3 = qn[g][d + 3];
+            let k0 = kn[g][d];
+            let k1 = kn[g][d + 1];
+            let k2 = kn[g][d + 2];
+            let k3 = kn[g][d + 3];
+            let b = beta[h];
+            let dec = decay[h];
+            let mut mine : f32 = 0.0;
+            for m in 0..32 {
+              let v = vq * 32 + m;
+              let s0 = state[h][v][d] * dec;
+              let s1 = state[h][v][d + 1] * dec;
+              let s2 = state[h][v][d + 2] * dec;
+              let s3 = state[h][v][d + 3] * dec;
+              let kv = simd_sum(s0 * k0 + s1 * k1 + s2 * k2 + s3 * k3);
+              let delta = (vv[h][v] - kv) * b;
+              let n0 = s0 + k0 * delta;
+              let n1 = s1 + k1 * delta;
+              let n2 = s2 + k2 * delta;
+              let n3 = s3 + k3 * delta;
+              state[h][v][d] = n0;
+              state[h][v][d + 1] = n1;
+              state[h][v][d + 2] = n2;
+              state[h][v][d + 3] = n3;
+              let out = simd_sum(n0 * q0 + n1 * q1 + n2 * q2 + n3 * q3);
+              if m == l {
+                mine = out;
+              }
+            }
+            o[h][vq * 32 + l] = mine;
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// y = rms_norm(o) * norm * silu(z), for each head of v. Block h does one head.
+fn deltanet_gated_norm(y : &mut Tensor<f32, [?], Memory::HBM>, o : &Tensor<f32, [?, ?], Memory::HBM>, proj : &Tensor<f32, [?], Memory::HBM>, norm : &Tensor<f32, [?], Memory::HBM>, z_at : i32, v_heads : i32, eps : f32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..v_heads across blocks {
+      let mut part = unsafe { Tensor<f32, [128], Memory::SMEM>::uninit() };
+      for i in 0..128 across lanes {
+        let a = o[h][i];
+        part[i] = a * a;
+      }
+      let ss = lanes::sum(&part, 128);
+      let inv = 1.0 / (ss / 128.0 + eps).sqrt();
+      for i in 0..128 across lanes {
+        let z = proj[z_at + h * 128 + i];
+        y[h * 128 + i] = o[h][i] * inv * norm[i] * (z / (1.0 + (0.0 - z).fast_exp()));
+      }
+    }
+  }
+  return;
+}

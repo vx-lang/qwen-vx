@@ -1,0 +1,181 @@
+//===- gated_attention.vx - Qwen app ----------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// `gated_norm_rope_and_store` and `gated_attention` (src/gated_attention.vx) against the same math
+// on the CPU, with random values and the shapes of Qwen3.6-35B-A3B: 16 heads of q, 2 of k and v, 256
+// values a head, RoPE on the first 64. The cache holds random rows before the position. The cases
+// are position 0, positions in the first blocks, and positions past 2,048, where the attention goes
+// from 32 to 64 SIMD groups for each head. A value is off when it differs from the CPU value by more
+// than 1e-3 (1 + |value|); the cache is f16.
+//
+// RUN: vxc %s --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx | FileCheck %s
+//
+// CHECK: {{^}}pos 0: q 0 off, cache 0 off, y 0 off{{$}}
+// CHECK: {{^}}pos 37: q 0 off, cache 0 off, y 0 off{{$}}
+// CHECK: {{^}}pos 700: q 0 off, cache 0 off, y 0 off{{$}}
+// CHECK: {{^}}pos 2047: q 0 off, cache 0 off, y 0 off{{$}}
+// CHECK: {{^}}pos 2100: q 0 off, cache 0 off, y 0 off{{$}}
+import core::convert;
+import core::num;
+import std::nn;
+import std::vec;
+import qwen::gated_attention;
+
+const Q_HEADS : i32 = 16;
+const KV_HEADS : i32 = 2;
+const ROT : i32 = 64;
+const MAX_SEQ : i32 = 2112;
+
+/// A number in [-1, 1) from the state `s` of a linear congruential generator.
+fn random(s : &mut i64) -> f32 {
+  *s = (*s * 1103515245 + 12345) % 2147483648;
+  return (*s as f32) / 1073741824.0 - 1.0;
+}
+
+fn off(a : f32, b : f32) -> bool {
+  return (a - b).abs() > 0.001 * (1.0 + b.abs());
+}
+
+fn check(s : &mut i64, pos : i32) -> void {
+  let width = (2 * Q_HEADS + 2 * KV_HEADS) * 256;
+  let eps : f32 = 0.000001;
+  let mut hk = Tensor<f16>([MAX_SEQ, KV_HEADS, 256]);
+  let mut hv = Tensor<f16>([MAX_SEQ, KV_HEADS, 256]);
+  for p in 0..MAX_SEQ {
+    for g in 0..KV_HEADS {
+      for i in 0..256 {
+        hk[p][g][i] = (random(s) * 2.0) as f16;
+        hv[p][g][i] = random(s) as f16;
+      }
+    }
+  }
+  let mut hx = Tensor<f32>([width]);
+  for i in 0..width {
+    hx[i] = random(s) * 2.0;
+  }
+  let mut hqn = Tensor<f32>([256]);
+  let mut hkn = Tensor<f32>([256]);
+  for i in 0..256 {
+    hqn[i] = 1.0 + random(s) * 0.5;
+    hkn[i] = 1.0 + random(s) * 0.5;
+  }
+  let mut hcos = Tensor<f32>([MAX_SEQ, ROT / 2]);
+  let mut hsin = Tensor<f32>([MAX_SEQ, ROT / 2]);
+  for p in 0..MAX_SEQ {
+    for i in 0..ROT / 2 {
+      hcos[p][i] = random(s);
+      hsin[p][i] = random(s);
+    }
+  }
+  let mut k_cache = transfer(&hk, Memory::HBM);
+  let mut v_cache = transfer(&hv, Memory::HBM);
+  let qkvg = transfer(&hx, Memory::HBM);
+  let q_norm = transfer(&hqn, Memory::HBM);
+  let k_norm = transfer(&hkn, Memory::HBM);
+  let cos = transfer(&hcos, Memory::HBM);
+  let sin = transfer(&hsin, Memory::HBM);
+  let mut q = transfer(Tensor<f32>([Q_HEADS, 256]), Memory::HBM);
+  let mut y = transfer(Tensor<f32>([Q_HEADS * 256]), Memory::HBM);
+  let mut part = transfer(gated_attention_scratch(Q_HEADS), Memory::HBM);
+  gated_norm_rope_and_store(&mut q, &mut k_cache, &mut v_cache, &qkvg, &q_norm, &k_norm, &cos, &sin, pos, Q_HEADS, KV_HEADS, ROT, eps);
+  gated_attention(&mut y, &mut part, &q, &k_cache, &v_cache, &qkvg, pos, Q_HEADS, KV_HEADS);
+
+  // The CPU: the norms and RoPE of the q heads and k heads.
+  let mut r = Vec<f32>::new();
+  let half = ROT / 2;
+  for h in 0..Q_HEADS + KV_HEADS {
+    let mut ss : f32 = 0.0;
+    for i in 0..256 {
+      ss = ss + hx[h * 256 + i] * hx[h * 256 + i];
+    }
+    let inv = 1.0 / (ss / 256.0 + eps).sqrt();
+    let mut n = Vec<f32>::new();
+    for i in 0..256 {
+      let mut w = hqn[i];
+      if h >= Q_HEADS {
+        w = hkn[i];
+      }
+      n.push(hx[h * 256 + i] * inv * w);
+    }
+    for i in 0..256 {
+      let mut a = n[i];
+      if i < half {
+        a = n[i] * hcos[pos][i] - n[i + half] * hsin[pos][i];
+      } else if i < ROT {
+        a = n[i] * hcos[pos][i - half] + n[i - half] * hsin[pos][i - half];
+      }
+      r.push(a);
+    }
+  }
+  let hq = transfer(&q, Memory::CPU_DRAM);
+  let mut q_off = 0;
+  for h in 0..Q_HEADS {
+    for i in 0..256 {
+      if off(hq[h][i], r[h * 256 + i]) {
+        q_off = q_off + 1;
+      }
+    }
+  }
+  let hkc = transfer(&k_cache, Memory::CPU_DRAM);
+  let hvc = transfer(&v_cache, Memory::CPU_DRAM);
+  let mut cache_off = 0;
+  for g in 0..KV_HEADS {
+    for i in 0..256 {
+      if off(hkc[pos][g][i] as f32, r[(Q_HEADS + g) * 256 + i]) {
+        cache_off = cache_off + 1;
+      }
+      if (hvc[pos][g][i] as f32) != ((hx[(Q_HEADS + KV_HEADS + g) * 256 + i] as f16) as f32) {
+        cache_off = cache_off + 1;
+      }
+    }
+  }
+  // The attention over rows 0 to pos of the caches that the kernel wrote, then the gate.
+  let hy = transfer(&y, Memory::CPU_DRAM);
+  let mut y_off = 0;
+  for h in 0..Q_HEADS {
+    let g = h / (Q_HEADS / KV_HEADS);
+    let mut scores = Vec<f32>::new();
+    let mut big : f32 = -3.0e38;
+    for p in 0..pos + 1 {
+      let mut dot : f32 = 0.0;
+      for i in 0..256 {
+        dot = dot + r[h * 256 + i] * (hkc[p][g][i] as f32);
+      }
+      let sc = dot * 0.0625;
+      scores.push(sc);
+      big = big.max(sc);
+    }
+    let mut total : f32 = 0.0;
+    for p in 0..pos + 1 {
+      scores[p] = (scores[p] - big).exp();
+      total = total + scores[p];
+    }
+    for i in 0..256 {
+      let mut acc : f32 = 0.0;
+      for p in 0..pos + 1 {
+        acc = acc + scores[p] * (hvc[p][g][i] as f32);
+      }
+      let gate = hx[(Q_HEADS + 2 * KV_HEADS + h) * 256 + i];
+      let want = acc / total / (1.0 + (0.0 - gate).exp());
+      if off(hy[h * 256 + i], want) {
+        y_off = y_off + 1;
+      }
+    }
+  }
+  println!("pos {}: q {} off, cache {} off, y {} off", pos, q_off, cache_off, y_off);
+  return;
+}
+
+fn main() -> i32 {
+  let mut seed : i64 = 11;
+  check(&mut seed, 0);
+  check(&mut seed, 37);
+  check(&mut seed, 700);
+  check(&mut seed, 2047);
+  check(&mut seed, 2100);
+  return 0;
+}
