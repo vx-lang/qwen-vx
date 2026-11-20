@@ -1,0 +1,59 @@
+Third-party notices
+===================
+
+The code of this repository is under the Apache License v2.0 with LLVM Exceptions (LICENSE).
+Some of it follows the design of code from other projects. This file lists each such piece, the
+files that hold it, and the license of the project that it comes from.
+
+The repository has no copy of another project's source files. The pieces below are written anew in
+Vx, in MLIR that a script of this repository prints, or in Python, after the design of the named
+upstream code. The upstream commit that each design was read from was not recorded.
+
+
+1. llama.cpp (https://github.com/ggml-org/llama.cpp), MIT License
+-----------------------------------------------------------------
+
+| Files | Follows |
+| --- | --- |
+| src/attention.vx (vec_attention), scripts/mlir_kernels/decode_attention.py | kernel_flash_attn_ext_vec and kernel_flash_attn_ext_vec_reduce, in ggml/src/ggml-metal/ggml-metal.metal of older releases and ggml/src/ggml-metal/kernels/fa_vec_*.metal in v1.0.0 |
+| src/round.vx (round_attention), scripts/mlir_kernels/round_attention.py | the same kernels, for several queries in a row |
+| src/prefill.vx (the attention of the prompt), scripts/mlir_kernels/flash_attention.py | kernel_flash_attn_ext, ggml/src/ggml-metal/kernels/fa_common.metal |
+| src/prefill.vx (pf_mm_q4_set), scripts/mlir_kernels/expert_product.py | kernel_mul_mm_id, ggml/src/ggml-metal/kernels/mul_mm.metal |
+| src/products.vx | the shape of a block of kernel_mul_mv_q4_0_f32 (2 SIMD groups of 4 rows), ggml/src/ggml-metal/kernels/mul_mv.metal |
+| scripts/qwen_weights.py (Q4_0 codes) | the rounding of quantize_row_q4_0_ref and the search of quantize_row_q4_0_impl, ggml/src/ggml-quants.c |
+
+The Q4_0 format itself (a 4-bit code and an f16 scale for each 32 weights, a weight being
+(code - 8) times the scale) is the Q4_0 of llama.cpp.
+
+The license of llama.cpp:
+
+MIT License
+
+Copyright (c) 2023-2026 The ggml authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+
+2. Model weights and tokenizers
+-------------------------------
+
+The repository has no model weights and no tokenizer files. scripts/convert.py and
+scripts/convert_tokenizer.py make the files that the program reads from a model of Hugging Face.
+Each model has its own license, on its model card. The tests make tiny random models with
+scripts/make_tiny_model.py and scripts/make_tiny_tokenizer.py.

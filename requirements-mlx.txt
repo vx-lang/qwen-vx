@@ -1,0 +1,4 @@
+# The package of scripts/check_against_mlx.py, which compares scripts/reference.py with MLX on the
+# same model. It runs only on Apple Silicon, so CI does not install it.
+-r requirements.txt
+mlx-lm==0.32.2

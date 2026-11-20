@@ -1,0 +1,10 @@
+# The Python packages of the scripts in scripts/: convert.py, reference.py, importance.py and the
+# prompt tools. Python 3.12 or later. Install them in a virtual environment:
+#
+#   python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
+#
+# The versions are the ones that CI and the published results used. Change one only in a PR that
+# says why, and run the tests with the new version.
+numpy==2.5.5
+tokenizers==0.23.3
+huggingface_hub==2.4.0

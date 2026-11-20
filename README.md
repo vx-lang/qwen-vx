@@ -20,14 +20,17 @@ changed, its measurements, and the changes that did not help.
 
 ## Install Vx
 
-The program needs Vx v0.0.5 or later:
+The program needs a Mac with Apple Silicon for the GPU, and the Vx release that the file
+[`VX_VERSION`](VX_VERSION) names (now v0.0.5). CI tests that release. On a Mac, the Vx toolchain
+also needs LLVM 22 and z3 from Homebrew:
 
 ```sh
-curl -fsSL https://vxlang.org/install.sh | sh
+brew install llvm@22 z3
+curl -fsSL https://vxlang.org/install.sh | VX_VERSION=$(cat VX_VERSION) sh
 ```
 
-The toolchain goes in `~/.vx/current`. On a Mac, it also needs LLVM 22 (`brew install llvm@22`).
-The commands below call `vxc`, so put the toolchain on `PATH`, as the installer says:
+The toolchain goes in `~/.vx/current`. The commands below call `vxc`, so put the toolchain on
+`PATH`, as the installer says:
 
 ```sh
 export PATH="$HOME/.vx/bin:$PATH"
@@ -49,14 +52,15 @@ with no Apple GPU, the same program runs on the CPU.
 
 ## Prepare a model
 
-The scripts need Python 3 with NumPy. `--prompt` also needs the `tokenizers` package, and
-`check_against_mlx.py` needs `mlx-lm`. The Python of Homebrew takes no packages of its own, so
-put them in a virtual environment:
+The scripts need Python 3.12 or later and the packages of [`requirements.txt`](requirements.txt),
+at the versions that it pins. `check_against_mlx.py` also needs those of
+[`requirements-mlx.txt`](requirements-mlx.txt). The Python of Homebrew takes no packages of its
+own, so put them in a virtual environment:
 
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
-pip install numpy tokenizers huggingface_hub
+pip install -r requirements.txt
 ```
 
 1. Download a model from Hugging Face, for example
@@ -219,8 +223,8 @@ the same prompt, after `convert_tokenizer.py ~/models/Qwen3-Coder-30B-A3B-Instru
 and an iterative `fibonacci` in the 64 steps. `reference.py` on the same file chose the same 64
 tokens, with each logit within 5.4e-05.
 
-The program gives the GPU the pages of the mapped weight file, with no copy. This needs the vxc of
-Vx `main` at c4e57fd7 or later ([vx-lang/Vx#3606](https://github.com/vx-lang/Vx/pull/3606)). On
+The program gives the GPU the pages of the mapped weight file, with no copy. Vx has this since
+v0.0.5 ([vx-lang/Vx#3606](https://github.com/vx-lang/Vx/pull/3606)). On
 an M4 with 32 GB, the load takes about 10.5 s, and the program has 0.3 GB of private memory at
 a short context and 2.1 GB at 8,000 tokens of context. When it copied the weights, the load took
 29 to 38 s and 18.9 to 20.4 GB. The file cache keeps one copy of the weights for all the runs, and
@@ -411,8 +415,9 @@ A program imports the modules as `qwen::weights`, `qwen::model`, `qwen::attentio
 `qwen::tokenizer` and `qwen::session`, with `vxc --package qwen=src`. A program in another folder
 names the `src` folder of this repository.
 
-The tests are in `tests/`. They need a Python 3 that has NumPy and ml_dtypes, and `FileCheck` from
-LLVM or the Python port (`pip install numpy ml_dtypes filecheck`). `tests/run.sh` takes `vxc` and the
+The tests are in `tests/`. They need the packages of [`requirements-test.txt`](requirements-test.txt)
+(`pip install -r requirements-test.txt`): NumPy, ml_dtypes, and the Python port of `FileCheck`.
+A `FileCheck` of LLVM on `PATH` comes first. `tests/run.sh` takes `vxc` and the
 machine files from `$VX_HOME/current` when `VX_HOME` is set, else from the `vxc` on `PATH`, else
 from `~/.vx/current`:
 
@@ -502,3 +507,14 @@ The check fails when the router chooses the smallest experts or one expert too f
 does not scale the weights of the chosen experts to sum to 1. It also fails when an expert uses
 the down matrix of the next expert, when the converter puts the up rows before the gate rows, or
 when the Q and K norms are missing, swapped or after RoPE.
+
+## License and notices
+
+The code of this repository is under the Apache License v2.0 with LLVM Exceptions
+([`LICENSE`](LICENSE)). Some kernels follow the design of llama.cpp, which is under the MIT License.
+[`THIRD_PARTY_NOTICES`](THIRD_PARTY_NOTICES) lists them, with the notice of that license.
+
+The repository has no model weights or tokenizer files. `scripts/convert.py` and
+`scripts/convert_tokenizer.py` make them from a model of Hugging Face, which has its own license:
+see the model card, for example
+[Qwen3-Coder-30B-A3B-Instruct](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct).

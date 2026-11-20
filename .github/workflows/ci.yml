@@ -15,23 +15,24 @@ jobs:
     runs-on: macos-15
     # A run takes 5 to 8 minutes. A test that hangs stops here, not at the limit of 6 hours.
     timeout-minutes: 30
-    env:
-      # The oldest release that has every std::nn kernel that the program calls.
-      VX_VERSION: v0.0.5
     steps:
       - uses: actions/checkout@v7
 
+      # The file VX_VERSION names the Vx release that the program is tested with. The toolchain
+      # needs LLVM 22 and z3 on macOS.
       - name: Install Vx
         run: |
           brew install --quiet llvm@22 z3
-          curl -fsSL https://vxlang.org/install.sh | VX_NO_MODIFY_PATH=1 sh
-          ~/.vx/current/bin/vxc --version
+          version=$(cat VX_VERSION)
+          curl -fsSL https://vxlang.org/install.sh | VX_VERSION="$version" VX_NO_MODIFY_PATH=1 sh
+          ~/.vx/current/bin/vxc --version | grep -F "vxc ${version#v} "
 
       # The system Python of the runner takes no packages, so they go in a venv.
       - name: Install the Python packages
         run: |
+          python3 --version
           python3 -m venv "$RUNNER_TEMP/venv"
-          "$RUNNER_TEMP/venv/bin/pip" install --quiet numpy ml_dtypes filecheck
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet -r requirements-test.txt
 
       - name: Test
         run: PATH="$RUNNER_TEMP/venv/bin:$PATH" tests/run.sh

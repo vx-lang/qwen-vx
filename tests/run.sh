@@ -1,7 +1,7 @@
 #!/bin/bash
 # Runs the RUN lines of the tests, as the fixture runner of Vx runs them, from the root of this
-# repository. A python3 that has NumPy must be on PATH, and FileCheck or the `filecheck` of
-# `pip install filecheck`.
+# repository. A python3 with the packages of requirements-test.txt must be on PATH. FileCheck of
+# LLVM on PATH comes first, else the `filecheck` of those packages.
 #
 #   tests/run.sh              # the Python tests of the scripts, and every test here
 #   tests/run.sh FILE...      # only these tests
