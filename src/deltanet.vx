@@ -25,26 +25,7 @@
 // a SIMD group read them in one load. Both start at zero.
 import core::num;
 import std::nn;
-
-/// The sum of `x` over the 32 lanes of a SIMD group. Each lane gets the sum.
-fn dn_lane_sum(x : f32) on Topology::Device -> f32
-ensures writes_only()
-{
-  return mlir!( inputs : (%x = x : f32), returns : f32, dialects : ["gpu"], ensures : [writes_only()]) {
-    %r = gpu.subgroup_reduce add %x : (f32) -> f32
-    macro.yield %r : f32
-  };
-}
-
-/// The natural logarithm of x. (The Metal code generator of Vx v0.0.5 cannot print `math.log1p`.)
-fn dn_log(x : f32) on Topology::Device -> f32
-ensures writes_only()
-{
-  return mlir!( inputs : (%x = x : f32), returns : f32, dialects : ["math"], ensures : [writes_only()]) {
-    %r = math.log %x : f32
-    macro.yield %r : f32
-  };
-}
+import qwen::simd;
 
 /// The scratch tensors of one token, in GPU memory: q and k after the convolution and the norm
 /// [k_heads, 128], v after the convolution [v_heads, 128], beta and the decay exp(g) of each head of
@@ -160,7 +141,7 @@ fn deltanet_gates(beta : &mut Tensor<f32, [?], Memory::HBM>, decay : &mut Tensor
           let x = proj[a_at + j] + dt_bias[j];
           let mut sp = x;
           if x <= 20.0 {
-            sp = dn_log(1.0 + x.fast_exp());
+            sp = simd_log(1.0 + x.fast_exp());
           }
           decay[j] = (neg_a[j] * sp).fast_exp();
         }
@@ -199,7 +180,7 @@ fn deltanet_recur(o : &mut Tensor<f32, [?, ?], Memory::HBM>, state : &mut Tensor
               let s1 = state[h][v][d + 1] * dec;
               let s2 = state[h][v][d + 2] * dec;
               let s3 = state[h][v][d + 3] * dec;
-              let kv = dn_lane_sum(s0 * k0 + s1 * k1 + s2 * k2 + s3 * k3);
+              let kv = simd_sum(s0 * k0 + s1 * k1 + s2 * k2 + s3 * k3);
               let delta = (vv[h][v] - kv) * b;
               let n0 = s0 + k0 * delta;
               let n1 = s1 + k1 * delta;
@@ -209,7 +190,7 @@ fn deltanet_recur(o : &mut Tensor<f32, [?, ?], Memory::HBM>, state : &mut Tensor
               state[h][v][d + 1] = n1;
               state[h][v][d + 2] = n2;
               state[h][v][d + 3] = n3;
-              let out = dn_lane_sum(n0 * q0 + n1 * q1 + n2 * q2 + n3 * q3);
+              let out = simd_sum(n0 * q0 + n1 * q1 + n2 * q2 + n3 * q3);
               if m == l {
                 mine = out;
               }

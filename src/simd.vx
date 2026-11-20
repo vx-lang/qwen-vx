@@ -1,0 +1,72 @@
+//===- simd.vx - Qwen app ---------------------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// Small `mlir!` functions for the operations that a kernel of Vx v0.0.5 cannot write: a sum, a
+// largest value or a value across the 32 lanes of a SIMD group, a load of 4 halves in 8 bytes, and
+// the logarithm. The kernels of Qwen3.6 (#89) use them. They are the same as the functions of
+// src/attention.vx in vx-lang/qwen-vx#87, under other names; one copy should go when both merge.
+import core::num;
+
+/// The sum of `x` over the 32 lanes of a SIMD group. Each lane gets the sum.
+fn simd_sum(x : f32) on Topology::Device -> f32
+ensures writes_only()
+{
+  return mlir!( inputs : (%x = x : f32), returns : f32, dialects : ["gpu"], ensures : [writes_only()]) {
+    %r = gpu.subgroup_reduce add %x : (f32) -> f32
+    macro.yield %r : f32
+  };
+}
+
+/// The largest `x` over the 32 lanes of a SIMD group. Each lane gets it.
+fn simd_max(x : f32) on Topology::Device -> f32
+ensures writes_only()
+{
+  return mlir!( inputs : (%x = x : f32), returns : f32, dialects : ["gpu"], ensures : [writes_only()]) {
+    %r = gpu.subgroup_reduce maxnumf %x : (f32) -> f32
+    macro.yield %r : f32
+  };
+}
+
+/// The value of `x` in lane `src` of the SIMD group.
+fn simd_value(x : f32, src : i32) on Topology::Device -> f32
+ensures writes_only()
+{
+  return mlir!( inputs : (%x = x : f32, %src = src : i32), returns : f32, dialects : ["arith", "gpu"], ensures : [writes_only()]) {
+    %w = arith.constant 32 : i32
+    %r, %ok = gpu.shuffle idx %x, %src, %w : f32
+    macro.yield %r : f32
+  };
+}
+
+/// t[row][g][d + j] for j 0 to 3, from one 8-byte load of the 4 halves at d, a multiple of 4. The
+/// compiler merges the loads of the 4 calls for one d into one.
+fn half4_at(t : &Tensor<f16, [?, ?, ?], Memory::HBM>, row : i32, g : i32, d : i32, j : i32) on Topology::Device -> f32
+ensures reads_only(t)
+{
+  return mlir!( inputs : (%t = t : memref<?x?x?xf16>, %row = row : i32, %g = g : i32, %d = d : i32, %j = j : i32), returns : f32, dialects : ["arith", "vector"], ensures : [reads_only(t)]) {
+    %r = arith.index_cast %row : i32 to index
+    %gi = arith.index_cast %g : i32 to index
+    %di = arith.index_cast %d : i32 to index
+    %ji = arith.index_cast %j : i32 to index
+    %h = vector.load %t[%r, %gi, %di] {
+      alignment = 8
+    } : memref<?x?x?xf16>, vector<4xf16>
+    %x = vector.extract %h[%ji] : f16 from vector<4xf16>
+    %f = arith.extf %x : f16 to f32
+    macro.yield %f : f32
+  };
+}
+
+/// The natural logarithm of x. (The Metal code generator of Vx v0.0.5 cannot print `math.log1p`.)
+fn simd_log(x : f32) on Topology::Device -> f32
+ensures writes_only()
+{
+  return mlir!( inputs : (%x = x : f32), returns : f32, dialects : ["math"], ensures : [writes_only()]) {
+    %r = math.log %x : f32
+    macro.yield %r : f32
+  };
+}
