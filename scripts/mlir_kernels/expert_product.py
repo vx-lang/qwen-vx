@@ -94,14 +94,16 @@ b('%zf = arith.constant 0.0 : f32')
 b('%z = gpu.subgroup_mma_constant_matrix %zf : ' + ACC)
 # the MMA operands of this subgroup: tokens th * 16.., rows rh * 32..
 b(f'%th512 = arith.muli %th, {c(512)} : index')       # sx[(th * 16) * 32]
+b('%th16 = arith.muli %th, %k16 : index')
 b('%rh32 = arith.muli %rh, %k32 : index')              # sw[rh * 32]
-# The tokens of an expert come first in its tiles, so when token 16 of the block is padding, so are
-# tokens 16 to 31, and the subgroups of those tokens (th = 1) skip their multiplies.
-b('%tb16 = arith.addi %tb32, %k16 : index')
-b('%from16 = memref.load %list[%tb16] : memref<?xi32>')
-b('%live16 = arith.cmpi sge, %from16, %zi : i32')
-b('%th0 = arith.cmpi eq, %th, %k0 : index')
-b('%busy = arith.ori %th0, %live16 : i1')
+# The tokens of an expert come first in its tiles, so when token t of the block is padding, so are
+# the tokens after it. A subgroup skips the multiplies of its 8 tokens th * 16 + 8 to + 15 when the
+# first of them is padding (busy1 false), and all its multiplies when token th * 16 is padding.
+b('%tf0 = arith.addi %tb32, %th16 : index')
+b('%tf1 = arith.addi %tf0, %k8 : index')
+for i in range(2):
+    b(f'%from_t{i} = memref.load %list[%tf{i}] : memref<?xi32>')
+    b(f'%busy{i} = arith.cmpi sge, %from_t{i}, %zi : i32')
 accs = ', '.join(f'%a{i} = %z' for i in range(8))
 accty = ', '.join([ACC] * 8)
 b(f'%res:8 = scf.for %g = %k0 to %Gl step %k1 iter_args({accs}) -> ({accty}) {{')
@@ -145,38 +147,46 @@ for k in range(16):
 d('vector.store %h0, %sx[%sxd] {alignment = 8} : memref<1024xf16, 3>, vector<4xf16>')
 d('vector.store %h1, %sx[%sxd4] {alignment = 8} : memref<1024xf16, 3>, vector<4xf16>')
 d('gpu.barrier')
-d(f'%mm:8 = scf.if %busy -> ({accty}) {{')
-d0 = d
-d = lambda s: d0('  ' + s)
-prev = [f'%a{i}' for i in range(8)]
-for k8 in (0, 8, 16, 24):
-    if hint:
-        d('vx.subgroup_schedule_barrier')
-    for j in range(4):
-        d(f'%bo{j}_{k8} = arith.addi %rh32, {c(k8 * 64 + j * 8)} : index')
-        d(f'%mb{j}_{k8} = gpu.subgroup_mma_load_matrix %sw[%bo{j}_{k8}] {{leadDimension = 64 : index}} : memref<2048xf16, 3> -> {BOP}')
-    if hint:
-        d('vx.subgroup_schedule_barrier')
-    for i in range(2):
-        d(f'%ao{i}_{k8} = arith.addi %th512, {c(i * 8 * 32 + k8)} : index')
-        d(f'%ma{i}_{k8} = gpu.subgroup_mma_load_matrix %sx[%ao{i}_{k8}] {{leadDimension = 32 : index}} : memref<1024xf16, 3> -> {AOP}')
-    if hint:
-        d('vx.subgroup_schedule_barrier')
-    cur = []
-    for i in range(2):
+def mma(d, tag, rows):
+    """The multiplies of a step for the token rows `rows` (0: tokens th * 16 to + 7, 1: + 8 to + 15).
+    Yields the 8 sums; those of the other rows go through as they are."""
+    prev = [f'%a{i}' for i in range(8)]
+    for k8 in (0, 8, 16, 24):
+        if hint:
+            d('vx.subgroup_schedule_barrier')
         for j in range(4):
-            n = i * 4 + j
-            d(f'%r{n}_{k8} = gpu.subgroup_mma_compute %ma{i}_{k8}, %mb{j}_{k8}, {prev[n]} : {AOP}, {BOP} -> {ACC}')
-            cur.append(f'%r{n}_{k8}')
-    prev = cur
-d('scf.yield ' + ', '.join(prev) + ' : ' + accty)
-d = d0
+            d(f'%bo{j}_{k8}{tag} = arith.addi %rh32, {c(k8 * 64 + j * 8)} : index')
+            d(f'%mb{j}_{k8}{tag} = gpu.subgroup_mma_load_matrix %sw[%bo{j}_{k8}{tag}] {{leadDimension = 64 : index}} : memref<2048xf16, 3> -> {BOP}')
+        if hint:
+            d('vx.subgroup_schedule_barrier')
+        for i in rows:
+            d(f'%ao{i}_{k8}{tag} = arith.addi %th512, {c(i * 8 * 32 + k8)} : index')
+            d(f'%ma{i}_{k8}{tag} = gpu.subgroup_mma_load_matrix %sx[%ao{i}_{k8}{tag}] {{leadDimension = 32 : index}} : memref<1024xf16, 3> -> {AOP}')
+        if hint:
+            d('vx.subgroup_schedule_barrier')
+        cur = list(prev)
+        for i in rows:
+            for j in range(4):
+                n = i * 4 + j
+                d(f'%r{n}_{k8}{tag} = gpu.subgroup_mma_compute %ma{i}_{k8}{tag}, %mb{j}_{k8}{tag}, {prev[n]} : {AOP}, {BOP} -> {ACC}')
+                cur[n] = f'%r{n}_{k8}{tag}'
+        prev = cur
+    d('scf.yield ' + ', '.join(prev) + ' : ' + accty)
+d0 = d
+d1 = lambda s: d0('  ' + s)
+d2 = lambda s: d0('    ' + s)
+d(f'%mm:8 = scf.if %busy1 -> ({accty}) {{')
+mma(d1, 'f', (0, 1))
 d('} else {')
-d('  scf.yield ' + ', '.join(f'%a{i}' for i in range(8)) + ' : ' + accty)
+d1(f'%mh:8 = scf.if %busy0 -> ({accty}) {{')
+mma(d2, 'h', (0,))
+d1('} else {')
+d1('  scf.yield ' + ', '.join(f'%a{i}' for i in range(8)) + ' : ' + accty)
+d1('}')
+d1('scf.yield ' + ', '.join(f'%mh#{i}' for i in range(8)) + ' : ' + accty)
 d('}')
 d('scf.yield ' + ', '.join(f'%mm#{i}' for i in range(8)) + ' : ' + accty)
 b('}')
-b('%th16 = arith.muli %th, %k16 : index')
 b('%yr0 = arith.addi %tb32, %th16 : index')
 b('%yr1 = arith.addi %yr0, %k8 : index')
 b('%yc0 = arith.addi %rb64, %rh32 : index')
