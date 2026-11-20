@@ -436,7 +436,7 @@ python3 scripts/reference.py qwen-0.5b.vxw --tensors
 
 ## The tokenizer
 
-`src/tokenizer.vx` is the byte-level BPE tokenizer of Qwen2 and Qwen3. It splits out the added
+`src/tokenizer.vx` is the byte-level BPE tokenizer of Qwen2, Qwen3 and Qwen3.5. It splits out the added
 tokens, such as `<|im_start|>`, and applies Unicode NFC to the text between them. Then it splits
 the text with the regex of the pre-tokenizer, and merges the bytes of each piece by the ranks of
 tokenizer.json. `convert_tokenizer.py` describes the file and the steps. The file holds sorted
@@ -451,7 +451,9 @@ encoded 3 MB of source files, 820,000 tokens, in about 2.4 seconds.
 The NFC step of `tokenizers` has the data of an old Unicode version. It does not know the
 combining class of 120 marks that later versions added, and it does not make 21 newer composites.
 `convert_tokenizer.py` leaves both out of its tables, so that the ids are the same.
-`test_tokenizer.py` measures the two lists again, and fails when they change.
+`test_tokenizer.py` measures the two lists again, and fails when they change. The tables come from
+the `unicodedata` module of Python, so `convert_tokenizer.py` needs the Unicode version of
+`tokenizers`, 16.0, which Python 3.14 has. It refuses another version.
 
 `tests/tokenize.vx` checks a tiny tokenizer from `make_tiny_tokenizer.py` against the ids that
 `tokenizers` gave for it. So CI checks the tokenizer without a download. To compare with

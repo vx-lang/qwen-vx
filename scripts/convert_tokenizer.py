@@ -16,7 +16,8 @@ The Vx program `src/tokenizer.vx` reads the file. It turns text into token ids a
 
 This script reads only tokenizer.json, with no package beyond the standard library of Python. The
 Unicode tables come from `unicodedata`. The classes of the regex equal those of the regex engine
-of `tokenizers`. Its NFC step has older data, so the NFC tables leave out the marks and composites
+of `tokenizers` when Python has the same Unicode version (UNICODE_VERSION), so the script refuses
+another version. Its NFC step has older data, so the NFC tables leave out the marks and composites
 that the older data lacks (OLD_NFC_MARKS and OLD_NFC_COMPOSITES). `scripts/test_tokenizer.py`
 checks both.
 
@@ -95,6 +96,10 @@ WHITE_SPACE = [(0x09, 0x0D), (0x20, 0x20), (0x85, 0x85), (0xA0, 0xA0), (0x1680, 
                (0x3000, 0x3000)]
 
 HANGUL_FIRST, HANGUL_LAST = 0xAC00, 0xD7A3
+
+# The Unicode version of the regex engine of `tokenizers` 0.23. Python 3.14 has it. With another
+# version, `unicodedata` puts some new characters in other classes, and the two lists below change.
+UNICODE_VERSION = "16.0.0"
 
 # The NFC step of `tokenizers` 0.23 has the data of an old version of Unicode. It gives combining
 # class 0 to these marks, which later versions added, and it does not compose to these
@@ -190,8 +195,12 @@ def unicode_tables(marks_are_letters=False):
     return ranges(letters), ranges(numbers), WHITE_SPACE, decomposed, combining, compositions
 
 
-def build(t):
-    """The bytes of the tokenizer file for the parsed tokenizer.json `t`."""
+def build(t, any_unicode=False):
+    """The bytes of the tokenizer file for the parsed tokenizer.json `t`. With `any_unicode`, the
+    Unicode version of Python may differ from UNICODE_VERSION."""
+    assert any_unicode or unicodedata.unidata_version == UNICODE_VERSION, (
+        f"this Python has Unicode {unicodedata.unidata_version}, but the tables must have Unicode "
+        f"{UNICODE_VERSION}, as the tokenizers package has. Run the script with Python 3.14.")
     marks_are_letters = check_structure(t)
     to_char = bytes_to_unicode()
     to_byte = {c: b for b, c in to_char.items()}
@@ -273,11 +282,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("model_dir", help="a Hugging Face model folder with tokenizer.json, or the file itself")
     parser.add_argument("output", help="the tokenizer file to write")
+    parser.add_argument("--any-unicode", action="store_true",
+                        help="accept any Unicode version of Python, for a test tokenizer with no new characters")
     args = parser.parse_args()
     path = Path(args.model_dir).expanduser()
     if path.is_dir():
         path = path / "tokenizer.json"
-    data = build(json.loads(path.read_text(encoding="utf-8")))
+    data = build(json.loads(path.read_text(encoding="utf-8")), args.any_unicode)
     Path(args.output).write_bytes(data)
     print(f"wrote {args.output}: {len(data)} bytes")
     return 0

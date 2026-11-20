@@ -9,7 +9,9 @@ decodes those ids and asserts that each text comes back in its NFC form. The cor
 of this repository, Python, Rust and C++ sources, and texts made from random Unicode characters.
 QWEN_TOKENIZER_CORPUS_MB sets the size of the source files (default 4 MB).
 
-The tests skip when `tokenizers`, `vxc` or the model folders are missing, as in CI.
+The tests make the tokenizer files and the Unicode tables with a Python that has the Unicode
+version of `tokenizers` (convert_tokenizer.UNICODE_VERSION): this Python, or python3.14 on PATH.
+They skip when `tokenizers`, `vxc`, that Python or the model folders are missing, as in CI.
 `tests/tokenize.vx` checks a tiny tokenizer without them.
 
 Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
@@ -30,6 +32,7 @@ import sysconfig
 import tempfile
 import unicodedata
 import unittest
+import unittest.mock
 from pathlib import Path
 
 import convert_tokenizer
@@ -117,6 +120,51 @@ def random_texts(count, seed=1):
     return texts
 
 
+def unicode_python():
+    """A Python with the Unicode version of `tokenizers`: this one, or python3.14. None when there
+    is none."""
+    for python in [sys.executable, shutil.which("python3.14")]:
+        if python:
+            out = subprocess.run([python, "-c", "import unicodedata; print(unicodedata.unidata_version)"],
+                                 capture_output=True, text=True)
+            if out.stdout.strip() == convert_tokenizer.UNICODE_VERSION:
+                return python
+    return None
+
+
+UNICODE_PYTHON = unicode_python()
+NEEDS_UNICODE_PYTHON = f"needs a Python with Unicode {convert_tokenizer.UNICODE_VERSION}, such as python3.14"
+
+
+def with_unicode_python(code):
+    """The JSON value that `code` prints in UNICODE_PYTHON. The code may use `json`, `unicodedata`,
+    and this file as `t`."""
+    script = (f"import json, sys, unicodedata; sys.path.insert(0, {str(Path(__file__).parent)!r}); "
+              f"import test_tokenizer as t; {code}")
+    out = subprocess.run([UNICODE_PYTHON, "-I", "-c", script], capture_output=True, text=True, check=True)
+    return json.loads(out.stdout)
+
+
+def nfc_cases():
+    """For each mark with a combining class, and each code point with a canonical decomposition of
+    two parts, the code point and its texts: each text with its NFC form in this Python. A mark
+    of class k > 0 moves before U+0301 (230) when k < 230, and after U+0316 (220) when k > 220. A
+    mark of class 0 does neither. "#" composes with no mark."""
+    marks, composites = [], []
+    for c in range(0x110000):
+        if 0xD800 <= c <= 0xDFFF:
+            continue
+        if unicodedata.combining(chr(c)):
+            texts = ["#\u0301" + chr(c), "#" + chr(c) + "\u0316"]
+            marks.append([c, [[text, unicodedata.normalize("NFC", text)] for text in texts]])
+        mapping = unicodedata.decomposition(chr(c))
+        parts = [int(x, 16) for x in mapping.split()] if mapping and not mapping.startswith("<") else []
+        if len(parts) == 2:
+            text = chr(parts[0]) + chr(parts[1])
+            composites.append([c, [[text, unicodedata.normalize("NFC", text)]]])
+    return marks, composites
+
+
 def run_vx(*args):
     out = subprocess.run(["vxc", str(ROOT / "tests" / "tokenize.vx"), "--package", f"qwen={ROOT / 'src'}",
                           "--host", "default", "--machine", str(vx_fleet() / "m4-uma.vx"), "--", *map(str, args)],
@@ -126,6 +174,7 @@ def run_vx(*args):
 
 @unittest.skipIf(Tokenizer is None, "needs the tokenizers package")
 @unittest.skipIf(shutil.which("vxc") is None, "needs vxc on PATH")
+@unittest.skipIf(UNICODE_PYTHON is None, NEEDS_UNICODE_PYTHON)
 class TokenizerAgainstHuggingFace(unittest.TestCase):
 
     @classmethod
@@ -143,7 +192,8 @@ class TokenizerAgainstHuggingFace(unittest.TestCase):
             self.skipTest(f"needs {model}")
         tmp = Path(self.tmp.name)
         vxt = tmp / (model.name + ".vxt")
-        vxt.write_bytes(convert_tokenizer.build(json.loads((model / "tokenizer.json").read_text(encoding="utf-8"))))
+        subprocess.run([UNICODE_PYTHON, str(ROOT / "scripts" / "convert_tokenizer.py"), str(model), str(vxt)],
+                       capture_output=True, check=True)
         texts_file = tmp / "texts.bin"
         texts_file.write_bytes(b"\0".join(t.encode("utf-8") for t in self.texts))
         lines = [l for l in run_vx(vxt, texts_file).decode().split("\n") if not l.startswith("[JIT]")]
@@ -208,8 +258,8 @@ class RegexOfQwen35(unittest.TestCase):
         def category(c):
             return unicodedata.category(chr(c))[0]
 
-        qwen2 = code_points(letter_ranges(convert_tokenizer.build(self.tiny_tokenizer(convert_tokenizer.QWEN2_PATTERN))))
-        qwen35 = code_points(letter_ranges(convert_tokenizer.build(self.tiny_tokenizer(convert_tokenizer.QWEN35_PATTERN))))
+        qwen2 = code_points(letter_ranges(convert_tokenizer.build(self.tiny_tokenizer(convert_tokenizer.QWEN2_PATTERN), True)))
+        qwen35 = code_points(letter_ranges(convert_tokenizer.build(self.tiny_tokenizer(convert_tokenizer.QWEN35_PATTERN), True)))
         self.assertEqual({category(c) for c in qwen2}, {"L"})
         self.assertEqual({category(c) for c in qwen35 - qwen2}, {"M"})
         self.assertLessEqual(qwen2, qwen35)
@@ -217,10 +267,21 @@ class RegexOfQwen35(unittest.TestCase):
 
     def test_another_regex_is_refused(self):
         with self.assertRaisesRegex(AssertionError, "the pre-tokenizer has another regex"):
-            convert_tokenizer.build(self.tiny_tokenizer(convert_tokenizer.QWEN2_PATTERN.replace(r"\p{N}", r"\d")))
+            convert_tokenizer.build(self.tiny_tokenizer(convert_tokenizer.QWEN2_PATTERN.replace(r"\p{N}", r"\d")), True)
+
+
+class UnicodeVersion(unittest.TestCase):
+
+    def test_another_unicode_version_is_refused(self):
+        t = make_tiny_tokenizer.tokenizer_json()
+        with unittest.mock.patch.object(convert_tokenizer, "UNICODE_VERSION", "1.1.0"):
+            with self.assertRaisesRegex(AssertionError, "the tables must have Unicode 1.1.0"):
+                convert_tokenizer.build(t)
+            self.assertEqual(convert_tokenizer.build(t, True)[:8], convert_tokenizer.MAGIC)
 
 
 @unittest.skipIf(Tokenizer is None, "needs the tokenizers package")
+@unittest.skipIf(UNICODE_PYTHON is None, NEEDS_UNICODE_PYTHON)
 class UnicodeTablesAgainstHuggingFace(unittest.TestCase):
 
     def test_classes_equal_those_of_the_regex_engine(self):
@@ -239,7 +300,8 @@ class UnicodeTablesAgainstHuggingFace(unittest.TestCase):
 
     def check_classes(self, path, marks_are_letters):
         pre = Tokenizer.from_file(str(path)).pre_tokenizer
-        letters, numbers, spaces, *_ = convert_tokenizer.unicode_tables(marks_are_letters)
+        tables = with_unicode_python(f"print(json.dumps(t.convert_tokenizer.unicode_tables({marks_are_letters})[:3]))")
+        letters, numbers, spaces = [[tuple(r) for r in table] for table in tables]
 
         def inside(ranges, c):
             i = bisect.bisect_right(ranges, (c, 0x110000)) - 1
@@ -268,21 +330,12 @@ class UnicodeTablesAgainstHuggingFace(unittest.TestCase):
             self.skipTest("needs a Qwen tokenizer.json")
         norm = Tokenizer.from_file(str(path)).normalizer
 
-        def differs(text):
-            return norm.normalize_str(text) != unicodedata.normalize("NFC", text)
+        def differs(texts):
+            return any(norm.normalize_str(text) != nfc for text, nfc in texts)
 
-        # A mark of class k > 0 moves before U+0301 (230) when k < 230, and after U+0316 (220)
-        # when k > 220. A mark of class 0 does neither. "#" composes with no mark.
-        marks = [c for c in range(0x110000) if not 0xD800 <= c <= 0xDFFF and unicodedata.combining(chr(c))
-                 and (differs("#́" + chr(c)) or differs("#" + chr(c) + "̖"))]
-        composites = []
-        for c in range(0x110000):
-            if 0xD800 <= c <= 0xDFFF:
-                continue
-            mapping = unicodedata.decomposition(chr(c))
-            parts = [int(x, 16) for x in mapping.split()] if mapping and not mapping.startswith("<") else []
-            if len(parts) == 2 and differs(chr(parts[0]) + chr(parts[1])):
-                composites.append(c)
+        mark_cases, composite_cases = with_unicode_python("print(json.dumps(t.nfc_cases()))")
+        marks = [c for c, texts in mark_cases if differs(texts)]
+        composites = [c for c, texts in composite_cases if differs(texts)]
         listed = [c for first, last in convert_tokenizer.OLD_NFC_MARKS for c in range(first, last + 1)]
         self.assertEqual([hex(c) for c in marks], [hex(c) for c in listed])
         self.assertEqual([hex(c) for c in composites], [hex(c) for c in convert_tokenizer.OLD_NFC_COMPOSITES])

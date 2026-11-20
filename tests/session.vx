@@ -13,7 +13,7 @@
 //
 // RUN: python3 %S/../scripts/make_tiny_model.py --vocab-size 404 --max-positions 1024 %t.vxw > /dev/null
 // RUN: python3 %S/../scripts/make_tiny_tokenizer.py %t.json > /dev/null
-// RUN: python3 %S/../scripts/convert_tokenizer.py %t.json %t.vxt > /dev/null
+// RUN: python3 %S/../scripts/convert_tokenizer.py --any-unicode %t.json %t.vxt > /dev/null
 // RUN: python3 %S/../scripts/chat.py %t.vxw %t.vxt --context 512 --check | FileCheck %s
 //
 // CHECK: {{^}}turn 1: prompt {{[0-9]+}} tokens, reused False, same text as a fresh run: True{{$}}
