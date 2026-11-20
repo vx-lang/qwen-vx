@@ -2,16 +2,16 @@
 # Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
 # See LICENSE for license information.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-"""Prints vec_attention_parts and vec_attention_merge of src/attention.vx: the attention of a generated token as
-mlir! blocks.
+"""Prints vec_attention_parts of src/attention.vx: the attention of a generated token as an mlir! block.
+vec_attention_merge, which merges the parts, is Vx code in src/attention.vx.
 
-The design is that of llama.cpp's kernel_flash_attn_ext_vec and kernel_flash_attn_ext_vec_reduce
-(ggml/src/ggml-metal/ggml-metal.metal) for head size 128 with NE 1, MIT License, Copyright (c) 2023-2026 The ggml authors. Edit this script, not the generated
-MLIR:
+The design is that of llama.cpp's kernel_flash_attn_ext_vec (ggml/src/ggml-metal/ggml-metal.metal) for
+head size 128 with NE 1, MIT License, Copyright (c) 2023-2026 The ggml authors. Edit this script, not the
+generated MLIR:
 
     python3 scripts/mlir_kernels/decode_attention.py
 
-prints the functions; replace them in src/attention.vx.
+prints the function; replace it in src/attention.vx.
 """
 KV = 'memref<?x?xf16, strided<[?, 1]>>'
 L = []
@@ -111,75 +111,4 @@ e('  }')
 e('  return;')
 e('}')
 
-# The merge: a block of 4 SIMD groups for each head of Q. Lane l of each SIMD group takes parts l, l + 32,
-# l + 64 and l + 96, as kernel_flash_attn_ext_vec_reduce takes part l; SIMD group s makes the values 16 n + 4 s
-# to 16 n + 4 s + 3 of the head, for n in 0..8.
-e('')
-e('/// Merges the first `parts` parts of `vec_attention_parts` for each head of Q, as llama.cpp\'s')
-e('/// kernel_flash_attn_ext_vec_reduce. A block of 4 SIMD groups does one head: each lane weighs up to 4 parts,')
-e('/// and the SIMD groups add them up for 4 values of the head at a time.')
-e('fn vec_attention_merge(out : &mut Tensor<f32, [?, ?], Memory::HBM>, part : &Tensor<f32, [?, ?, ?], Memory::HBM>, parts : i32, q_heads : i32) -> void {')
-e('  spawn on(Topology::Device) {')
-e('    for h in 0..q_heads across blocks {')
-e('      let _d = mlir!( threads : 128, inputs : (%out = out : memref<?x?xf32>, %part = part : memref<?x?x?xf32>, %parts = parts : i32, %h = h : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(part), writes_only(out[h])]) {')
-b = lambda s: e('        ' + s)
-for c in [0, 1, 2, 3, 4, 16, 32, 64, 96, 128, 129]:
-    b(f'%c{c} = arith.constant {c} : index')
-b('%neg = arith.constant -3.0e38 : f32')
-b('%zero = arith.constant 0.0 : f32')
-b('%one = arith.constant 1.0 : f32')
-b('%tid = gpu.thread_id x')
-b('%sg = arith.divui %tid, %c32 : index')
-b('%l = arith.remui %tid, %c32 : index')
-b('%hi = arith.index_cast %h : i32 to index')
-b('%np = arith.index_cast %parts : i32 to index')
-b('%last = arith.subi %np, %c1 : index')
-for j in range(4):
-    b(f'%p{j} = arith.addi %l, %c{32 * j} : index')
-    b(f'%live{j} = arith.cmpi ult, %p{j}, %np : index')
-    b(f'%pc{j} = arith.minui %p{j}, %last : index')
-    b(f'%mr{j} = memref.load %part[%hi, %pc{j}, %c128] : memref<?x?x?xf32>')
-    b(f'%m{j} = arith.select %live{j}, %mr{j}, %neg : f32')
-b('%m01 = arith.maxnumf %m0, %m1 : f32')
-b('%m23 = arith.maxnumf %m2, %m3 : f32')
-b('%mx = arith.maxnumf %m01, %m23 : f32')
-b('%big = gpu.subgroup_reduce maxnumf %mx : (f32) -> f32')
-for j in range(4):
-    b(f'%dm{j} = arith.subf %m{j}, %big : f32')
-    b(f'%w{j} = math.exp %dm{j} : f32')
-    b(f'%s{j} = memref.load %part[%hi, %pc{j}, %c129] : memref<?x?x?xf32>')
-    b(f'%ws{j} = arith.mulf %w{j}, %s{j} : f32')
-    b(f'%wv{j} = vector.broadcast %w{j} : f32 to vector<4xf32>')
-b('%t01 = arith.addf %ws0, %ws1 : f32')
-b('%t23 = arith.addf %ws2, %ws3 : f32')
-b('%ts = arith.addf %t01, %t23 : f32')
-b('%total = gpu.subgroup_reduce add %ts : (f32) -> f32')
-b('%inv = arith.divf %one, %total : f32')
-b('%lane0 = arith.cmpi eq, %l, %c0 : index')
-b('%sg4 = arith.muli %sg, %c4 : index')
-b('%vz4 = arith.constant dense<0.0> : vector<4xf32>')
-b('scf.for %n = %c0 to %c128 step %c16 {')
-c = lambda s: e('          ' + s)
-c('%d = arith.addi %n, %sg4 : index')
-acc = '%vz4'
-for j in range(4):
-    c(f'%x{j} = vector.load %part[%hi, %pc{j}, %d] {{alignment = 16}} : memref<?x?x?xf32>, vector<4xf32>')
-    c(f'%a{j} = vector.fma %x{j}, %wv{j}, {acc} : vector<4xf32>')
-    acc = f'%a{j}'
-for i in range(4):
-    c(f'%e{i} = vector.extract {acc}[{i}] : f32 from vector<4xf32>')
-    c(f'%r{i} = gpu.subgroup_reduce add %e{i} : (f32) -> f32')
-    c(f'%o{i} = arith.mulf %r{i}, %inv : f32')
-c('scf.if %lane0 {')
-for i in range(4):
-    c(f'  %d{i} = arith.addi %d, %c{i} : index')
-    c(f'  memref.store %o{i}, %out[%hi, %d{i}] : memref<?x?xf32>')
-c('}')
-b('}')
-b('macro.yield %h : i32')
-e('      };')
-e('    }')
-e('  }')
-e('  return;')
-e('}')
 print('\n'.join(L))
