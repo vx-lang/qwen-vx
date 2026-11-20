@@ -1,0 +1,902 @@
+//===- model.vx - Qwen app --------------------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// One token of a Qwen2 or Qwen3 MoE decoder on the GPU, with the kernels of `std::nn`. `State`
+// holds every tensor that a token writes, and the KV cache. It is made once, before the first
+// token, so the token loop allocates nothing.
+import core::convert;
+import core::num;
+import std::nn;
+import std::vec;
+import qwen::attention;
+import qwen::products;
+import qwen::q6;
+import qwen::weights;
+
+/// The keys and the values of every position so far, for one layer: [max_seq, kv_heads, head_dim].
+/// They are f16, half the memory of f32. The kernels compute in f32, and round only what they
+/// store here.
+struct Cache {
+  k : Tensor<f16, [?, ?, ?], Memory::HBM>,
+  v : Tensor<f16, [?, ?, ?], Memory::HBM>,
+}
+
+/// The tensors of a mixture-of-experts layer: the router's score of each expert, the chosen
+/// experts and their weights, and the SwiGLU output of each chosen expert, [experts_per_token,
+/// moe_intermediate_size].
+struct Experts {
+  router_logits : Tensor<f32, [?], Memory::HBM>,
+  ids : Tensor<i32, [?], Memory::HBM>,
+  weights : Tensor<f32, [?], Memory::HBM>,
+  mlp : Tensor<f32, [?, ?], Memory::HBM>,
+}
+
+/// The tensors that a token writes, in GPU memory, and one `Cache` for each layer. `cos` and `sin`
+/// are [max_seq, head_dim / 2].
+struct State {
+  max_seq : i32,
+  x : Tensor<f32, [?], Memory::HBM>,
+  xn : Tensor<f32, [?], Memory::HBM>,
+  q : Tensor<f32, [?, ?], Memory::HBM>,
+  k : Tensor<f32, [?, ?], Memory::HBM>,
+  v : Tensor<f32, [?, ?], Memory::HBM>,
+  q_turned : Tensor<f32, [?, ?], Memory::HBM>,
+  attended : Tensor<f32, [?, ?], Memory::HBM>,
+  attention_parts : Tensor<f32, [?, ?, ?, ?], Memory::HBM>,
+  vec_parts : Tensor<f32, [?, ?, ?], Memory::HBM>,
+  mlp : Tensor<f32, [?], Memory::HBM>,
+  experts : Experts,
+  logits : Tensor<f32, [?], Memory::HBM>,
+  cos : Tensor<f32, [?, ?], Memory::HBM>,
+  sin : Tensor<f32, [?, ?], Memory::HBM>,
+  caches : Vec<Cache>,
+}
+
+/// The state for up to `max_seq` positions. The angles of RoPE are computed in f64, as in
+/// `reference.py`, and rounded to f32 once.
+fn new_state(c : &Config, max_seq : i32) -> State {
+  assert(max_seq > 0 && max_seq <= c.max_positions, "max_seq must be between 1 and the max_positions of the model");
+  let half = c.head_dim / 2;
+  let mut hcos = Tensor<f32>([max_seq, half]);
+  let mut hsin = Tensor<f32>([max_seq, half]);
+  for p in 0..max_seq {
+    for i in 0..half {
+      let angle = f64::from(p) / f64::powf(c.rope_theta, f64::from(2 * i) / f64::from(c.head_dim));
+      hcos[p][i] = f64::cos(angle) as f32;
+      hsin[p][i] = f64::sin(angle) as f32;
+    }
+  }
+  // A dense model uses none of the tensors of the experts, so one value each is enough.
+  let experts = i32::max(c.num_experts, 1);
+  let chosen = i32::max(c.experts_per_token, 1);
+  let moe_inter = i32::max(c.moe_intermediate_size, 1);
+  // The flash attention of a prompt reads the cache in blocks of 64 positions.
+  let rows = (max_seq + 63) / 64 * 64;
+  let mut caches = Vec<Cache>::new();
+  for l in 0..c.num_layers {
+    caches.push(Cache {
+      k: transfer(Tensor<f16>([rows, c.num_kv_heads, c.head_dim]), Memory::HBM),
+      v: transfer(Tensor<f16>([rows, c.num_kv_heads, c.head_dim]), Memory::HBM),
+    });
+  }
+  return State {
+    max_seq: max_seq,
+    x: transfer(Tensor<f32>([c.hidden_size]), Memory::HBM),
+    xn: transfer(Tensor<f32>([c.hidden_size]), Memory::HBM),
+    q: transfer(Tensor<f32>([c.num_q_heads, c.head_dim]), Memory::HBM),
+    k: transfer(Tensor<f32>([c.num_kv_heads, c.head_dim]), Memory::HBM),
+    v: transfer(Tensor<f32>([c.num_kv_heads, c.head_dim]), Memory::HBM),
+    q_turned: transfer(Tensor<f32>([c.num_q_heads, c.head_dim]), Memory::HBM),
+    attended: transfer(Tensor<f32>([c.num_q_heads, c.head_dim]), Memory::HBM),
+    attention_parts: transfer(split_attention_scratch(max_seq, c.num_q_heads, c.num_kv_heads, c.head_dim), Memory::HBM),
+    vec_parts: transfer(vec_attention_scratch(c.num_q_heads), Memory::HBM),
+    mlp: transfer(Tensor<f32>([c.intermediate_size]), Memory::HBM),
+    experts: Experts {
+      router_logits: transfer(Tensor<f32>([experts]), Memory::HBM),
+      ids: transfer(Tensor<i32>([chosen]), Memory::HBM),
+      weights: transfer(Tensor<f32>([chosen]), Memory::HBM),
+      mlp: transfer(Tensor<f32>([chosen, moe_inter]), Memory::HBM),
+    },
+    logits: transfer(Tensor<f32>([c.vocab_size]), Memory::HBM),
+    cos: transfer(hcos, Memory::HBM),
+    sin: transfer(hsin, Memory::HBM),
+    caches: caches,
+  };
+}
+
+/// y = m x, with the kernel for the dtype of `m`, which has `rows` x `cols` weights.
+fn matvec(y : &mut Tensor<f32, [?], Memory::HBM>, m : &WeightMatrix, x : &Tensor<f32, [?], Memory::HBM>, rows : i32, cols : i32) -> void {
+  if m.dtype == U6 {
+    matvec_q6(y, &m.codes, &m.high, &m.group_scales, x, rows, cols);
+  } else if m.dtype == U4 {
+    nn_matvec_q4(y, &m.codes, &m.group_scales, x, rows, cols);
+  } else if m.dtype == F8E4M3 {
+    nn_matvec_fp8(y, &m.codes, &m.scales, x, rows, cols);
+  } else {
+    nn_matvec(y, &m.bf16, x, rows, cols);
+  }
+  return;
+}
+
+/// y += m x.
+fn matvec_add(y : &mut Tensor<f32, [?], Memory::HBM>, m : &WeightMatrix, x : &Tensor<f32, [?], Memory::HBM>, rows : i32, cols : i32) -> void {
+  if m.dtype == U4 {
+    nn_matvec_q4_add(y, &m.codes, &m.group_scales, x, rows, cols);
+  } else if m.dtype == F8E4M3 {
+    nn_matvec_fp8_add(y, &m.codes, &m.scales, x, rows, cols);
+  } else {
+    nn_matvec_add(y, &m.bf16, x, rows, cols);
+  }
+  return;
+}
+
+/// y += m x, for x of [heads, head_dim].
+fn matvec_heads_add(y : &mut Tensor<f32, [?], Memory::HBM>, m : &WeightMatrix, x : &Tensor<f32, [?, ?], Memory::HBM>, rows : i32, heads : i32, head_dim : i32) -> void {
+  if m.dtype == U4 {
+    matvec_q4_heads_add_blocks(y, &m.codes, &m.group_scales, x, rows, heads, head_dim);
+  } else if m.dtype == F8E4M3 {
+    nn_matvec_fp8_heads_add(y, &m.codes, &m.scales, x, rows, heads, head_dim);
+  } else {
+    nn_matvec_heads_add(y, &m.bf16, x, rows, heads, head_dim);
+  }
+  return;
+}
+
+/// The Q, K and V of x: m x + b, split by heads.
+fn qkv(q : &mut Tensor<f32, [?, ?], Memory::HBM>, k : &mut Tensor<f32, [?, ?], Memory::HBM>, v : &mut Tensor<f32, [?, ?], Memory::HBM>, m : &WeightMatrix, b : &Tensor<bf16, [?], Memory::HBM>, x : &Tensor<f32, [?], Memory::HBM>, c : &Config) -> void {
+  if m.dtype == U4 {
+    qkv_q4_blocks(q, k, v, &m.codes, &m.group_scales, b, x, c.num_q_heads, c.num_kv_heads, c.head_dim, c.hidden_size);
+  } else if m.dtype == F8E4M3 {
+    nn_qkv_fp8(q, k, v, &m.codes, &m.scales, b, x, c.num_q_heads, c.num_kv_heads, c.head_dim, c.hidden_size);
+  } else {
+    nn_qkv(q, k, v, &m.bf16, b, x, c.num_q_heads, c.num_kv_heads, c.head_dim, c.hidden_size);
+  }
+  return;
+}
+
+/// The SwiGLU of a dense MLP, for the gate rows and then the up rows of `m`.
+fn swiglu(out : &mut Tensor<f32, [?], Memory::HBM>, m : &WeightMatrix, x : &Tensor<f32, [?], Memory::HBM>, rows : i32, cols : i32) -> void {
+  if m.dtype == U4 {
+    nn_swiglu_q4(out, &m.codes, &m.group_scales, x, rows, cols);
+  } else if m.dtype == F8E4M3 {
+    nn_swiglu_fp8(out, &m.codes, &m.scales, x, rows, cols);
+  } else {
+    nn_swiglu(out, &m.bf16, x, rows, cols);
+  }
+  return;
+}
+
+/// The mixture of experts of a layer: the router chooses experts_per_token experts and their
+/// weights, and x gets the sum of their outputs for xn, each times its weight.
+fn add_experts(e : &mut Experts, x : &mut Tensor<f32, [?], Memory::HBM>, xn : &Tensor<f32, [?], Memory::HBM>, layer : &Layer, c : &Config) -> void {
+  let k = c.experts_per_token;
+  let inter = c.moe_intermediate_size;
+  nn_matvec(&mut e.router_logits, &layer.router, xn, c.num_experts, c.hidden_size);
+  nn_top_k(&mut e.ids, &mut e.weights, &e.router_logits, c.num_experts, k);
+  let gate_up = &layer.gate_up;
+  let down = &layer.down;
+  if gate_up.dtype == U4 {
+    moe_swiglu_q4_blocks(&mut e.mlp, &gate_up.codes, &gate_up.group_scales, &e.ids, xn, k, inter, c.hidden_size, c.num_experts);
+    moe_down_q4_add_blocks(x, &down.codes, &down.group_scales, &e.ids, &e.weights, &e.mlp, k, c.hidden_size, inter, c.num_experts);
+  } else {
+    assert(gate_up.dtype == BF16, "the experts of a mixture-of-experts model must be bf16 or Q4_0");
+    nn_moe_swiglu(&mut e.mlp, &gate_up.bf16, &e.ids, xn, k, inter, c.hidden_size, c.num_experts);
+    nn_moe_down_add(x, &down.bf16, &e.ids, &e.weights, &e.mlp, k, c.hidden_size, inter, c.num_experts);
+  }
+  return;
+}
+
+/// Runs the token in `token` at position `pos` through every layer. The hidden state of the
+/// token is then in `s.x`, and its keys and values are in the caches.
+fn run_layers(w : &Weights, s : &mut State, token : &Tensor<i32, [?], Memory::HBM>, pos : i32) -> void {
+  let c = &w.config;
+  let eps = c.rms_norm_eps as f32;
+  assert(pos >= 0 && pos < s.max_seq, "the position is past the end of the KV cache");
+  nn_embed(&mut s.x, &w.embed, token, c.hidden_size);
+  let mut l = 0;
+  for cache in s.caches.iter_mut() {
+    let layer = &w.layers[l];
+    nn_rms_norm(&mut s.xn, &s.x, &layer.attn_norm, c.hidden_size, eps);
+    qkv(&mut s.q, &mut s.k, &mut s.v, &layer.qkv, &layer.qkv_bias, &s.xn, c);
+    if c.qk_norm {
+      norm_rope_and_store(&mut s.q_turned, &mut cache.k, &mut cache.v, &s.q, &s.k, &s.v, &layer.q_norm, &layer.k_norm, &s.cos, &s.sin, pos, c.num_q_heads, c.num_kv_heads, c.head_dim, eps);
+    } else {
+      rope_and_store(&mut s.q_turned, &mut cache.k, &mut cache.v, &s.q, &s.k, &s.v, &s.cos, &s.sin, pos, c.num_q_heads, c.num_kv_heads, c.head_dim);
+    }
+    if c.head_dim == 128 {
+      vec_attention(&mut s.attended, &mut s.vec_parts, &s.q_turned, &cache.k, &cache.v, pos, c.num_q_heads, c.num_kv_heads, c.head_dim);
+    } else {
+      split_attention(&mut s.attended, &mut s.attention_parts, &s.q_turned, &cache.k, &cache.v, pos, c.num_q_heads, c.num_kv_heads, c.head_dim);
+    }
+    matvec_heads_add(&mut s.x, &layer.attn_out, &s.attended, c.hidden_size, c.num_q_heads, c.head_dim);
+    nn_rms_norm(&mut s.xn, &s.x, &layer.mlp_norm, c.hidden_size, eps);
+    if c.num_experts > 0 {
+      add_experts(&mut s.experts, &mut s.x, &s.xn, layer, c);
+    } else {
+      swiglu(&mut s.mlp, &layer.gate_up, &s.xn, c.intermediate_size, c.hidden_size);
+      matvec_add(&mut s.x, &layer.down, &s.mlp, c.hidden_size, c.intermediate_size);
+    }
+    l = l + 1;
+  }
+  return;
+}
+
+/// The logits of the token whose hidden state is in `s.x`, and in `next` the index of the largest
+/// one. Both stay in GPU memory.
+fn predict(w : &Weights, s : &mut State, next : &mut Tensor<i32, [?], Memory::HBM>) -> void {
+  let c = &w.config;
+  nn_rms_norm(&mut s.xn, &s.x, &w.final_norm, c.hidden_size, c.rms_norm_eps as f32);
+  if c.tied_embeddings {
+    nn_matvec(&mut s.logits, &w.embed, &s.xn, c.vocab_size, c.hidden_size);
+  } else {
+    matvec(&mut s.logits, &w.lm_head, &s.xn, c.vocab_size, c.hidden_size);
+  }
+  nn_argmax(next, &s.logits, c.vocab_size);
+  return;
+}
+//===- attention.vx - Qwen app ----------------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// The attention of one generated token, with the positions split among blocks. This is a copy of
+// `nn_attention` and its kernels from `std::nn` on Vx main (vx-lang/Vx#3216), with `split_` in place
+// of `nn_` in their names. Vx v0.0.4 has the older `nn_attention`, which has one block for each head
+// of Q, so its time grows with the number of positions. Remove this file, and call `nn_attention`
+// of `std::nn`, when a Vx release has the new one (#4).
+//
+// `vec_attention`, for head_dim 128, has the design of llama.cpp's flash attention for one token
+// (kernel_flash_attn_ext_vec and kernel_flash_attn_ext_vec_reduce), MIT License, Copyright (c) 2023-2026
+// The ggml authors. scripts/mlir_kernels/decode_attention.py writes its kernels: change that script, not
+// the MLIR.
+import core::num;
+import std::nn;
+
+/// Attention of the token at position `pos` over rows 0 to `pos` of the KV cache, with a softmax
+/// of the scores q . k / sqrt(head_dim). `part` is scratch space from `split_attention_scratch`.
+///
+/// The blocks of the first kernel split the positions, 32 to a block below position 640 and 64 from
+/// there on. A block serves the 8 heads of Q that share a head of K and V, so it reads each row of
+/// the cache once for all 8. A second kernel merges the parts of the blocks for each head.
+fn split_attention<M : Memory>(out : &mut Tensor<f32, [?, ?], Memory::M>, part : &mut Tensor<f32, [?, ?, ?, ?], Memory::M>, q : &Tensor<f32, [?, ?], Memory::M>, k_cache : &Tensor<f16, [?, ?, ?], Memory::M>, v_cache : &Tensor<f16, [?, ?, ?], Memory::M>, pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+  nn_check_heads(q.extent(0), q.extent(1), q_heads, head_dim);
+  nn_check_heads(out.extent(0), out.extent(1), q_heads, head_dim);
+  nn_check_cache(k_cache.extent(0), k_cache.extent(1), k_cache.extent(2), pos, kv_heads, head_dim);
+  nn_check_cache(v_cache.extent(0), v_cache.extent(1), v_cache.extent(2), pos, kv_heads, head_dim);
+  assert(q_heads % kv_heads == 0, "split_attention: q_heads must be a multiple of kv_heads");
+  assert(head_dim % 32 == 0 && head_dim <= 128, "split_attention: head_dim must be a multiple of 32, and at most 128");
+  let mut n_pos = 32;
+  if pos >= 640 {
+    n_pos = 64;
+  }
+  assert(part.extent(0) >= kv_heads * ((q_heads / kv_heads + 7) / 8) && part.extent(1) >= (pos + n_pos) / n_pos && part.extent(2) >= 8 && part.extent(3) >= head_dim + 2, "split_attention: `part` is too small for this position. Make it with split_attention_scratch");
+  if n_pos == 32 {
+    split_attention_parts_32(part, q, k_cache, v_cache, pos, q_heads, kv_heads, head_dim);
+  } else {
+    split_attention_parts_64(part, q, k_cache, v_cache, pos, q_heads, kv_heads, head_dim);
+  }
+  split_attention_merge(out, part, pos, n_pos, q_heads, kv_heads, head_dim);
+  return;
+}
+
+/// Attention of the token at position `pos`, as `split_attention`, for head_dim 128, with the kernels of
+/// llama.cpp's flash attention for one token. `vec_attention_parts` splits the blocks of 32 positions among
+/// `nwg` SIMD groups for each head of Q: 32 of them, or 64 when each of 32 would have more than 2 blocks.
+/// (llama.cpp goes on to 4 SIMD groups of 32 a block, but 128 parts are no faster here: their merge costs what
+/// they save.) `vec_attention_merge` then merges the parts. `part` is scratch space from
+/// `vec_attention_scratch`.
+fn vec_attention(out : &mut Tensor<f32, [?, ?], Memory::HBM>, part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+  nn_check_heads(q.extent(0), q.extent(1), q_heads, head_dim);
+  nn_check_heads(out.extent(0), out.extent(1), q_heads, head_dim);
+  nn_check_cache(k_cache.extent(0), k_cache.extent(1), k_cache.extent(2), pos, kv_heads, head_dim);
+  nn_check_cache(v_cache.extent(0), v_cache.extent(1), v_cache.extent(2), pos, kv_heads, head_dim);
+  assert(q_heads % kv_heads == 0 && head_dim == 128, "vec_attention: q_heads must be a multiple of kv_heads, and head_dim 128");
+  assert(part.extent(0) >= q_heads && part.extent(1) >= 128 && part.extent(2) == 132, "vec_attention: `part` is too small. Make it with vec_attention_scratch");
+  let mut nwg = 32;
+  if 2 * nwg * 32 < pos + 1 {
+    nwg = nwg * 2;
+  }
+  vec_attention_parts(part, q, k_cache, v_cache, pos, q_heads, q_heads / kv_heads, nwg, 1.0 / (head_dim as f32).sqrt());
+  vec_attention_merge(out, part, nwg, q_heads);
+  return;
+}
+
+/// The scratch space of `vec_attention`, on the CPU: up to 128 parts for each head of Q, each the sum of V
+/// (128 values), the largest score, and the sum of the weights. A part has 132 values, so that each starts
+/// at a multiple of 16 bytes.
+fn vec_attention_scratch(q_heads : i32) -> Tensor<f32, [?, ?, ?]> {
+  return Tensor<f32>([q_heads, 128, 132]);
+}
+
+/// The parts of `vec_attention`, as llama.cpp's kernel_flash_attn_ext_vec. Block (h, w) is a SIMD group for
+/// query head h. It does the blocks of 32 positions w, w + nwg, w + 2 nwg, ... up to `pos`, and writes
+/// part[h][w]. Lane l owns values 4 l to 4 l + 3 of the head, so that the 32 lanes read a row of K or V in
+/// one 256-byte load. For each row, the lanes add up their parts of q . k; then each lane keeps the score
+/// of one row, and the lanes take the weights of the rows from each other for the sum of V. A part is the
+/// sum of V, not divided, then the largest score and the sum of the weights.
+fn vec_attention_parts(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, pos : i32, q_heads : i32, group : i32, nwg : i32, scale : f32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..q_heads across blocks {
+      for w in 0..nwg across blocks {
+        let g = h / group;
+        let _d = mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
+          %c0 = arith.constant 0 : index
+          %c1 = arith.constant 1 : index
+          %c4 = arith.constant 4 : index
+          %c32 = arith.constant 32 : index
+          %c128 = arith.constant 128 : index
+          %c129 = arith.constant 129 : index
+          %c32i = arith.constant 32 : i32
+          %neg = arith.constant -3.0e38 : f32
+          %zero = arith.constant 0.0 : f32
+          %vz4 = arith.constant dense<0.0> : vector<4xf32>
+          %l = gpu.thread_id x
+          %l4 = arith.muli %l, %c4 : index
+          %hi = arith.index_cast %h : i32 to index
+          %wi = arith.index_cast %w : i32 to index
+          %gi = arith.index_cast %g : i32 to index
+          %posi = arith.index_cast %pos : i32 to index
+          %nwgi = arith.index_cast %nwg : i32 to index
+          %g128 = arith.muli %gi, %c128 : index
+          %kd = arith.addi %g128, %l4 : index
+          %P = memref.dim %k3, %c0 : memref<?x?x?xf16>
+          %KH = memref.dim %k3, %c1 : memref<?x?x?xf16>
+          %Wd = arith.muli %KH, %c128 : index
+          %k = memref.reinterpret_cast %k3 to offset: [0], sizes: [%P, %Wd], strides: [%Wd, 1] : memref<?x?x?xf16> to memref<?x?xf16, strided<[?, 1]>>
+          %v = memref.reinterpret_cast %v3 to offset: [0], sizes: [%P, %Wd], strides: [%Wd, 1] : memref<?x?x?xf16> to memref<?x?xf16, strided<[?, 1]>>
+          %qv = vector.load %q[%hi, %l4] {alignment = 16} : memref<?x?xf32>, vector<4xf32>
+          %scv = vector.broadcast %scale : f32 to vector<4xf32>
+          %qs = arith.mulf %qv, %scv : vector<4xf32>
+          %nkv = arith.addi %posi, %c32 : index
+          %chunks = arith.divui %nkv, %c32 : index
+          %st:3 = scf.for %ic = %wi to %chunks step %nwgi iter_args(%M = %neg, %S = %zero, %o = %vz4) -> (f32, f32, vector<4xf32>) {
+            %r0 = arith.muli %ic, %c32 : index
+            %my = scf.for %cc = %c0 to %c32 step %c1 iter_args(%m = %neg) -> (f32) {
+              %row = arith.addi %r0, %cc : index
+              %rowc = arith.minui %row, %posi : index
+              %kh = vector.load %k[%rowc, %kd] {alignment = 8} : memref<?x?xf16, strided<[?, 1]>>, vector<4xf16>
+              %kf = arith.extf %kh : vector<4xf16> to vector<4xf32>
+              %pr = arith.mulf %kf, %qs : vector<4xf32>
+              %pl = vector.reduction <add>, %pr : vector<4xf32> into f32
+              %sc = gpu.subgroup_reduce add %pl : (f32) -> f32
+              %live = arith.cmpi ule, %row, %posi : index
+              %scm = arith.select %live, %sc, %neg : f32
+              %mine = arith.cmpi eq, %cc, %l : index
+              %m2 = arith.select %mine, %scm, %m : f32
+              scf.yield %m2 : f32
+            }
+            %bm = gpu.subgroup_reduce maxnumf %my : (f32) -> f32
+            %Mn = arith.maxnumf %M, %bm : f32
+            %dm = arith.subf %M, %Mn : f32
+            %ms = math.exp %dm : f32
+            %dp = arith.subf %my, %Mn : f32
+            %p = math.exp %dp : f32
+            %bs = gpu.subgroup_reduce add %p : (f32) -> f32
+            %Ss = arith.mulf %S, %ms : f32
+            %Sn = arith.addf %Ss, %bs : f32
+            %msv = vector.broadcast %ms : f32 to vector<4xf32>
+            %o1 = arith.mulf %o, %msv : vector<4xf32>
+            %o2 = scf.for %cc = %c0 to %c32 step %c1 iter_args(%oa = %o1) -> (vector<4xf32>) {
+              %row = arith.addi %r0, %cc : index
+              %rowc = arith.minui %row, %posi : index
+              %vh = vector.load %v[%rowc, %kd] {alignment = 8} : memref<?x?xf16, strided<[?, 1]>>, vector<4xf16>
+              %vf = arith.extf %vh : vector<4xf16> to vector<4xf32>
+              %cci = arith.index_cast %cc : index to i32
+              %pc, %pv = gpu.shuffle idx %p, %cci, %c32i : f32
+              %pcv = vector.broadcast %pc : f32 to vector<4xf32>
+              %on = vector.fma %vf, %pcv, %oa : vector<4xf32>
+              scf.yield %on : vector<4xf32>
+            }
+            scf.yield %Mn, %Sn, %o2 : f32, f32, vector<4xf32>
+          }
+          vector.store %st#2, %part[%hi, %wi, %l4] : memref<?x?x?xf32>, vector<4xf32>
+          %lane0 = arith.cmpi eq, %l, %c0 : index
+          scf.if %lane0 {
+            memref.store %st#0, %part[%hi, %wi, %c128] : memref<?x?x?xf32>
+            memref.store %st#1, %part[%hi, %wi, %c129] : memref<?x?x?xf32>
+          }
+          macro.yield %h : i32
+        };
+      }
+    }
+  }
+  return;
+}
+
+/// Merges the first `parts` parts of `vec_attention_parts` for each head of Q, as llama.cpp's
+/// kernel_flash_attn_ext_vec_reduce. A block of 4 SIMD groups does one head: each lane weighs up to 4 parts,
+/// and the SIMD groups add them up for 4 values of the head at a time.
+fn vec_attention_merge(out : &mut Tensor<f32, [?, ?], Memory::HBM>, part : &Tensor<f32, [?, ?, ?], Memory::HBM>, parts : i32, q_heads : i32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..q_heads across blocks {
+      let _d = mlir!( threads : 128, inputs : (%out = out : memref<?x?xf32>, %part = part : memref<?x?x?xf32>, %parts = parts : i32, %h = h : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(part), writes_only(out[h])]) {
+        %c0 = arith.constant 0 : index
+        %c1 = arith.constant 1 : index
+        %c2 = arith.constant 2 : index
+        %c3 = arith.constant 3 : index
+        %c4 = arith.constant 4 : index
+        %c16 = arith.constant 16 : index
+        %c32 = arith.constant 32 : index
+        %c64 = arith.constant 64 : index
+        %c96 = arith.constant 96 : index
+        %c128 = arith.constant 128 : index
+        %c129 = arith.constant 129 : index
+        %neg = arith.constant -3.0e38 : f32
+        %zero = arith.constant 0.0 : f32
+        %one = arith.constant 1.0 : f32
+        %tid = gpu.thread_id x
+        %sg = arith.divui %tid, %c32 : index
+        %l = arith.remui %tid, %c32 : index
+        %hi = arith.index_cast %h : i32 to index
+        %np = arith.index_cast %parts : i32 to index
+        %last = arith.subi %np, %c1 : index
+        %p0 = arith.addi %l, %c0 : index
+        %live0 = arith.cmpi ult, %p0, %np : index
+        %pc0 = arith.minui %p0, %last : index
+        %mr0 = memref.load %part[%hi, %pc0, %c128] : memref<?x?x?xf32>
+        %m0 = arith.select %live0, %mr0, %neg : f32
+        %p1 = arith.addi %l, %c32 : index
+        %live1 = arith.cmpi ult, %p1, %np : index
+        %pc1 = arith.minui %p1, %last : index
+        %mr1 = memref.load %part[%hi, %pc1, %c128] : memref<?x?x?xf32>
+        %m1 = arith.select %live1, %mr1, %neg : f32
+        %p2 = arith.addi %l, %c64 : index
+        %live2 = arith.cmpi ult, %p2, %np : index
+        %pc2 = arith.minui %p2, %last : index
+        %mr2 = memref.load %part[%hi, %pc2, %c128] : memref<?x?x?xf32>
+        %m2 = arith.select %live2, %mr2, %neg : f32
+        %p3 = arith.addi %l, %c96 : index
+        %live3 = arith.cmpi ult, %p3, %np : index
+        %pc3 = arith.minui %p3, %last : index
+        %mr3 = memref.load %part[%hi, %pc3, %c128] : memref<?x?x?xf32>
+        %m3 = arith.select %live3, %mr3, %neg : f32
+        %m01 = arith.maxnumf %m0, %m1 : f32
+        %m23 = arith.maxnumf %m2, %m3 : f32
+        %mx = arith.maxnumf %m01, %m23 : f32
+        %big = gpu.subgroup_reduce maxnumf %mx : (f32) -> f32
+        %dm0 = arith.subf %m0, %big : f32
+        %w0 = math.exp %dm0 : f32
+        %s0 = memref.load %part[%hi, %pc0, %c129] : memref<?x?x?xf32>
+        %ws0 = arith.mulf %w0, %s0 : f32
+        %wv0 = vector.broadcast %w0 : f32 to vector<4xf32>
+        %dm1 = arith.subf %m1, %big : f32
+        %w1 = math.exp %dm1 : f32
+        %s1 = memref.load %part[%hi, %pc1, %c129] : memref<?x?x?xf32>
+        %ws1 = arith.mulf %w1, %s1 : f32
+        %wv1 = vector.broadcast %w1 : f32 to vector<4xf32>
+        %dm2 = arith.subf %m2, %big : f32
+        %w2 = math.exp %dm2 : f32
+        %s2 = memref.load %part[%hi, %pc2, %c129] : memref<?x?x?xf32>
+        %ws2 = arith.mulf %w2, %s2 : f32
+        %wv2 = vector.broadcast %w2 : f32 to vector<4xf32>
+        %dm3 = arith.subf %m3, %big : f32
+        %w3 = math.exp %dm3 : f32
+        %s3 = memref.load %part[%hi, %pc3, %c129] : memref<?x?x?xf32>
+        %ws3 = arith.mulf %w3, %s3 : f32
+        %wv3 = vector.broadcast %w3 : f32 to vector<4xf32>
+        %t01 = arith.addf %ws0, %ws1 : f32
+        %t23 = arith.addf %ws2, %ws3 : f32
+        %ts = arith.addf %t01, %t23 : f32
+        %total = gpu.subgroup_reduce add %ts : (f32) -> f32
+        %inv = arith.divf %one, %total : f32
+        %lane0 = arith.cmpi eq, %l, %c0 : index
+        %sg4 = arith.muli %sg, %c4 : index
+        %vz4 = arith.constant dense<0.0> : vector<4xf32>
+        scf.for %n = %c0 to %c128 step %c16 {
+          %d = arith.addi %n, %sg4 : index
+          %x0 = vector.load %part[%hi, %pc0, %d] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %a0 = vector.fma %x0, %wv0, %vz4 : vector<4xf32>
+          %x1 = vector.load %part[%hi, %pc1, %d] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %a1 = vector.fma %x1, %wv1, %a0 : vector<4xf32>
+          %x2 = vector.load %part[%hi, %pc2, %d] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %a2 = vector.fma %x2, %wv2, %a1 : vector<4xf32>
+          %x3 = vector.load %part[%hi, %pc3, %d] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %a3 = vector.fma %x3, %wv3, %a2 : vector<4xf32>
+          %e0 = vector.extract %a3[0] : f32 from vector<4xf32>
+          %r0 = gpu.subgroup_reduce add %e0 : (f32) -> f32
+          %o0 = arith.mulf %r0, %inv : f32
+          %e1 = vector.extract %a3[1] : f32 from vector<4xf32>
+          %r1 = gpu.subgroup_reduce add %e1 : (f32) -> f32
+          %o1 = arith.mulf %r1, %inv : f32
+          %e2 = vector.extract %a3[2] : f32 from vector<4xf32>
+          %r2 = gpu.subgroup_reduce add %e2 : (f32) -> f32
+          %o2 = arith.mulf %r2, %inv : f32
+          %e3 = vector.extract %a3[3] : f32 from vector<4xf32>
+          %r3 = gpu.subgroup_reduce add %e3 : (f32) -> f32
+          %o3 = arith.mulf %r3, %inv : f32
+          scf.if %lane0 {
+            %d0 = arith.addi %d, %c0 : index
+            memref.store %o0, %out[%hi, %d0] : memref<?x?xf32>
+            %d1 = arith.addi %d, %c1 : index
+            memref.store %o1, %out[%hi, %d1] : memref<?x?xf32>
+            %d2 = arith.addi %d, %c2 : index
+            memref.store %o2, %out[%hi, %d2] : memref<?x?xf32>
+            %d3 = arith.addi %d, %c3 : index
+            memref.store %o3, %out[%hi, %d3] : memref<?x?xf32>
+          }
+        }
+        macro.yield %h : i32
+      };
+    }
+  }
+  return;
+}
+
+/// The scratch space of `split_attention` for positions below `max_seq`, on the CPU. Transfer it to the
+/// memory of the other tensors. Each block of positions writes the weighted sum of V for each of its
+/// heads, then the largest score and the sum of the weights.
+fn split_attention_scratch(max_seq : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> Tensor<f32, [?, ?, ?, ?]> {
+  // 20 blocks of 32 positions below position 640, and blocks of 64 positions from there on.
+  let mut splits = (max_seq + 63) / 64;
+  if splits < 20 {
+    splits = 20;
+  }
+  return Tensor<f32>([kv_heads * ((q_heads / kv_heads + 7) / 8), splits, 8, head_dim + 2]);
+}
+
+/// The parts of `split_attention` for blocks of 32 positions: 4 SIMD groups of 2 heads of Q.
+fn split_attention_parts_32<M : Memory>(part : &mut Tensor<f32, [?, ?, ?, ?], Memory::M>, q : &Tensor<f32, [?, ?], Memory::M>, k_cache : &Tensor<f16, [?, ?, ?], Memory::M>, v_cache : &Tensor<f16, [?, ?, ?], Memory::M>, pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+  let group = q_heads / kv_heads;
+  let tiles = (group + 7) / 8;
+  let scale = 1.0 / (head_dim as f32).sqrt();
+  spawn on(Topology::Device) {
+    for gt in 0..kv_heads * tiles across blocks {
+      for c in 0..(pos + 32) / 32 across blocks {
+        let mut w = unsafe { Tensor<f32, [4, 2, 32], Memory::SMEM>::uninit() };
+        let mut top = unsafe {
+          Tensor<f32, [4, 2, 32], Memory::SMEM>::uninit()
+        };
+        let mut sums = unsafe {
+          Tensor<f32, [4, 2, 32], Memory::SMEM>::uninit()
+        };
+        let g = gt / tiles;
+        let base = g * group + (gt - g * tiles) * 8;
+        let left = group - (gt - g * tiles) * 8;
+        for s in 0..4 across subgroups {
+          let first = base + s * 2;
+          let mut heads = left - s * 2;
+          if heads > 2 {
+            heads = 2;
+          }
+          // A head past the last one of the group reads the last one again, and its sums go nowhere.
+          let mut h0 = first + 0;
+          if 0 >= heads {
+            h0 = first + heads - 1;
+          }
+          let mut h1 = first + 1;
+          if 1 >= heads {
+            h1 = first + heads - 1;
+          }
+          for l in 0..32 across lanes(32) {
+            // The scores of the position of the lane, for each head. A position past `pos` reads row
+            // `pos`, and its score is -3e38.
+            let mut t0 = c * 32 + 0 + l;
+            if t0 > pos {
+              t0 = pos;
+            }
+            let mut dot0_0 : f32 = 0.0;
+            let mut dot0_1 : f32 = 0.0;
+            for d in 0..head_dim {
+              let k0 = k_cache[t0][g][d] as f32;
+              let q0 = q[h0][d];
+              dot0_0 = dot0_0 + q0 * k0;
+              let q1 = q[h1][d];
+              dot0_1 = dot0_1 + q1 * k0;
+            }
+            let mut s0_0 : f32 = -3.0e38;
+            if c * 32 + 0 + l <= pos {
+              s0_0 = dot0_0 * scale;
+            }
+            w[s][0][0 + l] = s0_0;
+            top[s][0][l] = s0_0;
+            let mut s0_1 : f32 = -3.0e38;
+            if c * 32 + 0 + l <= pos {
+              s0_1 = dot0_1 * scale;
+            }
+            w[s][1][0 + l] = s0_1;
+            top[s][1][l] = s0_1;
+          }
+          let big0 = lanes::max(&top[s][0], 32);
+          let big1 = lanes::max(&top[s][1], 32);
+          // The weight of each position, as exp(score - the largest score of the block).
+          for l in 0..32 across lanes(32) {
+            let e0_0 = (w[s][0][0 + l] - big0).fast_exp();
+            w[s][0][0 + l] = e0_0;
+            sums[s][0][l] = e0_0;
+            let e0_1 = (w[s][1][0 + l] - big1).fast_exp();
+            w[s][1][0 + l] = e0_1;
+            sums[s][1][l] = e0_1;
+          }
+          let total0 = lanes::sum(&sums[s][0], 32);
+          let total1 = lanes::sum(&sums[s][1], 32);
+          // The weighted sum of the rows of V. Lane l takes values l, l + 32, l + 64 and l + 96.
+          for l in 0..32 across lanes(32) {
+            let mut acc0_0 : f32 = 0.0;
+            let mut acc0_1 : f32 = 0.0;
+            let mut acc0_2 : f32 = 0.0;
+            let mut acc0_3 : f32 = 0.0;
+            let mut acc1_0 : f32 = 0.0;
+            let mut acc1_1 : f32 = 0.0;
+            let mut acc1_2 : f32 = 0.0;
+            let mut acc1_3 : f32 = 0.0;
+            // With head_dim below 128, values past it read others again, and their sums go nowhere.
+            let d0 = (0 + l) % head_dim;
+            let d1 = (32 + l) % head_dim;
+            let d2 = (64 + l) % head_dim;
+            let d3 = (96 + l) % head_dim;
+            let mut last = pos - c * 32;
+            if last > 31 {
+              last = 31;
+            }
+            for t in 0..last + 1 {
+              let row = c * 32 + t;
+              let v0 = v_cache[row][g][d0] as f32;
+              let v1 = v_cache[row][g][d1] as f32;
+              let v2 = v_cache[row][g][d2] as f32;
+              let v3 = v_cache[row][g][d3] as f32;
+              let w0 = w[s][0][t];
+              acc0_0 = acc0_0 + w0 * v0;
+              acc0_1 = acc0_1 + w0 * v1;
+              acc0_2 = acc0_2 + w0 * v2;
+              acc0_3 = acc0_3 + w0 * v3;
+              let w1 = w[s][1][t];
+              acc1_0 = acc1_0 + w1 * v0;
+              acc1_1 = acc1_1 + w1 * v1;
+              acc1_2 = acc1_2 + w1 * v2;
+              acc1_3 = acc1_3 + w1 * v3;
+            }
+            if 0 < heads {
+              if 0 < head_dim {
+                part[gt][c][s * 2 + 0][0 + l] = acc0_0;
+              }
+              if 32 < head_dim {
+                part[gt][c][s * 2 + 0][32 + l] = acc0_1;
+              }
+              if 64 < head_dim {
+                part[gt][c][s * 2 + 0][64 + l] = acc0_2;
+              }
+              if 96 < head_dim {
+                part[gt][c][s * 2 + 0][96 + l] = acc0_3;
+              }
+            }
+            if 1 < heads {
+              if 0 < head_dim {
+                part[gt][c][s * 2 + 1][0 + l] = acc1_0;
+              }
+              if 32 < head_dim {
+                part[gt][c][s * 2 + 1][32 + l] = acc1_1;
+              }
+              if 64 < head_dim {
+                part[gt][c][s * 2 + 1][64 + l] = acc1_2;
+              }
+              if 96 < head_dim {
+                part[gt][c][s * 2 + 1][96 + l] = acc1_3;
+              }
+            }
+          }
+          if 0 < heads {
+            part[gt][c][s * 2 + 0][head_dim] = big0;
+            part[gt][c][s * 2 + 0][head_dim + 1] = total0;
+          }
+          if 1 < heads {
+            part[gt][c][s * 2 + 1][head_dim] = big1;
+            part[gt][c][s * 2 + 1][head_dim + 1] = total1;
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// The parts of `split_attention` for blocks of 64 positions: 2 SIMD groups of 4 heads of Q.
+fn split_attention_parts_64<M : Memory>(part : &mut Tensor<f32, [?, ?, ?, ?], Memory::M>, q : &Tensor<f32, [?, ?], Memory::M>, k_cache : &Tensor<f16, [?, ?, ?], Memory::M>, v_cache : &Tensor<f16, [?, ?, ?], Memory::M>, pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+  let group = q_heads / kv_heads;
+  let tiles = (group + 7) / 8;
+  let scale = 1.0 / (head_dim as f32).sqrt();
+  spawn on(Topology::Device) {
+    for gt in 0..kv_heads * tiles across blocks {
+      for c in 0..(pos + 64) / 64 across blocks {
+        let mut w = unsafe { Tensor<f32, [2, 4, 64], Memory::SMEM>::uninit() };
+        let mut top = unsafe {
+          Tensor<f32, [2, 4, 32], Memory::SMEM>::uninit()
+        };
+        let mut sums = unsafe {
+          Tensor<f32, [2, 4, 32], Memory::SMEM>::uninit()
+        };
+        let g = gt / tiles;
+        let base = g * group + (gt - g * tiles) * 8;
+        let left = group - (gt - g * tiles) * 8;
+        for s in 0..2 across subgroups {
+          let first = base + s * 4;
+          let mut heads = left - s * 4;
+          if heads > 4 {
+            heads = 4;
+          }
+          // A head past the last one of the group reads the last one again, and its sums go nowhere.
+          let mut h0 = first + 0;
+          if 0 >= heads {
+            h0 = first + heads - 1;
+          }
+          let mut h1 = first + 1;
+          if 1 >= heads {
+            h1 = first + heads - 1;
+          }
+          let mut h2 = first + 2;
+          if 2 >= heads {
+            h2 = first + heads - 1;
+          }
+          let mut h3 = first + 3;
+          if 3 >= heads {
+            h3 = first + heads - 1;
+          }
+          for l in 0..32 across lanes(32) {
+            // The scores of each of the 2 positions of the lane, for each head. A position past `pos` reads row
+            // `pos`, and its score is -3e38.
+            let mut t0 = c * 64 + 0 + l;
+            if t0 > pos {
+              t0 = pos;
+            }
+            let mut dot0_0 : f32 = 0.0;
+            let mut dot0_1 : f32 = 0.0;
+            let mut dot0_2 : f32 = 0.0;
+            let mut dot0_3 : f32 = 0.0;
+            let mut t1 = c * 64 + 32 + l;
+            if t1 > pos {
+              t1 = pos;
+            }
+            let mut dot1_0 : f32 = 0.0;
+            let mut dot1_1 : f32 = 0.0;
+            let mut dot1_2 : f32 = 0.0;
+            let mut dot1_3 : f32 = 0.0;
+            for d in 0..head_dim {
+              let k0 = k_cache[t0][g][d] as f32;
+              let k1 = k_cache[t1][g][d] as f32;
+              let q0 = q[h0][d];
+              dot0_0 = dot0_0 + q0 * k0;
+              dot1_0 = dot1_0 + q0 * k1;
+              let q1 = q[h1][d];
+              dot0_1 = dot0_1 + q1 * k0;
+              dot1_1 = dot1_1 + q1 * k1;
+              let q2 = q[h2][d];
+              dot0_2 = dot0_2 + q2 * k0;
+              dot1_2 = dot1_2 + q2 * k1;
+              let q3 = q[h3][d];
+              dot0_3 = dot0_3 + q3 * k0;
+              dot1_3 = dot1_3 + q3 * k1;
+            }
+            let mut s0_0 : f32 = -3.0e38;
+            if c * 64 + 0 + l <= pos {
+              s0_0 = dot0_0 * scale;
+            }
+            w[s][0][0 + l] = s0_0;
+            let mut s1_0 : f32 = -3.0e38;
+            if c * 64 + 32 + l <= pos {
+              s1_0 = dot1_0 * scale;
+            }
+            w[s][0][32 + l] = s1_0;
+            top[s][0][l] = s0_0.max(s1_0);
+            let mut s0_1 : f32 = -3.0e38;
+            if c * 64 + 0 + l <= pos {
+              s0_1 = dot0_1 * scale;
+            }
+            w[s][1][0 + l] = s0_1;
+            let mut s1_1 : f32 = -3.0e38;
+            if c * 64 + 32 + l <= pos {
+              s1_1 = dot1_1 * scale;
+            }
+            w[s][1][32 + l] = s1_1;
+            top[s][1][l] = s0_1.max(s1_1);
+            let mut s0_2 : f32 = -3.0e38;
+            if c * 64 + 0 + l <= pos {
+              s0_2 = dot0_2 * scale;
+            }
+            w[s][2][0 + l] = s0_2;
+            let mut s1_2 : f32 = -3.0e38;
+            if c * 64 + 32 + l <= pos {
+              s1_2 = dot1_2 * scale;
+            }
+            w[s][2][32 + l] = s1_2;
+            top[s][2][l] = s0_2.max(s1_2);
+            let mut s0_3 : f32 = -3.0e38;
+            if c * 64 + 0 + l <= pos {
+              s0_3 = dot0_3 * scale;
+            }
+            w[s][3][0 + l] = s0_3;
+            let mut s1_3 : f32 = -3.0e38;
+            if c * 64 + 32 + l <= pos {
+              s1_3 = dot1_3 * scale;
+            }
+            w[s][3][32 + l] = s1_3;
+            top[s][3][l] = s0_3.max(s1_3);
+          }
+          let big0 = lanes::max(&top[s][0], 32);
+          let big1 = lanes::max(&top[s][1], 32);
+          let big2 = lanes::max(&top[s][2], 32);
+          let big3 = lanes::max(&top[s][3], 32);
+          // The weight of each position, as exp(score - the largest score of the block).
+          for l in 0..32 across lanes(32) {
+            let e0_0 = (w[s][0][0 + l] - big0).fast_exp();
+            w[s][0][0 + l] = e0_0;
+            let e1_0 = (w[s][0][32 + l] - big0).fast_exp();
+            w[s][0][32 + l] = e1_0;
+            sums[s][0][l] = e0_0 + e1_0;
+            let e0_1 = (w[s][1][0 + l] - big1).fast_exp();
+            w[s][1][0 + l] = e0_1;
+            let e1_1 = (w[s][1][32 + l] - big1).fast_exp();
+            w[s][1][32 + l] = e1_1;
+            sums[s][1][l] = e0_1 + e1_1;
+            let e0_2 = (w[s][2][0 + l] - big2).fast_exp();
+            w[s][2][0 + l] = e0_2;
+            let e1_2 = (w[s][2][32 + l] - big2).fast_exp();
+            w[s][2][32 + l] = e1_2;
+            sums[s][2][l] = e0_2 + e1_2;
+            let e0_3 = (w[s][3][0 + l] - big3).fast_exp();
+            w[s][3][0 + l] = e0_3;
+            let e1_3 = (w[s][3][32 + l] - big3).fast_exp();
+            w[s][3][32 + l] = e1_3;
+            sums[s][3][l] = e0_3 + e1_3;
+          }
+          let total0 = lanes::sum(&sums[s][0], 32);
+          let total1 = lanes::sum(&sums[s][1], 32);
+          let total2 = lanes::sum(&sums[s][2], 32);
+          let total3 = lanes::sum(&sums[s][3], 32);
+          // The weighted sum of the rows of V. Lane l takes values l, l + 32, l + 64 and l + 96.
+          for l in 0..32 across lanes(32) {
+            let mut acc0_0 : f32 = 0.0;
+            let mut acc0_1 : f32 = 0.0;
+            let mut acc0_2 : f32 = 0.0;
+            let mut acc0_3 : f32 = 0.0;
+            let mut acc1_0 : f32 = 0.0;
+            let mut acc1_1 : f32 = 0.0;
+            let mut acc1_2 : f32 = 0.0;
+            let mut acc1_3 : f32 = 0.0;
+            let mut acc2_0 : f32 = 0.0;
+            let mut acc2_1 : f32 = 0.0;
+            let mut acc2_2 : f32 = 0.0;
+            let mut acc2_3 : f32 = 0.0;
+            let mut acc3_0 : f32 = 0.0;
+            let mut acc3_1 : f32 = 0.0;
+            let mut acc3_2 : f32 = 0.0;
+            let mut acc3_3 : f32 = 0.0;
+            // With head_dim below 128, values past it read others again, and their sums go nowhere.
+            let d0 = (0 + l) % head_dim;
+            let d1 = (32 + l) % head_dim;
+            let d2 = (64 + l) % head_dim;
+            let d3 = (96 + l) % head_dim;
+            let mut last = pos - c * 64;
+            if last > 63 {
+              last = 63;
+            }
+            for t in 0..last + 1 {
+              let row = c * 64 + t;
+              let v0 = v_cache[row][g][d0] as f32;
+              let v1 = v_cache[row][g][d1] as f32;
+              let v2 = v_cache[row][g][d2] as f32;
+              let v3 = v_cache[row][g][d3] as f32;
+              let w0 = w[s][0][t];
+              acc0_0 = acc0_0 + w0 * v0;
+              acc0_1 = acc0_1 + w0 * v1;
+              acc0_2 = acc0_2 + w0 * v2;
+              acc0_3 = acc0_3 + w0 * v3;
+              let w1 = w[s][1][t];
+              acc1_0 = acc1_0 + w1 * v0;
+              acc1_1 = acc1_1 + w1 * v1;
+              acc1_2 = acc1_2 + w1 * v2;
+              acc1_3 = acc1_3 + w1 * v3;
+              let w2 = w[s][2][t];
+              acc2_0 = acc2_0 + w2 * v0;
+              acc2_1 = acc2_1 + w2 * v1;
+              acc2_2 = acc2_2 + w2 * v2;
+              acc2_3 = acc2_3 + w2 * v3;
+              let w3 = w[s][3][t];
+              acc3_0 = acc3_0 + w3 * v0;
+              acc3_1 = acc3_1 + w3 * v1;
+              acc3_2 = acc3_2 + w3 * v2;
+              acc3_3 = acc3_3 + w3 * v3
