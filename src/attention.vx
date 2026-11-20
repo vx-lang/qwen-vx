@@ -106,26 +106,6 @@ ensures writes_only()
   };
 }
 
-/// q0 t[row][g][d] + q1 t[row][g][d + 1] + q2 t[row][g][d + 2] + q3 t[row][g][d + 3], with the 4 halves in
-/// one 8-byte load. d is a multiple of 4.
-fn dot4(t : &Tensor<f16, [?, ?, ?], Memory::HBM>, row : i32, g : i32, d : i32, q0 : f32, q1 : f32, q2 : f32, q3 : f32) on Topology::Device -> f32
-ensures reads_only(t)
-{
-  return mlir!( inputs : (%t = t : memref<?x?x?xf16>, %row = row : i32, %g = g : i32, %d = d : i32, %q0 = q0 : f32, %q1 = q1 : f32, %q2 = q2 : f32, %q3 = q3 : f32), returns : f32, dialects : ["arith", "vector"], ensures : [reads_only(t)]) {
-    %r = arith.index_cast %row : i32 to index
-    %gi = arith.index_cast %g : i32 to index
-    %di = arith.index_cast %d : i32 to index
-    %h = vector.load %t[%r, %gi, %di] {
-      alignment = 8
-    } : memref<?x?x?xf16>, vector<4xf16>
-    %f = arith.extf %h : vector<4xf16> to vector<4xf32>
-    %q = vector.from_elements %q0, %q1, %q2, %q3 : vector<4xf32>
-    %p = arith.mulf %f, %q : vector<4xf32>
-    %s = vector.reduction <add>, %p : vector<4xf32> into f32
-    macro.yield %s : f32
-  };
-}
-
 /// t[row][g][d + j] for j 0 to 3, from one 8-byte load of the 4 halves at d, a multiple of 4. The compiler
 /// merges the loads of the 4 calls for one d into one.
 fn half_at(t : &Tensor<f16, [?, ?, ?], Memory::HBM>, row : i32, g : i32, d : i32, j : i32) on Topology::Device -> f32
@@ -192,7 +172,11 @@ fn vec_attention_parts(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Ten
                 if row > pos {
                   kept = pos;
                 }
-                let mut score = lane_sum(dot4(k_cache, kept, g, d, q0, q1, q2, q3));
+                let k0 = half_at(k_cache, kept, g, d, 0);
+                let k1 = half_at(k_cache, kept, g, d, 1);
+                let k2 = half_at(k_cache, kept, g, d, 2);
+                let k3 = half_at(k_cache, kept, g, d, 3);
+                let mut score = lane_sum(k0 * q0 + k1 * q1 + k2 * q2 + k3 * q3);
                 if row > pos {
                   score = -3.0e38;
                 }
