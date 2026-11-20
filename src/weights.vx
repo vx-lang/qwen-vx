@@ -24,7 +24,11 @@ extern {
 
 /// The bytes "VXQWEN01" at the start of the file, read as one little-endian i64.
 const MAGIC : i64 = 3544418966465239126;
-const VERSION : i64 = 1;
+// Version 1 has room for 16 config integers, and version 2, which arch 1 uses, for 32.
+const VERSION_1 : i64 = 1;
+const VERSION_2 : i64 = 2;
+// Qwen3.5 MoE, which Qwen3.6 also uses. arch 0 is Qwen2 and Qwen3 MoE.
+const ARCH_QWEN35 : i32 = 1;
 const ENTRY_WORDS : i64 = 16;
 const F32 : i64 = 0;
 const BF16 : i64 = 1;
@@ -66,6 +70,19 @@ struct Config {
   moe_intermediate_size : i32,
   // Whether an RMSNorm over each head of Q and of K comes before RoPE.
   qk_norm : bool,
+  // The fields from here to rotary_dim are in a version 2 file only, and 0 in a version 1 file.
+  arch : i32,
+  // In arch 1, layer l has full attention when (l + 1) % full_attention_interval is 0, and a
+  // Gated DeltaNet otherwise.
+  full_attention_interval : i32,
+  linear_k_heads : i32,
+  linear_v_heads : i32,
+  linear_k_dim : i32,
+  linear_v_dim : i32,
+  conv_width : i32,
+  shared_expert_inter : i32,
+  // RoPE turns the first rotary_dim values of each head: head_dim in a version 1 file.
+  rotary_dim : i32,
   rope_theta : f64,
   rms_norm_eps : f64,
 }
@@ -118,6 +135,46 @@ struct Weights {
   lm_head : WeightMatrix,
 }
 
+/// The weights of one layer of an arch 1 model (Qwen3.5 MoE), in GPU memory. Each norm except
+/// `linear_norm` holds 1 + w as f32, so that a plain RMSNorm multiplies by it. A layer with full
+/// attention fills the fields up to `attn_out`, and a Gated DeltaNet layer the fields from
+/// `linear_in` to `linear_out`. The other ones hold one row of zeros.
+struct Qwen35Layer {
+  full_attention : bool,
+  attn_norm : Tensor<f32, [?], Memory::HBM>,
+  // The rows of q, k and v, then the rows of the gate of each query head.
+  qkv : WeightMatrix,
+  q_norm : Tensor<f32, [?], Memory::HBM>,
+  k_norm : Tensor<f32, [?], Memory::HBM>,
+  attn_out : WeightMatrix,
+  // The rows of q, k, v, z, b and a.
+  linear_in : WeightMatrix,
+  // The causal convolution of q, k and v: channel c at c * conv_width, and its last value
+  // multiplies the current token.
+  conv : Tensor<f32, [?], Memory::HBM>,
+  neg_a : Tensor<f32, [?], Memory::HBM>,
+  dt_bias : Tensor<f32, [?], Memory::HBM>,
+  // The RMSNorm of each head of the output. It holds w, not 1 + w.
+  linear_norm : Tensor<f32, [?], Memory::HBM>,
+  linear_out : WeightMatrix,
+  mlp_norm : Tensor<f32, [?], Memory::HBM>,
+  // One row for each expert, then the gate of the shared expert.
+  router : Tensor<bf16, [?], Memory::HBM>,
+  gate_up : WeightMatrix,
+  down : WeightMatrix,
+  shared_gate_up : WeightMatrix,
+  shared_down : WeightMatrix,
+}
+
+/// All the weights of an arch 1 model, in GPU memory.
+struct Qwen35Weights {
+  config : Config,
+  embed : Tensor<bf16, [?], Memory::HBM>,
+  layers : Vec<Qwen35Layer>,
+  final_norm : Tensor<f32, [?], Memory::HBM>,
+  lm_head : WeightMatrix,
+}
+
 /// A weight file mapped into memory, and the position of the next tensor to load.
 struct Reader {
   base : *mut i8,
@@ -125,6 +182,8 @@ struct Reader {
   table : i64,
   count : i64,
   next : i64,
+  fd : i32,
+  version : i64,
 }
 
 /// The i64 word at `index` of the file.
@@ -209,7 +268,8 @@ fn load_f16(r : &mut Reader, kind : *const i8, rows : i32, cols : i32) -> Tensor
   return transfer(&view, Memory::HBM);
 }
 
-/// Puts the next tensor, of f32 values, in GPU memory.
+/// Puts the next tensor, of f32 values, in GPU memory: scales, or a norm or other small tensor
+/// of arch 1.
 fn load_scales(r : &mut Reader, kind : *const i8, rows : i32, cols : i32) -> Tensor<f32, [?], Memory::HBM> {
   let offset = next_tensor(r, kind, F32, 32, rows, cols);
   let count = values(rows, cols);
@@ -292,8 +352,8 @@ fn map_failed(p : *mut i8) -> bool {
   return eq(p as *const i8, failed as *const i8);
 }
 
-/// Loads the weight file at `path` into GPU memory.
-fn load_weights(path : *const i8) -> Weights {
+/// Maps the weight file at `path` into memory, and checks its magic word and version.
+fn open_weight_file(path : *const i8) -> Reader {
   let fd : i32 = unsafe { open(path, 0) };
   assert(fd >= 0, "cannot open the weight file");
   let size : i64 = unsafe { lseek(fd, 0, 2) };
@@ -301,36 +361,208 @@ fn load_weights(path : *const i8) -> Weights {
   let base : *mut i8 = unsafe { mmap(0 as *mut i8, size, 1, 1, fd, 0) };
   assert(!map_failed(base), "cannot map the weight file into memory");
   let mut r = Reader {
-    base: base, size: size, table: 0, count: 0, next: 0
+    base: base, size: size, table: 0, count: 0, next: 0, fd: fd, version: 0
   };
   assert(size >= 4096 && word(&r, 0) == MAGIC, "this is not a weight file of the Qwen app");
-  assert(word(&r, 1) == VERSION, "the weight file has another format version");
+  r.version = word(&r, 1);
+  assert(r.version == VERSION_1 || r.version == VERSION_2, "the weight file has another format version");
   r.count = word(&r, 2);
   r.table = word(&r, 4);
+  return r;
+}
 
-  let floats : *mut f64 = base;
+/// Unmaps the weight file. The tensors in GPU memory stay.
+fn close_weight_file(r : &Reader) -> void {
+  unsafe { munmap(r.base, r.size); close(r.fd); }
+  return;
+}
+
+/// Config integer `index` of a version 2 file, or `otherwise` in a version 1 file, which has no
+/// room for it.
+fn v2_int(r : &Reader, index : i64, otherwise : i32) -> i32 {
+  if r.version == VERSION_1 {
+    return otherwise;
+  }
+  return word(r, 5 + index) as i32;
+}
+
+/// The config in the header of the weight file.
+fn read_config(r : &Reader) -> Config {
+  let floats : *mut f64 = r.base;
+  // Words 5 and up hold the config integers, and the two f64 values follow the room for them.
+  let floats_at : i64 = if r.version == VERSION_1 {
+    5 + 16
+  } else {
+    5 + 32
+  };
+  let head_dim = word(r, 10) as i32;
   let config = Config {
-    hidden_size: word(&r, 5) as i32,
-    intermediate_size: word(&r, 6) as i32,
-    num_layers: word(&r, 7) as i32,
-    num_q_heads: word(&r, 8) as i32,
-    num_kv_heads: word(&r, 9) as i32,
-    head_dim: word(&r, 10) as i32,
-    vocab_size: word(&r, 11) as i32,
-    max_positions: word(&r, 12) as i32,
-    tied_embeddings: word(&r, 13) != 0,
-    qkv_bias: word(&r, 14) != 0,
-    eos_token_id: word(&r, 15) as i32,
-    weight_format: word(&r, 16) as i32,
-    num_experts: word(&r, 17) as i32,
-    experts_per_token: word(&r, 18) as i32,
-    moe_intermediate_size: word(&r, 19) as i32,
-    qk_norm: word(&r, 20) != 0,
-    rope_theta: unsafe { floats[21] },
-    rms_norm_eps: unsafe { floats[22] },
+    hidden_size: word(r, 5) as i32,
+    intermediate_size: word(r, 6) as i32,
+    num_layers: word(r, 7) as i32,
+    num_q_heads: word(r, 8) as i32,
+    num_kv_heads: word(r, 9) as i32,
+    head_dim: head_dim,
+    vocab_size: word(r, 11) as i32,
+    max_positions: word(r, 12) as i32,
+    tied_embeddings: word(r, 13) != 0,
+    qkv_bias: word(r, 14) != 0,
+    eos_token_id: word(r, 15) as i32,
+    weight_format: word(r, 16) as i32,
+    num_experts: word(r, 17) as i32,
+    experts_per_token: word(r, 18) as i32,
+    moe_intermediate_size: word(r, 19) as i32,
+    qk_norm: word(r, 20) != 0,
+    arch: v2_int(r, 16, 0),
+    full_attention_interval: v2_int(r, 17, 0),
+    linear_k_heads: v2_int(r, 18, 0),
+    linear_v_heads: v2_int(r, 19, 0),
+    linear_k_dim: v2_int(r, 20, 0),
+    linear_v_dim: v2_int(r, 21, 0),
+    conv_width: v2_int(r, 22, 0),
+    shared_expert_inter: v2_int(r, 24, 0),
+    rotary_dim: v2_int(r, 23, head_dim),
+    rope_theta: unsafe { floats[floats_at] },
+    rms_norm_eps: unsafe { floats[floats_at + 1] },
   };
   assert(config.weight_format >= FORMAT_BF16 && config.weight_format <= FORMAT_Q4_0_Q6, "the weight file has an unknown weight format");
   assert(config.num_experts == 0 || (config.experts_per_token > 0 && config.experts_per_token <= config.num_experts), "a model must use between 1 and all of its experts for each token");
+  assert((r.version == VERSION_2) == (config.arch == ARCH_QWEN35), "an arch 1 model needs a version 2 file, and only it");
+  return config;
+}
+
+/// The arch of the model in the weight file at `path`: 0 for `load_weights`, and 1 for
+/// `load_qwen35_weights`. It reads only the header.
+fn weight_file_arch(path : *const i8) -> i32 {
+  let r = open_weight_file(path);
+  let arch = read_config(&r).arch;
+  close_weight_file(&r);
+  return arch;
+}
+
+/// A weight matrix that a layer does not have: one row of bf16 zeros.
+fn empty_matrix() -> WeightMatrix {
+  return WeightMatrix {
+    dtype: BF16, bf16: zeros(8), codes: zero_words(8), high: zero_words(8), scales: zero_scales(8), group_scales: zero_f16(8)
+  };
+}
+
+/// Loads the weight file at `path`, of an arch 1 model, into GPU memory.
+fn load_qwen35_weights(path : *const i8) -> Qwen35Weights {
+  let mut r = open_weight_file(path);
+  let config = read_config(&r);
+  assert(config.arch == ARCH_QWEN35, "this weight file is not of a Qwen3.5 MoE model; use load_weights");
+  assert(config.full_attention_interval > 0 && config.num_experts > 0 && config.shared_expert_inter > 0, "a Qwen3.5 MoE model has full attention layers, experts and a shared expert");
+  assert(config.linear_k_heads > 0 && config.linear_v_heads % config.linear_k_heads == 0, "each key head of a Gated DeltaNet must serve the same number of value heads");
+  assert(!config.tied_embeddings, "a Qwen3.5 MoE weight file has its own lm_head");
+  let hidden = config.hidden_size;
+  let head_dim = config.head_dim;
+  let heads = config.num_q_heads;
+  let k_total = config.linear_k_heads * config.linear_k_dim;
+  let v_heads = config.linear_v_heads;
+  let v_total = v_heads * config.linear_v_dim;
+  let experts = config.num_experts;
+  let moe_inter = config.moe_intermediate_size;
+  let shared = config.shared_expert_inter;
+  let dtype = matrix_dtype(config.weight_format, false);
+  let embed = load_next(&mut r, "embed", config.vocab_size, hidden);
+  let mut layers = Vec<Qwen35Layer>::new();
+  for l in 0..config.num_layers {
+    // The tensors come in file order: those of the attention or the Gated DeltaNet, then those
+    // of the experts.
+    let full = (l + 1) % config.full_attention_interval == 0;
+    let attn_norm = load_scales(&mut r, ".attn_norm", hidden, 0);
+    let qkv = if full {
+      load_matrix(&mut r, dtype, ".qkv", ".qkv.scale", 2 * heads * head_dim + 2 * config.num_kv_heads * head_dim, hidden)
+    } else {
+      empty_matrix()
+    };
+    let q_norm = if full {
+      load_scales(&mut r, ".q_norm", head_dim, 0)
+    } else {
+      zero_scales(8)
+    };
+    let k_norm = if full {
+      load_scales(&mut r, ".k_norm", head_dim, 0)
+    } else {
+      zero_scales(8)
+    };
+    let attn_out = if full {
+      load_matrix(&mut r, dtype, ".attn_out", ".attn_out.scale", hidden, heads * head_dim)
+    } else {
+      empty_matrix()
+    };
+    let linear_in = if full {
+      empty_matrix()
+    } else {
+      load_matrix(&mut r, dtype, ".linear_in", ".linear_in.scale", 2 * k_total + 2 * v_total + 2 * v_heads, hidden)
+    };
+    let conv = if full {
+      zero_scales(8)
+    } else {
+      load_scales(&mut r, ".conv", 2 * k_total + v_total, config.conv_width)
+    };
+    let neg_a = if full {
+      zero_scales(8)
+    } else {
+      load_scales(&mut r, ".neg_A", v_heads, 0)
+    };
+    let dt_bias = if full {
+      zero_scales(8)
+    } else {
+      load_scales(&mut r, ".dt_bias", v_heads, 0)
+    };
+    let linear_norm = if full {
+      zero_scales(8)
+    } else {
+      load_scales(&mut r, ".linear_norm", config.linear_v_dim, 0)
+    };
+    let linear_out = if full {
+      empty_matrix()
+    } else {
+      load_matrix(&mut r, dtype, ".linear_out", ".linear_out.scale", hidden, v_total)
+    };
+    let mlp_norm = load_scales(&mut r, ".mlp_norm", hidden, 0);
+    let router = load_next(&mut r, ".router", experts + 1, hidden);
+    let gate_up = load_matrix(&mut r, dtype, ".experts_gate_up", ".experts_gate_up.scale", experts * 2 * moe_inter, hidden);
+    let down = load_matrix(&mut r, dtype, ".experts_down", ".experts_down.scale", experts * hidden, moe_inter);
+    let shared_gate_up = load_matrix(&mut r, dtype, ".shared_gate_up", ".shared_gate_up.scale", 2 * shared, hidden);
+    let shared_down = load_matrix(&mut r, dtype, ".shared_down", ".shared_down.scale", hidden, shared);
+    layers.push(Qwen35Layer {
+      full_attention: full,
+      attn_norm: attn_norm,
+      qkv: qkv,
+      q_norm: q_norm,
+      k_norm: k_norm,
+      attn_out: attn_out,
+      linear_in: linear_in,
+      conv: conv,
+      neg_a: neg_a,
+      dt_bias: dt_bias,
+      linear_norm: linear_norm,
+      linear_out: linear_out,
+      mlp_norm: mlp_norm,
+      router: router,
+      gate_up: gate_up,
+      down: down,
+      shared_gate_up: shared_gate_up,
+      shared_down: shared_down,
+    });
+  }
+  let final_norm = load_scales(&mut r, "final_norm", hidden, 0);
+  let lm_head = load_matrix(&mut r, matrix_dtype(config.weight_format, true), "lm_head", "lm_head.scale", config.vocab_size, hidden);
+  assert(r.next == r.count, "the weight file has more tensors than the config needs");
+  close_weight_file(&r);
+  return Qwen35Weights {
+    config: config, embed: embed, layers: layers, final_norm: final_norm, lm_head: lm_head
+  };
+}
+
+/// Loads the weight file at `path`, of an arch 0 model, into GPU memory.
+fn load_weights(path : *const i8) -> Weights {
+  let mut r = open_weight_file(path);
+  let config = read_config(&r);
+  assert(config.arch == 0, "this weight file is of a Qwen3.5 MoE model; use load_qwen35_weights");
 
   let hidden = config.hidden_size;
   let q_rows = config.num_q_heads * config.head_dim;
@@ -392,14 +624,12 @@ fn load_weights(path : *const i8) -> Weights {
   let final_norm = load_next(&mut r, "final_norm", hidden, 0);
   assert(config.weight_format == FORMAT_BF16 || !config.tied_embeddings, "an fp8 or Q4_0 weight file must have its own lm_head");
   let lm_head = if config.tied_embeddings {
-    WeightMatrix {
-      dtype: BF16, bf16: zeros(8), codes: zero_words(8), high: zero_words(8), scales: zero_scales(8), group_scales: zero_f16(8)
-    }
+    empty_matrix()
   } else {
     load_matrix(&mut r, matrix_dtype(config.weight_format, true), "lm_head", "lm_head.scale", config.vocab_size, hidden)
   };
   assert(r.next == r.count, "the weight file has more tensors than the config needs");
-  unsafe { munmap(base, size); close(fd); }
+  close_weight_file(&r);
   return Weights {
     config: config, embed: embed, layers: layers, final_norm: final_norm, lm_head: lm_head
   };
