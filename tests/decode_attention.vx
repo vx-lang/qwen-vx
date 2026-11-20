@@ -1,0 +1,106 @@
+//===- decode_attention.vx - Qwen app ---------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// `vec_attention` against an attention in f64 on the CPU, on random values with the shapes of
+// Qwen3-30B-A3B: 32 heads of Q, 4 of K and V, and head_dim 128. Each value must be within 1e-5 of
+// 1 + |value|. The positions give 1 row, 2 blocks of 32 rows, 1 block for each of 32 parts, and 64
+// parts with 1 to 4 blocks each. The cache has 31 more rows than the position: K is 8 there, and V is
+// NaN, so a row after the position that counts, or a read of it, changes the result.
+//
+// RUN: vxc %s --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx | FileCheck %s
+//
+// CHECK: {{^}}attention pos 0: 0 off{{$}}
+// CHECK: {{^}}attention pos 40: 0 off{{$}}
+// CHECK: {{^}}attention pos 1000: 0 off{{$}}
+// CHECK: {{^}}attention pos 2100: 0 off{{$}}
+// CHECK: {{^}}attention pos 8000: 0 off{{$}}
+import core::num;
+import qwen::attention;
+
+const Q_HEADS : i32 = 32;
+const KV_HEADS : i32 = 4;
+
+/// A number in [-1, 1) from the state `s` of a linear congruential generator.
+fn random(s : &mut i64) -> f32 {
+  *s = (*s * 1103515245 + 12345) % 2147483648;
+  return (*s as f32) / 1073741824.0 - 1.0;
+}
+
+fn check(s : &mut i64, pos : i32) -> void {
+  let rows = pos + 32;
+  let mut qh = Tensor<f32>([Q_HEADS, 128]);
+  let mut kh = Tensor<f16>([rows, KV_HEADS, 128]);
+  let mut vh = Tensor<f16>([rows, KV_HEADS, 128]);
+  for h in 0..Q_HEADS {
+    for d in 0..128 {
+      qh[h][d] = 4.0 * random(s);
+    }
+  }
+  for r in 0..rows {
+    for g in 0..KV_HEADS {
+      for d in 0..128 {
+        if r <= pos {
+          kh[r][g][d] = random(s) as f16;
+          vh[r][g][d] = random(s) as f16;
+        } else {
+          kh[r][g][d] = 8.0 as f16;
+          vh[r][g][d] = f16::nan();
+        }
+      }
+    }
+  }
+  let q = transfer(&qh, Memory::HBM);
+  let k = transfer(&kh, Memory::HBM);
+  let v = transfer(&vh, Memory::HBM);
+  let mut part = transfer(vec_attention_scratch(Q_HEADS), Memory::HBM);
+  let mut out = transfer(Tensor<f32>([Q_HEADS, 128]), Memory::HBM);
+  vec_attention(&mut out, &mut part, &q, &k, &v, pos, Q_HEADS, KV_HEADS, 128);
+  let got = transfer(&out, Memory::CPU_DRAM);
+  let scale = 1.0 / (128.0 as f64).sqrt();
+  let mut score = Tensor<f64>([pos + 1]);
+  let mut off = 0;
+  for h in 0..Q_HEADS {
+    let g = h / (Q_HEADS / KV_HEADS);
+    let mut big : f64 = -1.0e300;
+    for r in 0..pos + 1 {
+      let mut dot : f64 = 0.0;
+      for d in 0..128 {
+        dot = dot + (qh[h][d] as f64) * (kh[r][g][d] as f64);
+      }
+      score[r] = dot * scale;
+      big = big.max(score[r]);
+    }
+    let mut total : f64 = 0.0;
+    for r in 0..pos + 1 {
+      score[r] = (score[r] - big).exp();
+      total = total + score[r];
+    }
+    for d in 0..128 {
+      let mut acc : f64 = 0.0;
+      for r in 0..pos + 1 {
+        acc = acc + score[r] * (vh[r][g][d] as f64);
+      }
+      let want = acc / total;
+      // Written so that a NaN counts as off.
+      if !(((got[h][d] as f64) - want).abs() <= 1.0e-5 * (1.0 + want.abs())) {
+        off = off + 1;
+      }
+    }
+  }
+  println!("attention pos {}: {} off", pos, off);
+  return;
+}
+
+fn main() -> i32 {
+  let mut s : i64 = 11;
+  check(&mut s, 0);
+  check(&mut s, 40);
+  check(&mut s, 1000);
+  check(&mut s, 2100);
+  check(&mut s, 8000);
+  return 0;
+}
