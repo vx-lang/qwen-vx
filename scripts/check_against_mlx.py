@@ -3,11 +3,13 @@
 
     python3 scripts/check_against_mlx.py ~/models/Qwen2.5-Coder-0.5B-Instruct qwen-0.5b.vxw
     python3 scripts/check_against_mlx.py --tokens 1,2,3 TINY_MOE_DIR tiny-moe.vxw
+    python3 scripts/check_against_mlx.py --tokens 1,2,3 TINY_QWEN35_DIR tiny-qwen35.vxw
 
 MLX reads the Hugging Face folder and runs in float32. reference.py reads the converted weight
 file. So agreement also checks the converter. The script prints the largest difference of the
 logits and fails when the greedy tokens differ. It needs the `mlx-lm` package. A folder with no
-tokenizer, such as the one of `make_tiny_model.py --moe --hugging-face`, needs --tokens.
+tokenizer, such as the one of `make_tiny_model.py --moe --hugging-face` or `--qwen35 --hugging-face`,
+needs --tokens.
 
 Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
 See LICENSE for license information.

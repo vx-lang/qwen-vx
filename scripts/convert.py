@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Convert a Qwen2 or Qwen3 MoE model folder from Hugging Face into the weight file of the Qwen app.
+"""Convert a Qwen2, Qwen3 MoE or Qwen3.5 MoE model folder from Hugging Face into the weight file
+of the Qwen app.
 
     python3 scripts/convert.py ~/models/Qwen2.5-Coder-0.5B-Instruct qwen-0.5b.vxw
     python3 scripts/convert.py --fp8 ~/models/Qwen2.5-Coder-0.5B-Instruct qwen-0.5b-fp8.vxw
@@ -40,9 +41,70 @@ def convert(model_dir):
     return convert_tensors(qwen_weights.config_from_hugging_face(model_dir), qwen_weights.read_safetensors(model_dir))
 
 
+def one_plus(entry):
+    """1 + w as f32, for an RMSNorm that multiplies by 1 + w. Each bf16 w gives an exact sum."""
+    return "f32", qwen_weights.as_f32(entry) + np.float32(1)
+
+
+def f32(entry):
+    return "f32", qwen_weights.as_f32(entry)
+
+
+def convert_qwen3_5(config, hf):
+    """The tensors of the weight file of an arch 1 model, from the tensors of a Hugging Face
+    Qwen3.5 MoE model. The joined matrices are functions, as in `convert_tensors`."""
+    src = "model.language_model."
+    tensors = {"embed": hf[src + "embed_tokens.weight"], "final_norm": one_plus(hf[src + "norm.weight"])}
+    if not config["tied_embeddings"]:
+        tensors["lm_head"] = hf["lm_head.weight"]
+    heads, head_dim, hidden = config["num_q_heads"], config["head_dim"], config["hidden_size"]
+    experts, moe_inter = config["num_experts"], config["moe_intermediate_size"]
+    for layer in range(config["num_layers"]):
+        source = f"{src}layers.{layer}."
+        target = f"layers.{layer}."
+        tensors[target + "attn_norm"] = one_plus(hf[source + "input_layernorm.weight"])
+        if qwen_weights.has_full_attention(config, layer):
+            attn = source + "self_attn."
+            dtype, q_and_gate = hf[attn + "q_proj.weight"]
+            # q_proj gives each head its query rows and then its gate rows.
+            q_and_gate = q_and_gate.reshape(heads, 2, head_dim, hidden)
+            parts = [(dtype, q_and_gate[:, 0].reshape(heads * head_dim, hidden)), hf[attn + "k_proj.weight"],
+                     hf[attn + "v_proj.weight"], (dtype, q_and_gate[:, 1].reshape(heads * head_dim, hidden))]
+            tensors[target + "qkv"] = lambda parts=parts: joined(parts)
+            tensors[target + "q_norm"] = one_plus(hf[attn + "q_norm.weight"])
+            tensors[target + "k_norm"] = one_plus(hf[attn + "k_norm.weight"])
+            tensors[target + "attn_out"] = hf[attn + "o_proj.weight"]
+        else:
+            linear = source + "linear_attn."
+            parts = [hf[linear + f"in_proj_{p}.weight"] for p in ("qkv", "z", "b", "a")]
+            tensors[target + "linear_in"] = lambda parts=parts: joined(parts)
+            dtype, conv = hf[linear + "conv1d.weight"]
+            tensors[target + "conv"] = f32((dtype, conv.reshape(conv.shape[0], conv.shape[2])))
+            tensors[target + "neg_A"] = ("f32", -np.exp(qwen_weights.as_f32(hf[linear + "A_log"])))
+            tensors[target + "dt_bias"] = f32(hf[linear + "dt_bias"])
+            tensors[target + "linear_norm"] = f32(hf[linear + "norm.weight"])
+            tensors[target + "linear_out"] = hf[linear + "out_proj.weight"]
+        mlp = source + "mlp."
+        tensors[target + "mlp_norm"] = one_plus(hf[source + "post_attention_layernorm.weight"])
+        tensors[target + "router"] = joined([hf[mlp + "gate.weight"], hf[mlp + "shared_expert_gate.weight"]])
+        # The experts come as one tensor [experts, 2 * inter, hidden], each expert's gate rows and
+        # then its up rows, and one [experts, hidden, inter]. Reshapes of a memory map copy nothing.
+        dtype, gate_up = hf[mlp + "experts.gate_up_proj"]
+        tensors[target + "experts_gate_up"] = (dtype, gate_up.reshape(experts * 2 * moe_inter, hidden))
+        dtype, down = hf[mlp + "experts.down_proj"]
+        tensors[target + "experts_down"] = (dtype, down.reshape(experts * hidden, moe_inter))
+        shared = mlp + "shared_expert."
+        parts = [hf[shared + p + "_proj.weight"] for p in ("gate", "up")]
+        tensors[target + "shared_gate_up"] = lambda parts=parts: joined(parts)
+        tensors[target + "shared_down"] = hf[shared + "down_proj.weight"]
+    return config, tensors
+
+
 def convert_tensors(config, hf):
     """The tensors of the weight file, from a dict of the tensors of a Hugging Face model. The
     matrices of the experts are functions, so that the file joins them when it writes them."""
+    if config.get("arch", 0):
+        return convert_qwen3_5(config, hf)
     tensors = {"embed": hf["model.embed_tokens.weight"], "final_norm": hf["model.norm.weight"]}
     if not config["tied_embeddings"]:
         tensors["lm_head"] = hf["lm_head.weight"]

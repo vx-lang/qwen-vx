@@ -398,5 +398,81 @@ class QuantizedFiles(unittest.TestCase):
         np.testing.assert_array_equal(q.resolve(tensors["layers.1.experts_gate_up.scale"])[1][3 * 512 : 4 * 512], scales)
 
 
+def header_version(path):
+    with open(path, "rb") as f:
+        return int.from_bytes(f.read(16)[8:16], "little")
+
+
+def write_and_read(name, config, tensors):
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, name)
+        q.write_weight_file(path, config, tensors)
+        read_config, read = q.read_weight_file(path)
+        # Copy the arrays out of the memory map before the folder goes away.
+        return header_version(path), read_config, {n: (dtype, np.array(a)) for n, (dtype, a) in read.items()}
+
+
+class Qwen35Files(unittest.TestCase):
+    """The weight file of a Qwen3.5 MoE model (arch 1), from the tiny model of make_tiny_model.py."""
+
+    def setUp(self):
+        self.hf = make_tiny_model.tiny_qwen35_model()
+        self.config, self.tensors = convert.convert_tensors(q.config_from_json(make_tiny_model.QWEN35_CONFIG), self.hf)
+
+    def test_an_old_model_keeps_version_1_and_reads_arch_0(self):
+        config, tensors = convert.convert_tensors(q.config_from_json(make_tiny_model.MOE_CONFIG), make_tiny_model.tiny_moe_model())
+        version, read_config, _ = write_and_read("tiny-moe.vxw", config, tensors)
+        self.assertEqual(version, 1)
+        self.assertEqual((read_config["arch"], read_config["full_attention_interval"]), (0, 0))
+
+    def test_the_q4_0_file_has_version_2_and_the_types_of_llama_cpp(self):
+        config, tensors = q.quantize(self.config, self.tensors, "q4_0_q6")
+        version, c, read = write_and_read("tiny-qwen35-q4.vxw", config, tensors)
+        self.assertEqual(version, 2)
+        self.assertEqual(list(read), q.tensor_names(c))
+        self.assertEqual((c["arch"], c["full_attention_interval"], c["rotary_dim"]), (1, 4, 64))
+        self.assertEqual((c["linear_k_heads"], c["linear_v_heads"], c["linear_k_dim"], c["linear_v_dim"]), (2, 4, 128, 128))
+        self.assertEqual((c["conv_width"], c["shared_expert_intermediate_size"]), (4, 128))
+        dtype = {name: d for name, (d, _) in read.items()}
+        # Layers 0 to 2 have a Gated DeltaNet, and layer 3 full attention.
+        for name in ("linear_in", "linear_out", "shared_gate_up", "shared_down", "experts_gate_up"):
+            self.assertEqual(dtype["layers.0." + name], "u4", name)
+        for name in ("attn_norm", "conv", "neg_A", "dt_bias", "linear_norm", "mlp_norm"):
+            self.assertEqual(dtype["layers.0." + name], "f32", name)
+        self.assertEqual((dtype["layers.3.qkv"], dtype["layers.3.q_norm"], dtype["layers.3.router"]), ("u4", "f32", "bf16"))
+        self.assertNotIn("layers.0.qkv", dtype)
+        self.assertNotIn("layers.3.linear_in", dtype)
+        # q, k, v, z, b and a of 2 key heads and 4 value heads of 128; q, k, v and gate of 4 query
+        # heads and 2 key-value heads of 256; the 8 experts and the gate of the shared expert.
+        self.assertEqual(read["layers.0.linear_in.scale"][1].shape, (2 * 256 + 2 * 512 + 2 * 4, 256 // 32))
+        self.assertEqual(read["layers.3.qkv.scale"][1].shape, (2 * 1024 + 2 * 512, 256 // 32))
+        self.assertEqual(read["layers.0.router"][1].shape, (9, 256))
+
+    def test_the_bf16_file_holds_the_hugging_face_tensors_in_its_order(self):
+        _, c, read = write_and_read("tiny-qwen35.vxw", self.config, self.tensors)
+        hf = {name: q.as_f32(entry) for name, entry in self.hf.items()}
+        p = "model.language_model.layers."
+        # Each RMSNorm holds 1 + w, except the norm of the DeltaNet output.
+        np.testing.assert_array_equal(q.as_f32(read["layers.0.attn_norm"]), hf[p + "0.input_layernorm.weight"] + 1)
+        np.testing.assert_array_equal(q.as_f32(read["layers.3.k_norm"]), hf[p + "3.self_attn.k_norm.weight"] + 1)
+        np.testing.assert_array_equal(q.as_f32(read["layers.1.linear_norm"]), hf[p + "1.linear_attn.norm.weight"])
+        np.testing.assert_array_equal(q.as_f32(read["layers.1.neg_A"]), -np.exp(hf[p + "1.linear_attn.A_log"]))
+        np.testing.assert_array_equal(q.as_f32(read["layers.1.conv"]), hf[p + "1.linear_attn.conv1d.weight"][:, 0, :])
+        # linear_in: q, k and v, then z, b and a.
+        linear_in = q.as_f32(read["layers.2.linear_in"])
+        np.testing.assert_array_equal(linear_in[1536:1540], hf[p + "2.linear_attn.in_proj_b.weight"])
+        np.testing.assert_array_equal(linear_in[1540:], hf[p + "2.linear_attn.in_proj_a.weight"])
+        # qkv: q_proj gives head h 512 rows, its query and then its gate. The file has the query
+        # rows of all heads first, and the gate rows of all heads last.
+        qkv, q_proj = q.as_f32(read["layers.3.qkv"]), hf[p + "3.self_attn.q_proj.weight"]
+        np.testing.assert_array_equal(qkv[256:512], q_proj[512:768])
+        np.testing.assert_array_equal(qkv[2048:2304], q_proj[256:512])
+        np.testing.assert_array_equal(qkv[1024:1536], hf[p + "3.self_attn.k_proj.weight"])
+        # The router: one row for each expert, then the gate of the shared expert.
+        np.testing.assert_array_equal(q.as_f32(read["layers.0.router"])[8], hf[p + "0.mlp.shared_expert_gate.weight"][0])
+        # Expert 5 of layer 2: its gate rows, then its up rows.
+        np.testing.assert_array_equal(q.as_f32(read["layers.2.experts_gate_up"])[5 * 256 : 6 * 256], hf[p + "2.mlp.experts.gate_up_proj"][5])
+
+
 if __name__ == "__main__":
     unittest.main()
