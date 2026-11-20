@@ -1,0 +1,28 @@
+// Generates tokens of the tiny Qwen3.5 model (`make_tiny_model.py --qwen35`) on the GPU with
+// `src/main.vx`, and compares them with `reference.py`. The tokens must be equal, and each logit
+// within the tolerance of the reference:
+// - the bf16 file, with the bf16 kernels of the experts
+// - the Q4_0 file with a 6-bit lm_head, with the Q4_0 kernels
+// - the Q4_0 file after a prompt of 2,100 tokens, so the full attention layer goes past position
+//   2,048, where its blocks take 64 SIMD groups for each head in place of 32
+//
+// The tiny model has the head sizes of Qwen3.6-35B-A3B (DeltaNet heads of 128, attention heads of
+// 256 with RoPE on 64), so it runs the kernels of the real model.
+//
+// RUN: python3 %S/../scripts/make_tiny_model.py --qwen35 %t.vxw > /dev/null
+// RUN: python3 %S/../scripts/reference.py %t.vxw --tokens 1,2,3,4 --steps 16 > %t.reference
+// RUN: vxc %S/../src/main.vx --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t.vxw --tokens 1,2,3,4 --steps 16 > %t.vx
+// RUN: python3 %S/../scripts/compare.py %t.reference %t.vx --tolerance 0.001 | FileCheck %s
+// RUN: python3 %S/../scripts/make_tiny_model.py --qwen35 --q4 --q6-lm-head %t-q4.vxw > /dev/null
+// RUN: python3 %S/../scripts/reference.py %t-q4.vxw --tokens 1,2,3,4 --steps 16 > %t-q4.reference
+// RUN: vxc %S/../src/main.vx --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t-q4.vxw --tokens 1,2,3,4 --steps 16 > %t-q4.vx
+// RUN: python3 %S/../scripts/compare.py %t-q4.reference %t-q4.vx --tolerance 0.002 | FileCheck %s --check-prefix=Q4
+// RUN: python3 -c "print(','.join(str(i * 37 % 256) for i in range(2100)))" > %t-long.ids
+// RUN: python3 %S/../scripts/make_tiny_model.py --qwen35 --q4 --q6-lm-head --max-positions 2200 %t-long.vxw > /dev/null
+// RUN: python3 %S/../scripts/reference.py %t-long.vxw --tokens $(cat %t-long.ids) --steps 8 > %t-long.reference
+// RUN: vxc %S/../src/main.vx --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t-long.vxw --tokens $(cat %t-long.ids) --steps 8 > %t-long.vx
+// RUN: python3 %S/../scripts/compare.py %t-long.reference %t-long.vx --tolerance 0.002 | FileCheck %s --check-prefix=LONG
+//
+// CHECK: 16 steps, same tokens, logits within 0.001
+// Q4: 16 steps, same tokens, logits within 0.002
+// LONG: 8 steps, same tokens, logits within 0.002

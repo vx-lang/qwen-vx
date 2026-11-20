@@ -25,6 +25,7 @@ import std::time;
 import std::vec;
 import qwen::weights;
 import qwen::model;
+import qwen::qwen35;
 import qwen::prefill;
 import qwen::session;
 import qwen::speculate;
@@ -354,6 +355,97 @@ fn generate_with_drafts(w : &Weights, s : &mut State, t : &Tokenizer, text_mode 
   return step;
 }
 
+/// `main` for a Qwen3.5 or Qwen3.6 model (weight file v2, arch 1). The prompt runs one token at a
+/// time; it has no chunked prefill and no drafts yet (#89). Prints the same lines as `main`.
+fn run_qwen35(path : *const i8, t : &Tokenizer, text_mode : bool, prompt : &Vec<i32>, steps : i32) -> i32 {
+  let w = load_qwen35_weights(path);
+  let count = prompt.len();
+  let mut s = new_qwen35_state(&w.config, count + steps);
+  for i in 0..count {
+    assert(prompt[i] < w.config.vocab_size, "a token of the prompt is not in the vocabulary");
+  }
+  let ahead = if text_mode {
+    AHEAD
+  } else {
+    1
+  };
+  let mut slots = Vec<Slot>::new();
+  for i in 0..ahead + 1 {
+    slots.push(Slot {
+      next: transfer(Tensor<i32>([1]), Memory::HBM)
+    });
+  }
+  if text_mode {
+    for i in 0..count {
+      write_token(t, prompt[i]);
+    }
+  } else {
+    print!("prompt=");
+    for i in 0..count {
+      if i > 0 {
+        print!(",");
+      }
+      print!("{}", prompt[i]);
+    }
+    println!(";");
+  }
+  let prompt_start = Instant::now();
+  let mut ht = Tensor<i32>([1]);
+  for i in 0..count {
+    ht[0] = prompt[i];
+    let token = transfer(&ht, Memory::HBM);
+    run_qwen35_layers(&w, &mut s, &token, i);
+  }
+  predict_qwen35(&w, &mut s, &mut slots[0].next);
+  let mut tokens = Vec<i32>::new();
+  tokens.push(read_token(&slots[0].next));
+  let prompt_ms = f64::from(prompt_start.elapsed().as_secs_f32()) * 1000.0;
+  let mut start = Instant::now();
+  let mut decoded = 0;
+  for step in 0..steps {
+    let token = tokens[step];
+    if text_mode {
+      if is_special(t, token) || token == w.config.eos_token_id {
+        break;
+      }
+      write_token(t, token);
+    } else {
+      println!("step={} token={} logit={};", step, token, read_logit(&s.logits, token));
+    }
+    if step == 0 {
+      // The first token after the prompt compiles the kernels of a step, so the clock starts after it.
+      start = Instant::now();
+    }
+    if step + 1 < steps && tokens.len() == step + 1 {
+      let mut n = steps - 1 - step;
+      if n > ahead {
+        n = ahead;
+      }
+      for j in 0..n {
+        let from = (step + j) % (ahead + 1);
+        let to = (step + j + 1) % (ahead + 1);
+        run_qwen35_layers(&w, &mut s, &slots[from].next, count + step + j);
+        predict_qwen35(&w, &mut s, &mut slots[to].next);
+      }
+      for j in 0..n {
+        tokens.push(read_token(&slots[(step + j + 1) % (ahead + 1)].next));
+      }
+      if step > 0 {
+        decoded = decoded + n;
+      }
+    }
+  }
+  if text_mode {
+    println!("");
+  }
+  if decoded > 0 {
+    let ms = f64::from(start.elapsed().as_secs_f32()) * 1000.0 / f64::from(decoded);
+    println!("time ms_per_token={};", ms);
+  }
+  println!("time prompt_ms_per_token={};", prompt_ms / f64::from(count));
+  return 0;
+}
+
 fn main(argc : i32, argv : *mut *mut i8) -> i32 {
   let o = parse_options(argc, argv);
   if o.session {
@@ -373,6 +465,9 @@ fn main(argc : i32, argv : *mut *mut i8) -> i32 {
   let count = prompt.len();
   assert(steps > 0, "--steps must be at least 1");
 
+  if weight_file_arch(o.weights) == 1 {
+    return run_qwen35(o.weights, &t, text_mode, &prompt, steps);
+  }
   let w = load_weights(o.weights);
   let mut s = new_state(&w.config, count + steps);
   for i in 0..count {

@@ -177,11 +177,19 @@ fn add_experts_shared(e : &mut Experts, x : &mut Tensor<f32, [?], Memory::HBM>, 
   nn_matvec(&mut e.router_logits, &layer.router, xn, c.num_experts + 1, c.hidden_size);
   nn_top_k(&mut e.ids, &mut e.weights, &e.router_logits, c.num_experts, k);
   shared_gate(shared_weight, &e.router_logits, c.num_experts);
-  assert(layer.gate_up.dtype == U4 && layer.down.dtype == U4 && layer.shared_gate_up.dtype == U4 && layer.shared_down.dtype == U4, "the experts of a Qwen3.5 model must be Q4_0");
-  moe_swiglu_q4_blocks(&mut e.mlp, &layer.gate_up.codes, &layer.gate_up.group_scales, &e.ids, xn, k, inter, c.hidden_size, c.num_experts);
-  moe_down_q4_add_blocks(x, &layer.down.codes, &layer.down.group_scales, &e.ids, &e.weights, &e.mlp, k, c.hidden_size, inter, c.num_experts);
-  moe_swiglu_q4_blocks(shared_mlp, &layer.shared_gate_up.codes, &layer.shared_gate_up.group_scales, shared_id, xn, 1, shared, c.hidden_size, 1);
-  moe_down_q4_add_blocks(x, &layer.shared_down.codes, &layer.shared_down.group_scales, shared_id, shared_weight, shared_mlp, 1, c.hidden_size, shared, 1);
+  if layer.gate_up.dtype == U4 {
+    assert(layer.down.dtype == U4 && layer.shared_gate_up.dtype == U4 && layer.shared_down.dtype == U4, "the experts of a Qwen3.5 model must all be Q4_0, or all bf16");
+    moe_swiglu_q4_blocks(&mut e.mlp, &layer.gate_up.codes, &layer.gate_up.group_scales, &e.ids, xn, k, inter, c.hidden_size, c.num_experts);
+    moe_down_q4_add_blocks(x, &layer.down.codes, &layer.down.group_scales, &e.ids, &e.weights, &e.mlp, k, c.hidden_size, inter, c.num_experts);
+    moe_swiglu_q4_blocks(shared_mlp, &layer.shared_gate_up.codes, &layer.shared_gate_up.group_scales, shared_id, xn, 1, shared, c.hidden_size, 1);
+    moe_down_q4_add_blocks(x, &layer.shared_down.codes, &layer.shared_down.group_scales, shared_id, shared_weight, shared_mlp, 1, c.hidden_size, shared, 1);
+  } else {
+    assert(layer.gate_up.dtype == BF16 && layer.down.dtype == BF16 && layer.shared_gate_up.dtype == BF16 && layer.shared_down.dtype == BF16, "the experts of a Qwen3.5 model must all be Q4_0, or all bf16");
+    nn_moe_swiglu(&mut e.mlp, &layer.gate_up.bf16, &e.ids, xn, k, inter, c.hidden_size, c.num_experts);
+    nn_moe_down_add(x, &layer.down.bf16, &e.ids, &e.weights, &e.mlp, k, c.hidden_size, inter, c.num_experts);
+    nn_moe_swiglu(shared_mlp, &layer.shared_gate_up.bf16, shared_id, xn, 1, shared, c.hidden_size, 1);
+    nn_moe_down_add(x, &layer.shared_down.bf16, shared_id, shared_weight, shared_mlp, 1, c.hidden_size, shared, 1);
+  }
   return;
 }
 
