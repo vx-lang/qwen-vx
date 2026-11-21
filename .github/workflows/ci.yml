@@ -13,8 +13,9 @@ permissions:
 jobs:
   test:
     runs-on: macos-15
-    # A run takes 5 to 8 minutes. A test that hangs stops here, not at the limit of 6 hours.
-    timeout-minutes: 30
+    # With the tests of Qwen3.6, a run takes more than 30 minutes: a RUN line that compiles the app
+    # takes 90 to 115 s on this runner. A test that hangs stops here, not at the limit of 6 hours.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
 
