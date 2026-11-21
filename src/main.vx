@@ -591,6 +591,18 @@ fn run_qwen35(path : *const i8, t : &Tokenizer, text_mode : bool, chat : bool, i
   // same tensors of the chunk, as a session does, made before the first clock starts, as llama.cpp
   // makes its buffers when it loads the model.
   let mut p = new_prefill35(&w.config, prefill35_chunk(count));
+  // The first run of a kernel compiles it. So before the first clock starts, the first tokens of
+  // the prompt (up to 16) go through every kernel of the prompt and of `predict_qwen35`, with a
+  // small state of their own, as llama.cpp runs a warm-up batch when it loads a model. The kernels
+  // of a chunk do not depend on its number of tokens.
+  let mut warm_prompt = Vec<i32>::new();
+  for i in 0..i32::min(count, 16) {
+    warm_prompt.push(prompt[i]);
+  }
+  let mut warm = new_qwen35_state(&w.config, warm_prompt.len());
+  prefill_qwen35_with(&w, &mut warm, &mut p, &warm_prompt);
+  predict_qwen35(&w, &mut warm, &mut slots[0].next);
+  read_token(&slots[0].next);
   let mut tokens = Vec<i32>::new();
   let mut prompt_ms : f64 = 0.0;
   for run in 0..runs {
