@@ -1,0 +1,58 @@
+Checks of the two weight files, on the CPU, on 2026-11-21. Each section gives the command and its output.
+VXW=~/models/Qwen3.6-35B-A3B-q4-q6.vxw GGUF=~/models/gguf/qwen36/Qwen3.6-35B-A3B-Q4_0.gguf, scripts/ of qwen-vx 3d56b14, gguf-py of llama.cpp b1b770d.
+
+== python3 bytes_per_token.py $VXW $GGUF scripts llama.cpp/gguf-py
+config: {'arch': 1, 'conv_width': 4, 'eos_token_id': 248044, 'experts_per_token': 8, 'full_attention_interval': 4, 'head_dim': 256, 'hidden_size': 2048, 'intermediate_size': 0, 'linear_k_dim': 128, 'linear_k_heads': 16, 'linear_v_dim': 128, 'linear_v_heads': 32, 'max_positions': 262144, 'moe_intermediate_size': 512, 'num_experts': 256, 'num_kv_heads': 2, 'num_layers': 40, 'num_q_heads': 16, 'qk_norm': 1, 'qkv_bias': 0, 'rms_norm_eps': 1e-06, 'rope_theta': 10000000.0, 'rotary_dim': 64, 'shared_expert_intermediate_size': 512, 'tied_embeddings': 0, 'vocab_size': 248320, 'weight_format': 3}
+app: 1.819 GB per token, file 20.389 GB
+  linear_in: 379.5 MB
+  experts_gate_up: 335.5 MB
+  lm_head: 254.3 MB
+  experts_down: 167.8 MB
+  lm_head.high: 127.1 MB
+  linear_out: 125.8 MB
+  qkv: 94.4 MB
+  linear_in.scale: 47.4 MB
+  router: 42.1 MB
+  experts_gate_up.scale: 41.9 MB
+  shared_gate_up: 41.9 MB
+  attn_out: 41.9 MB
+  lm_head.scale: 31.8 MB
+  experts_down.scale: 21.0 MB
+gguf: 1.865 GB per token, file 19.704 GB
+  output.weight: 417.2 MB
+  attn_qkv.weight: 283.1 MB
+  ffn_down_exps.weight: 188.7 MB
+  ffn_gate_exps.weight: 188.7 MB
+  ffn_up_exps.weight: 188.7 MB
+  attn_gate.weight: 141.6 MB
+  ssm_out.weight: 141.6 MB
+  attn_q.weight: 94.4 MB
+  ffn_gate_inp.weight: 83.9 MB
+  attn_output.weight: 47.2 MB
+  ffn_down_shexp.weight: 23.6 MB
+  ffn_gate_shexp.weight: 23.6 MB
+  ffn_up_shexp.weight: 23.6 MB
+  attn_k.weight: 5.9 MB
+
+== python3 compare_bits.py $VXW $GGUF scripts llama.cpp/gguf-py
+320 matrices checked in 40 layers, 0 differ: []
+
+== The same check on layers 0 and 3, with one code or scale changed in memory in 8 matrices:
+== experts_down, experts_gate_up (gate part), linear_in and linear_out of layer 0; qkv, attn_out,
+== shared_gate_up (up part) and shared_down of layer 3. Expected: exactly these 8 differ.
+16 matrices checked in 40 layers, 8 differ: ['layer 0 experts gate', 'layer 0 experts down', 'layer 0 linear in', 'layer 0 linear out', 'layer 3 shared up', 'layer 3 shared down', 'layer 3 qkv', 'layer 3 attn out']
+(The count line prints num_layers of the file, 40, though the loop ran 2 layers.)
+
+== python3 perplexity.py $VXW $GGUF scripts llama.cpp/gguf-py ~/models/Qwen3.6-35B-A3B policy.md speculate.vx qwen_weights.py --max-tokens 512
+== policy.md is docs/benchmarking_policy.md of Vx at 643f63b5b. speculate.vx and qwen_weights.py are src/ and scripts/ of qwen-vx at 3d56b14.
+embed: Q4_0 from the GGUF, (248320, 2048)
+lm_head: Q6_K from the GGUF, (248320, 2048)
+quality-texts/policy.md: app forward of 512 tokens in 59 s
+quality-texts/policy.md: llama.cpp forward of 512 tokens in 57 s
+quality-texts/policy.md: tokens=512 perplexity app=11.9348 llama.cpp=12.1307 kl=0.012269 same_top1=94.72%
+quality-texts/speculate.vx: app forward of 512 tokens in 62 s
+quality-texts/speculate.vx: llama.cpp forward of 512 tokens in 72 s
+quality-texts/speculate.vx: tokens=512 perplexity app=7.3574 llama.cpp=7.3558 kl=0.005107 same_top1=96.09%
+quality-texts/qwen_weights.py: app forward of 512 tokens in 57 s
+quality-texts/qwen_weights.py: llama.cpp forward of 512 tokens in 53 s
+quality-texts/qwen_weights.py: tokens=512 perplexity app=7.1244 llama.cpp=7.1567 kl=0.007000 same_top1=96.48%
