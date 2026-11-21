@@ -29,7 +29,7 @@ import qwen::weights;
 /// The tensors of a chunk, made once. `rows`, `zeros` and the `e_` tensors are those of `Prefill`.
 /// `proj` is the output of `qkv` or `linear_in` for each token, and `y` the input of `attn_out` or
 /// `linear_out`. The `d` tensors are those of the DeltaNet, and the `s_` tensors those of the shared
-/// expert. `router` has the logits of the experts, then that of the gate of the shared expert.
+/// expert. `router` has the logits of the experts, then that of the gate of the shared expert, and zeros to a whole number of blocks of 64.
 struct Prefill35 {
   chunk : i32,
   tokens : Tensor<i32, [?], Memory::HBM>,
@@ -70,7 +70,7 @@ fn new_prefill35(c : &Config, chunk : i32) -> Prefill35 {
   let k = c.experts_per_token;
   let experts = c.num_experts;
   let positions = expert_positions(c, chunk);
-  let cap = (chunk + 31) / 32 * 32;
+  let cap = (chunk + 63) / 64 * 64;
   let mut ident = Tensor<i32>([positions]);
   for p in 0..positions {
     ident[p] = p;
@@ -96,7 +96,7 @@ fn new_prefill35(c : &Config, chunk : i32) -> Prefill35 {
     beta: transfer(Tensor<f32>([chunk, vh]), Memory::HBM),
     decay: transfer(Tensor<f32>([chunk, vh]), Memory::HBM),
     o: transfer(Tensor<f32>([chunk, vh, 16, 8]), Memory::HBM),
-    router: transfer(Tensor<f32>([cap, experts + 1]), Memory::HBM),
+    router: transfer(Tensor<f32>([cap, (experts + 1 + 63) / 64 * 64]), Memory::HBM),
     ids: transfer(Tensor<i32>([chunk, k]), Memory::HBM),
     wts: transfer(Tensor<f32>([chunk, k]), Memory::HBM),
     e_rows: transfer(Tensor<i32>([positions]), Memory::HBM),
@@ -964,6 +964,18 @@ fn pf_gated_flash_attention(y : &mut Tensor<f32, [?, ?], Memory::HBM>, q : &Tens
 
 // ------------------------------------------------------------------------------ experts ---
 
+/// A dense product of the chunk: `pf_mm` with no bias and no `add`, or, for a Q4_0 matrix of whole
+/// blocks of 64 rows, `pf_mm_q4_mlir64`, whose blocks of 64 tokens decode each weight for 64 tokens
+/// in place of 32. `new_prefill35` makes the tensors of the chunk for whole blocks of 64 tokens.
+fn pf35_mm(y : &mut Tensor<f32, [?, ?], Memory::HBM>, m : &WeightMatrix, x : &Tensor<f32, [?, ?], Memory::HBM>, list : &Tensor<i32, [?], Memory::HBM>, zeros : &Tensor<i32, [?], Memory::HBM>, no_bias : &Tensor<bf16, [?], Memory::HBM>, rows : i32, cols : i32, tiles : i32) -> void {
+  if m.dtype == U4 && rows % 64 == 0 {
+    pf_mm_q4_mlir64(y, &m.codes, &m.group_scales, x, list, zeros, 0, rows, cols, tiles);
+  } else {
+    pf_mm(y, m, x, list, zeros, 0, no_bias, false, false, rows, cols, tiles);
+  }
+  return;
+}
+
 /// x[t] += sigmoid(router[t][at]) * out[t], for t below n: the shared expert times its gate.
 fn pf35_add_shared(x : &mut Tensor<f32, [?, ?], Memory::HBM>, out : &Tensor<f32, [?, ?], Memory::HBM>, router : &Tensor<f32, [?, ?], Memory::HBM>, at : i32, n : i32, dim : i32) -> void {
   spawn on(Topology::Device) {
@@ -989,19 +1001,26 @@ fn pf35_experts(p : &mut Prefill35, layer : &Qwen35Layer, c : &Config, n : i32, 
   let experts = c.num_experts;
   let inter = c.moe_intermediate_size;
   let shared = c.shared_expert_inter;
-  pf_mm_bf16(&mut p.router, &layer.router, &p.xn, &p.rows, &p.zeros, 0, &p.no_bias, false, false, experts + 1, c.hidden_size, tiles);
+  // With Q4_0 experts, whose products round to f16, the router rounds to f16 too, in the faster
+  // kernel. A bf16 file keeps the f32 products.
+  if layer.gate_up.dtype == U4 {
+    pf_mm_bf16_mlir(&mut p.router, &layer.router, &p.xn, &p.rows, &p.zeros, 0, experts + 1, c.hidden_size, tiles);
+  } else {
+    pf_mm_bf16(&mut p.router, &layer.router, &p.xn, &p.rows, &p.zeros, 0, &p.no_bias, false, false, experts + 1, c.hidden_size, tiles);
+  }
   pf_top_k(&mut p.ids, &mut p.wts, &p.router, n, experts, k);
   let e_tiles = p.e_rows.len() / 16;
   pf_count_experts(&mut p.e_counts, &mut p.e_lane_counts, &p.ids, n, k, experts);
   pf_place_experts(&p.e_rows, &p.slot, &p.e_counts, &p.e_lane_counts, &p.ids, n, k, experts);
   pf_expert_bases(&mut p.e_bases, &p.e_counts, experts, e_tiles);
+  pf_live_positions(&mut p.e_ident, &p.e_rows);
   pf_mm(&mut p.e_gu, &layer.gate_up, &p.xn, &p.e_rows, &p.e_bases, 2 * inter, &p.no_bias, false, false, 2 * inter, c.hidden_size, e_tiles);
-  pf_silu_mul(&mut p.e_h, &p.e_gu, e_tiles * 16, inter);
+  pf_silu_mul_live(&mut p.e_h, &p.e_gu, &p.e_ident, e_tiles * 16, inter);
   pf_mm(&mut p.e_out, &layer.down, &p.e_h, &p.e_ident, &p.e_bases, c.hidden_size, &p.no_bias, false, false, c.hidden_size, inter, e_tiles);
   pf_combine(&mut p.x, &p.e_out, &p.wts, &p.slot, n, k, c.hidden_size);
-  pf_mm(&mut p.s_gu, &layer.shared_gate_up, &p.xn, &p.rows, &p.zeros, 0, &p.no_bias, false, false, 2 * shared, c.hidden_size, tiles);
+  pf35_mm(&mut p.s_gu, &layer.shared_gate_up, &p.xn, &p.rows, &p.zeros, &p.no_bias, 2 * shared, c.hidden_size, tiles);
   pf_silu_mul(&mut p.s_h, &p.s_gu, n, shared);
-  pf_mm(&mut p.s_out, &layer.shared_down, &p.s_h, &p.rows, &p.zeros, 0, &p.no_bias, false, false, c.hidden_size, shared, tiles);
+  pf35_mm(&mut p.s_out, &layer.shared_down, &p.s_h, &p.rows, &p.zeros, &p.no_bias, c.hidden_size, shared, tiles);
   pf35_add_shared(&mut p.x, &p.s_out, &p.router, experts, n, c.hidden_size);
   return;
 }
@@ -1026,19 +1045,19 @@ fn pf35_chunk(w : &Qwen35Weights, s : &mut Qwen35State, p : &mut Prefill35, star
     let layer = &w.layers[l];
     pf35_rms_norm(&mut p.xn, &p.x, &layer.attn_norm, n, c.hidden_size, eps);
     if layer.full_attention {
-      pf_mm(&mut p.proj, &layer.qkv, &p.xn, &p.rows, &p.zeros, 0, &p.no_bias, false, false, qkv_rows, c.hidden_size, tiles);
+      pf35_mm(&mut p.proj, &layer.qkv, &p.xn, &p.rows, &p.zeros, &p.no_bias, qkv_rows, c.hidden_size, tiles);
       pf_gated_norm_rope_and_store(&mut p.q, &mut ls.k, &mut ls.v, &p.proj, &layer.q_norm, &layer.k_norm, &s.cos, &s.sin, start, n, c.num_q_heads, c.num_kv_heads, c.rotary_dim, eps);
       pf_gated_flash_attention(&mut p.y, &p.q, &ls.k, &ls.v, &p.proj, start, n, c.num_q_heads, c.num_q_heads / c.num_kv_heads, qkv_rows - c.num_q_heads * 256, 0.0625);
       // The product goes to xn, which is free until the norm, as in `pf_chunk`.
-      pf_mm(&mut p.xn, &layer.attn_out, &p.y, &p.rows, &p.zeros, 0, &p.no_bias, false, false, c.hidden_size, c.num_q_heads * 256, tiles);
+      pf35_mm(&mut p.xn, &layer.attn_out, &p.y, &p.rows, &p.zeros, &p.no_bias, c.hidden_size, c.num_q_heads * 256, tiles);
     } else {
-      pf_mm(&mut p.proj, &layer.linear_in, &p.xn, &p.rows, &p.zeros, 0, &p.no_bias, false, false, a_at + vh, c.hidden_size, tiles);
+      pf35_mm(&mut p.proj, &layer.linear_in, &p.xn, &p.rows, &p.zeros, &p.no_bias, a_at + vh, c.hidden_size, tiles);
       pf_dn_conv(&mut p.dq, &mut p.dk, &mut p.dv, &ls.conv, &p.proj, &layer.conv, n, kh, vh);
       pf_dn_conv_state(&mut ls.conv, &p.proj, n, 2 * kh + vh);
       pf_dn_gates(&mut p.beta, &mut p.decay, &p.proj, &layer.neg_a, &layer.dt_bias, b_at, a_at, n, vh);
       pf_dn_recur(&mut p.o, &mut ls.s, &p.dq, &p.dk, &p.dv, &p.beta, &p.decay, vh / kh, n, vh);
       pf_dn_gated_norm(&mut p.y, &p.o, &p.proj, &layer.linear_norm, z_at, n, vh, eps);
-      pf_mm(&mut p.xn, &layer.linear_out, &p.y, &p.rows, &p.zeros, 0, &p.no_bias, false, false, c.hidden_size, vh * 128, tiles);
+      pf35_mm(&mut p.xn, &layer.linear_out, &p.y, &p.rows, &p.zeros, &p.no_bias, c.hidden_size, vh * 128, tiles);
     }
     pf35_add_rms_norm(&mut p.x, &mut p.xn, &layer.mlp_norm, n, c.hidden_size, eps);
     pf35_experts(p, layer, c, n, tiles);
