@@ -157,10 +157,11 @@ def spread(xs, fmt="{:.2f}"):
 
 
 def timed(rows, table, program=None, setting=None):
-    """The runs of the summary: no failed runs, no runs with error lines, and no runs with drafts that
-    wrote other text than the runs without drafts."""
+    """The runs of the summary: no failed runs, no runs with error lines, and no runs of qwen-vx --draft
+    that wrote other text than qwen-vx. The summary keeps the runs of llama.cpp with drafts that wrote
+    other text: the shape of their batches changes the result at near ties. say_same_text lists them."""
     return [r for r in rows if r["table"] == table and r["rc"] == 0 and r["ms_per_token"] is not None
-            and not r["errors"] and r.get("same_text") is not False
+            and not r["errors"] and not (r["program"] == PROGRAMS["vxdraft"] and r.get("same_text") is False)
             and (program is None or r["program"] == program) and (setting is None or r["setting"] == setting)]
 
 
@@ -196,24 +197,29 @@ def plain_log(r):
 def mark_same_text(out, rows):
     """Whether each run with drafts wrote the text of the run without drafts. qwen-vx --draft must
     write the same text. A program of llama.cpp may generate a few more tokens with drafts, so its
-    text must start with the whole text of llama-completion."""
+    text must start with the whole text of llama-completion. same_chars is the number of equal
+    characters at the start of the two texts."""
     for r in rows:
-        r["same_text"] = ""
+        r["same_text"] = r["same_chars"] = ""
         log = plain_log(r)
         if log is None or r["rc"] != 0 or not (out / log).exists():
             continue
         a, b = answer(out / log), answer(out / r["log"])
         r["same_text"] = a == b if r["program"] == PROGRAMS["vxdraft"] else b.startswith(a)
+        r["same_chars"] = agree(a, b)
 
 
 def say_same_text(say, rows, table):
     for p in PROGRAMS.values():
         rr = [r for r in rows if r["table"] == table and r["program"] == p and r["same_text"] != ""]
         if rr:
-            plain = "qwen-vx" if p == PROGRAMS["vxdraft"] else "llama-completion"
-            differ = [r["log"] for r in rr if not r["same_text"]]
+            vx = p == PROGRAMS["vxdraft"]
+            plain = "qwen-vx" if vx else "llama-completion"
+            differ = [r for r in rr if not r["same_text"]]
             say(f"- {p}: the text of {plain} in {len(rr) - len(differ)} of {len(rr)} runs"
-                + (f". Other text, out of the summary: {', '.join(differ)}" if differ else ""))
+                + (f". Other text, {'out of' if vx else 'in'} the summary (the number of equal characters "
+                   f"at the start): " + ", ".join(f"{r['log']} ({r['same_chars']})" for r in differ)
+                   if differ else ""))
 
 
 def summary(out, rows):
