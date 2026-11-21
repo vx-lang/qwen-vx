@@ -1,0 +1,14 @@
+diff --git a/examples/speculative-simple/speculative-simple.cpp b/examples/speculative-simple/speculative-simple.cpp
+index e4a878b..4ddd972 100644
+--- a/examples/speculative-simple/speculative-simple.cpp
++++ b/examples/speculative-simple/speculative-simple.cpp
+@@ -155,6 +155,9 @@ int main(int argc, char ** argv) {
+ 
+     common_prompt_checkpoint ckpt;
+ 
++    // Wait for the GPU, so that the time of the prompt is not counted in the time of the first tokens.
++    llama_synchronize(ctx_tgt);
++
+     const auto t_enc_end = ggml_time_us();
+ 
+     const auto t_dec_start = ggml_time_us();

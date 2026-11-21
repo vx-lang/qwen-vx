@@ -141,7 +141,7 @@ def read_rows(out):
 
 def write_csv(out, rows):
     with open(out / "runs.csv", "w", newline="") as f:
-        w = csv.DictWriter(f, list(rows[0].keys()))
+        w = csv.DictWriter(f, list(rows[0].keys()), lineterminator="\n")
         w.writeheader()
         for r in rows:
             w.writerow({k: (f"{v:.4f}" if isinstance(v, float) else v) for k, v in r.items()})

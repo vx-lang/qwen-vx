@@ -1,0 +1,13 @@
+The build of llama.cpp that ran, from build/CMakeCache.txt (b1b770d with llama-timing.patch):
+CMAKE_BUILD_TYPE:STRING=Release
+CMAKE_CXX_COMPILER:FILEPATH=/usr/bin/c++
+CMAKE_C_COMPILER:FILEPATH=/usr/bin/cc
+GGML_METAL:BOOL=ON
+GGML_METAL_EMBED_LIBRARY:BOOL=ON
+GGML_NATIVE:BOOL=ON
+LLAMA_BUILD_MTMD:BOOL=OFF
+LLAMA_BUILD_TESTS:BOOL=OFF
+LLAMA_BUILD_UI:BOOL=OFF
+LLAMA_CURL:UNINITIALIZED=OFF
+
+Build times of the binaries (2026-11-20): llama-bench 12:42, llama-completion 12:43, llama-speculative-simple 15:25 (after the patch).
