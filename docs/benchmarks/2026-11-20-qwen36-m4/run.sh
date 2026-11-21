@@ -85,7 +85,9 @@ llama() { # TOOL PROMPT N CTX [options]
   show "$LB/$tool" -m "$GGUF" -f "$f" -n "$n" -c "$c" --temp 0 -ngl 99 -fa "$FA" --no-escape --ignore-eos "$@"
 }
 completion() { llama llama-completion "$@" -no-cnv; }
-spec() { llama llama-speculative-simple "$@"; }
+# llama-speculative-simple refuses a prompt longer than the batch (-b, 2,048 by default). The
+# longest prompt has 2,251 tokens.
+spec() { llama llama-speculative-simple "$@" -b 4096; }
 
 run() { # NAME COMMAND...: one run, its output in logs/NAME.txt, a line in log.txt
   local name=$1
