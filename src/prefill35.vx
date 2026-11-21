@@ -12,25 +12,19 @@
 //
 // - The DeltaNet of a chunk. The convolution and the norms run for all the tokens at once. The
 //   update of the state runs the tokens in order, in one kernel that keeps S in registers.
-// - The gated attention of a chunk: the kernels of src/gated_attention.vx for ATT_TOKENS tokens
-//   at a time, each with ATT_GROUPS SIMD groups for each head.
+// - The gated attention of a chunk: a flash attention for heads of 256 values, as
+//   `pf_flash_attention`, with the gate in its last step.
 // - The shared expert, as a dense SwiGLU over the chunk, times sigmoid(its gate).
 import core::convert;
 import core::num;
 import std::nn;
 import std::vec;
 import qwen::deltanet;
-import qwen::gated_attention;
 import qwen::model;
 import qwen::prefill;
 import qwen::qwen35;
 import qwen::simd;
 import qwen::weights;
-
-/// The tokens of a chunk that the attention takes at a time, and the SIMD groups of each head and
-/// token. The scratch space of the parts is ATT_TOKENS x q_heads x ATT_GROUPS x 260 values.
-const ATT_TOKENS : i32 = 64;
-const ATT_GROUPS : i32 = 8;
 
 /// The tensors of a chunk, made once. `rows`, `zeros` and the `e_` tensors are those of `Prefill`.
 /// `proj` is the output of `qkv` or `linear_in` for each token, and `y` the input of `attn_out` or
@@ -47,7 +41,6 @@ struct Prefill35 {
   proj : Tensor<f32, [?, ?], Memory::HBM>,
   y : Tensor<f32, [?, ?], Memory::HBM>,
   q : Tensor<f32, [?, ?, ?], Memory::HBM>,
-  parts : Tensor<f32, [?, ?, ?, ?], Memory::HBM>,
   dq : Tensor<f32, [?, ?, ?], Memory::HBM>,
   dk : Tensor<f32, [?, ?, ?], Memory::HBM>,
   dv : Tensor<f32, [?, ?, ?], Memory::HBM>,
@@ -97,7 +90,6 @@ fn new_prefill35(c : &Config, chunk : i32) -> Prefill35 {
     proj: transfer(Tensor<f32>([cap, i32::max(qkv_rows, in_rows)]), Memory::HBM),
     y: transfer(Tensor<f32>([cap, i32::max(c.num_q_heads * 256, vh * 128)]), Memory::HBM),
     q: transfer(Tensor<f32>([chunk, c.num_q_heads, 256]), Memory::HBM),
-    parts: transfer(Tensor<f32>([ATT_TOKENS, c.num_q_heads, ATT_GROUPS, 260]), Memory::HBM),
     dq: transfer(Tensor<f32>([chunk, kh, 128]), Memory::HBM),
     dk: transfer(Tensor<f32>([chunk, kh, 128]), Memory::HBM),
     dv: transfer(Tensor<f32>([chunk, vh, 128]), Memory::HBM),
@@ -578,165 +570,394 @@ fn pf_gated_norm_rope_and_store(q_out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>
   return;
 }
 
-/// The attention of tokens first to first + m - 1 of the chunk, as `gated_attention_parts` for each:
-/// block (tt, h, w) is a SIMD group for head h of token first + tt, at position start + first + tt.
-/// It does the blocks of 32 positions w, w + ATT_GROUPS, ... up to that position.
-fn pf_gated_attention_parts(part : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, start : i32, first : i32, m : i32, q_heads : i32, group : i32, scale : f32) -> void {
+/// y[t][h * 256 + d] = the attention of query head h of token t (at position start + t) over the
+/// positions up to start + t, times sigmoid(qkvg[t][gate_at + h * 256 + d]), for t below n: the
+/// gated attention of `gated_attention`. A threadgroup does 8 tokens of one query head, in steps of 64
+/// positions, as `pf_flash_attention` and llama.cpp's kernel_flash_attn_ext. The caches are
+/// [position, kv_heads, 256] f16, with a multiple of 64 positions. K and V go from the cache straight
+/// into simdgroup matrices, K transposed; Q (as f16), the scores, the weights (as f16) and the sums
+/// of the 8 tokens are in shared memory. The softmax is online, in all the lanes of a subgroup.
+///
+/// The design is that of llama.cpp (ggml/src/ggml-metal/kernels/fa_common.metal), MIT License,
+/// Copyright (c) 2023-2026 The ggml authors.
+///
+/// scripts/mlir_kernels/gated_flash_attention.py writes this function: change that script, not the
+/// MLIR.
+fn pf_gated_flash_attention(y : &mut Tensor<f32, [?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, qkvg : &Tensor<f32, [?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, group : i32, gate_at : i32, scale : f32) -> void {
+  assert(q.extent(2) == 256 && k_cache.extent(2) == 256 && k_cache.extent(0) % 64 == 0 && start + n <= k_cache.extent(0), "pf_gated_flash_attention: heads of 256 values, and a KV cache of a multiple of 64 positions");
   spawn on(Topology::Device) {
-    for tt in 0..m across blocks {
+    for qb in 0..(n + 7) / 8 across blocks {
       for h in 0..q_heads across blocks {
-        for w in 0..8 across blocks {
-          let mut stats = unsafe { Tensor<f32, [1, 2], Memory::SMEM>::uninit() };
-          for s in 0..1 across subgroups {
-            for l in 0..32 across lanes(32) {
-              let t = first + tt;
-              let pos = start + t;
-              let g = h / group;
-              let d = 8 * l;
-              let q0 = q[t][h][d] * scale;
-              let q1 = q[t][h][d + 1] * scale;
-              let q2 = q[t][h][d + 2] * scale;
-              let q3 = q[t][h][d + 3] * scale;
-              let q4 = q[t][h][d + 4] * scale;
-              let q5 = q[t][h][d + 5] * scale;
-              let q6 = q[t][h][d + 6] * scale;
-              let q7 = q[t][h][d + 7] * scale;
-              let mut big : f32 = -3.0e38;
-              let mut total : f32 = 0.0;
-              let mut o0 : f32 = 0.0;
-              let mut o1 : f32 = 0.0;
-              let mut o2 : f32 = 0.0;
-              let mut o3 : f32 = 0.0;
-              let mut o4 : f32 = 0.0;
-              let mut o5 : f32 = 0.0;
-              let mut o6 : f32 = 0.0;
-              let mut o7 : f32 = 0.0;
-              let chunks = (pos + 32) / 32;
-              let mut c = w;
-              while c < chunks {
-                let r0 = c * 32;
-                let mut mine : f32 = -3.0e38;
-                for r in 0..32 {
-                  let row = r0 + r;
-                  let mut kept = row;
-                  if row > pos {
-                    kept = pos;
-                  }
-                  let k0 = half4_at(k_cache, kept, g, d, 0);
-                  let k1 = half4_at(k_cache, kept, g, d, 1);
-                  let k2 = half4_at(k_cache, kept, g, d, 2);
-                  let k3 = half4_at(k_cache, kept, g, d, 3);
-                  let k4 = half4_at(k_cache, kept, g, d + 4, 0);
-                  let k5 = half4_at(k_cache, kept, g, d + 4, 1);
-                  let k6 = half4_at(k_cache, kept, g, d + 4, 2);
-                  let k7 = half4_at(k_cache, kept, g, d + 4, 3);
-                  let mut score = simd_sum(((k0 * q0 + k1 * q1) + (k2 * q2 + k3 * q3)) + ((k4 * q4 + k5 * q5) + (k6 * q6 + k7 * q7)));
-                  if row > pos {
-                    score = -3.0e38;
-                  }
-                  if r == l {
-                    mine = score;
-                  }
-                }
-                let top = big.max(simd_max(mine));
-                let shrink = (big - top).fast_exp();
-                let p = (mine - top).fast_exp();
-                total = total * shrink + simd_sum(p);
-                o0 = o0 * shrink;
-                o1 = o1 * shrink;
-                o2 = o2 * shrink;
-                o3 = o3 * shrink;
-                o4 = o4 * shrink;
-                o5 = o5 * shrink;
-                o6 = o6 * shrink;
-                o7 = o7 * shrink;
-                for r in 0..32 {
-                  let row = r0 + r;
-                  let mut kept = row;
-                  if row > pos {
-                    kept = pos;
-                  }
-                  let pr = simd_value(p, r);
-                  o0 = o0 + half4_at(v_cache, kept, g, d, 0) * pr;
-                  o1 = o1 + half4_at(v_cache, kept, g, d, 1) * pr;
-                  o2 = o2 + half4_at(v_cache, kept, g, d, 2) * pr;
-                  o3 = o3 + half4_at(v_cache, kept, g, d, 3) * pr;
-                  o4 = o4 + half4_at(v_cache, kept, g, d + 4, 0) * pr;
-                  o5 = o5 + half4_at(v_cache, kept, g, d + 4, 1) * pr;
-                  o6 = o6 + half4_at(v_cache, kept, g, d + 4, 2) * pr;
-                  o7 = o7 + half4_at(v_cache, kept, g, d + 4, 3) * pr;
-                }
-                big = top;
-                c = c + 8;
-              }
-              part[tt][h][w][d] = o0;
-              part[tt][h][w][d + 1] = o1;
-              part[tt][h][w][d + 2] = o2;
-              part[tt][h][w][d + 3] = o3;
-              part[tt][h][w][d + 4] = o4;
-              part[tt][h][w][d + 5] = o5;
-              part[tt][h][w][d + 6] = o6;
-              part[tt][h][w][d + 7] = o7;
-              if l < 2 {
-                let mut x = big;
-                if l == 1 {
-                  x = total;
-                }
-                stats[s][l] = x;
-              }
+        let mut sq = unsafe { Tensor<f16, [2048], Memory::SMEM>::uninit() };
+        let mut so = unsafe { Tensor<f32, [2048], Memory::SMEM>::uninit() };
+        let mut ss = unsafe { Tensor<f32, [512], Memory::SMEM>::uninit() };
+        let mut sp = unsafe { Tensor<f16, [512], Memory::SMEM>::uninit() };
+        let _d = mlir!( threads : 128, inputs : (%sq = &mut sq : memref<2048xf16, 3>, %so = &mut so : memref<2048xf32, 3>, %ss = &mut ss : memref<512xf32, 3>, %sp = &mut sp : memref<512xf16, 3>, %y = y : memref<?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %qkvg = qkvg : memref<?x?xf32>, %start = start : i32, %n = n : i32, %group = group : i32, %gate_at = gate_at : i32, %scale = scale : f32, %qb = qb : i32, %h = h : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [writes_only(sq), writes_only(so), writes_only(ss), writes_only(sp), reads_only(q), reads_only(k_cache), reads_only(v_cache), reads_only(qkvg), writes_only(y[qb * 8..qb * 8 + 8][h * 256..h * 256 + 256])]) {
+          %c0 = arith.constant 0 : index
+          %c1 = arith.constant 1 : index
+          %c2 = arith.constant 2 : index
+          %c4 = arith.constant 4 : index
+          %c8 = arith.constant 8 : index
+          %c12 = arith.constant 12 : index
+          %c16 = arith.constant 16 : index
+          %c32 = arith.constant 32 : index
+          %c64 = arith.constant 64 : index
+          %c256 = arith.constant 256 : index
+          %tid = gpu.thread_id x
+          %sg = arith.divui %tid, %c32 : index
+          %l = arith.remui %tid, %c32 : index
+          %qbi = arith.index_cast %qb : i32 to index
+          %hi = arith.index_cast %h : i32 to index
+          %ni = arith.index_cast %n : i32 to index
+          %starti = arith.index_cast %start : i32 to index
+          %groupi = arith.index_cast %group : i32 to index
+          %gatei = arith.index_cast %gate_at : i32 to index
+          %g = arith.divui %hi, %groupi : index
+          %gD = arith.muli %g, %c256 : index
+          %P = memref.dim %k3, %c0 : memref<?x?x?xf16>
+          %KH = memref.dim %k3, %c1 : memref<?x?x?xf16>
+          %Wd = arith.muli %KH, %c256 : index
+          %k = memref.reinterpret_cast %k3 to offset: [0], sizes: [%P, %Wd], strides: [%Wd, 1] : memref<?x?x?xf16> to memref<?x?xf16, strided<[?, 1]>>
+          %v = memref.reinterpret_cast %v3 to offset: [0], sizes: [%P, %Wd], strides: [%Wd, 1] : memref<?x?x?xf16> to memref<?x?xf16, strided<[?, 1]>>
+          %t0 = arith.muli %qbi, %c8 : index
+          %qj = arith.divui %tid, %c16 : index
+          %qm = arith.remui %tid, %c16 : index
+          %qc = arith.muli %qm, %c16 : index
+          %qt = arith.addi %t0, %qj : index
+          %nm1 = arith.subi %ni, %c1 : index
+          %qtc = arith.minui %qt, %nm1 : index
+          %qlive = arith.cmpi ult, %qt, %ni : index
+          %vz4 = arith.constant dense<0.0> : vector<4xf32>
+          %sqo = arith.muli %qj, %c256 : index
+          %sqa = arith.addi %sqo, %qc : index
+          %qc0 = arith.addi %qc, %c0 : index
+          %sq0 = arith.addi %sqa, %c0 : index
+          %q0r = vector.load %q[%qtc, %hi, %qc0] : memref<?x?x?xf32>, vector<4xf32>
+          %q0 = arith.select %qlive, %q0r, %vz4 : vector<4xf32>
+          %q0h = arith.truncf %q0 : vector<4xf32> to vector<4xf16>
+          vector.store %q0h, %sq[%sq0] : memref<2048xf16, 3>, vector<4xf16>
+          vector.store %vz4, %so[%sq0] : memref<2048xf32, 3>, vector<4xf32>
+          %qc1 = arith.addi %qc, %c4 : index
+          %sq1 = arith.addi %sqa, %c4 : index
+          %q1r = vector.load %q[%qtc, %hi, %qc1] : memref<?x?x?xf32>, vector<4xf32>
+          %q1 = arith.select %qlive, %q1r, %vz4 : vector<4xf32>
+          %q1h = arith.truncf %q1 : vector<4xf32> to vector<4xf16>
+          vector.store %q1h, %sq[%sq1] : memref<2048xf16, 3>, vector<4xf16>
+          vector.store %vz4, %so[%sq1] : memref<2048xf32, 3>, vector<4xf32>
+          %qc2 = arith.addi %qc, %c8 : index
+          %sq2 = arith.addi %sqa, %c8 : index
+          %q2r = vector.load %q[%qtc, %hi, %qc2] : memref<?x?x?xf32>, vector<4xf32>
+          %q2 = arith.select %qlive, %q2r, %vz4 : vector<4xf32>
+          %q2h = arith.truncf %q2 : vector<4xf32> to vector<4xf16>
+          vector.store %q2h, %sq[%sq2] : memref<2048xf16, 3>, vector<4xf16>
+          vector.store %vz4, %so[%sq2] : memref<2048xf32, 3>, vector<4xf32>
+          %qc3 = arith.addi %qc, %c12 : index
+          %sq3 = arith.addi %sqa, %c12 : index
+          %q3r = vector.load %q[%qtc, %hi, %qc3] : memref<?x?x?xf32>, vector<4xf32>
+          %q3 = arith.select %qlive, %q3r, %vz4 : vector<4xf32>
+          %q3h = arith.truncf %q3 : vector<4xf32> to vector<4xf16>
+          vector.store %q3h, %sq[%sq3] : memref<2048xf16, 3>, vector<4xf16>
+          vector.store %vz4, %so[%sq3] : memref<2048xf32, 3>, vector<4xf32>
+          gpu.barrier
+          %tl = arith.addi %t0, %c8 : index
+          %tlc = arith.minui %tl, %ni : index
+          %lastq = arith.subi %tlc, %c1 : index
+          %lastp = arith.addi %starti, %lastq : index
+          %nblk0 = arith.divui %lastp, %c64 : index
+          %nblk = arith.addi %nblk0, %c1 : index
+          %j0 = arith.addi %sg, %c0 : index
+          %j1 = arith.addi %sg, %c4 : index
+          %qt0 = arith.addi %t0, %j0 : index
+          %qp0 = arith.addi %starti, %qt0 : index
+          %qt1 = arith.addi %t0, %j1 : index
+          %qp1 = arith.addi %starti, %qt1 : index
+          %neg = arith.constant -3.0e38 : f32
+          %zero = arith.constant 0.0 : f32
+          %l2 = arith.muli %l, %c2 : index
+          %l8 = arith.muli %l, %c8 : index
+          %zacc = gpu.subgroup_mma_constant_matrix %zero : !gpu.mma_matrix<8x8xf32, "COp">
+          %st:4 = scf.for %kb = %c0 to %nblk step %c1 iter_args(%M0 = %neg, %S0 = %zero, %M1 = %neg, %S1 = %zero) -> (f32, f32, f32, f32) {
+            %p0 = arith.muli %kb, %c64 : index
+            %sg8 = arith.muli %sg, %c8 : index
+            %kc0 = arith.addi %sg8, %c0 : index
+            %kp0 = arith.addi %p0, %kc0 : index
+            %qk0 = scf.for %i = %c0 to %c32 step %c1 iter_args(%a = %zacc) -> (!gpu.mma_matrix<8x8xf32, "COp">) {
+              %d0 = arith.muli %i, %c8 : index
+              %mq = gpu.subgroup_mma_load_matrix %sq[%d0] {leadDimension = 256 : index} : memref<2048xf16, 3> -> !gpu.mma_matrix<8x8xf16, "AOp">
+              %kd = arith.addi %gD, %d0 : index
+              %mk = gpu.subgroup_mma_load_matrix %k[%kp0, %kd] {leadDimension = 0 : index, transpose} : memref<?x?xf16, strided<[?, 1]>> -> !gpu.mma_matrix<8x8xf16, "BOp">
+              %a2 = gpu.subgroup_mma_compute %mq, %mk, %a : !gpu.mma_matrix<8x8xf16, "AOp">, !gpu.mma_matrix<8x8xf16, "BOp"> -> !gpu.mma_matrix<8x8xf32, "COp">
+              scf.yield %a2 : !gpu.mma_matrix<8x8xf32, "COp">
             }
-            for l in 0..2 across lanes(32) {
-              part[tt][h][w][256 + l] = stats[s][l];
+            gpu.subgroup_mma_store_matrix %qk0, %ss[%kc0] {leadDimension = 64 : index} : !gpu.mma_matrix<8x8xf32, "COp">, memref<512xf32, 3>
+            %kc1 = arith.addi %sg8, %c32 : index
+            %kp1 = arith.addi %p0, %kc1 : index
+            %qk1 = scf.for %i = %c0 to %c32 step %c1 iter_args(%a = %zacc) -> (!gpu.mma_matrix<8x8xf32, "COp">) {
+              %d0 = arith.muli %i, %c8 : index
+              %mq = gpu.subgroup_mma_load_matrix %sq[%d0] {leadDimension = 256 : index} : memref<2048xf16, 3> -> !gpu.mma_matrix<8x8xf16, "AOp">
+              %kd = arith.addi %gD, %d0 : index
+              %mk = gpu.subgroup_mma_load_matrix %k[%kp1, %kd] {leadDimension = 0 : index, transpose} : memref<?x?xf16, strided<[?, 1]>> -> !gpu.mma_matrix<8x8xf16, "BOp">
+              %a2 = gpu.subgroup_mma_compute %mq, %mk, %a : !gpu.mma_matrix<8x8xf16, "AOp">, !gpu.mma_matrix<8x8xf16, "BOp"> -> !gpu.mma_matrix<8x8xf32, "COp">
+              scf.yield %a2 : !gpu.mma_matrix<8x8xf32, "COp">
             }
+            gpu.subgroup_mma_store_matrix %qk1, %ss[%kc1] {leadDimension = 64 : index} : !gpu.mma_matrix<8x8xf32, "COp">, memref<512xf32, 3>
+            gpu.barrier
+            %r0 = arith.muli %j0, %c64 : index
+            %ia0 = arith.addi %r0, %l2 : index
+            %ib0 = arith.addi %ia0, %c1 : index
+            %sa0r = memref.load %ss[%ia0] : memref<512xf32, 3>
+            %sb0r = memref.load %ss[%ib0] : memref<512xf32, 3>
+            %sa0s = arith.mulf %sa0r, %scale : f32
+            %sb0s = arith.mulf %sb0r, %scale : f32
+            %pa0 = arith.addi %p0, %l2 : index
+            %pb0 = arith.addi %pa0, %c1 : index
+            %oka0 = arith.cmpi ule, %pa0, %qp0 : index
+            %okb0 = arith.cmpi ule, %pb0, %qp0 : index
+            %sa0 = arith.select %oka0, %sa0s, %neg : f32
+            %sb0 = arith.select %okb0, %sb0s, %neg : f32
+            %mx0 = arith.maxnumf %sa0, %sb0 : f32
+            %bm0 = gpu.subgroup_reduce maxnumf %mx0 : (f32) -> f32
+            %Mn0 = arith.maxnumf %M0, %bm0 : f32
+            %dm0 = arith.subf %M0, %Mn0 : f32
+            %ms0 = math.exp %dm0 : f32
+            %ea0 = arith.subf %sa0, %Mn0 : f32
+            %eb0 = arith.subf %sb0, %Mn0 : f32
+            %xa0 = math.exp %ea0 : f32
+            %xb0 = math.exp %eb0 : f32
+            %xs0 = arith.addf %xa0, %xb0 : f32
+            %bs0 = gpu.subgroup_reduce add %xs0 : (f32) -> f32
+            %Ss0 = arith.mulf %S0, %ms0 : f32
+            %Sn0 = arith.addf %Ss0, %bs0 : f32
+            %ha0 = arith.truncf %xa0 : f32 to f16
+            %hb0 = arith.truncf %xb0 : f32 to f16
+            memref.store %ha0, %sp[%ia0] : memref<512xf16, 3>
+            memref.store %hb0, %sp[%ib0] : memref<512xf16, 3>
+            %or0 = arith.muli %j0, %c256 : index
+            %oi0 = arith.addi %or0, %l8 : index
+            %oj0 = arith.addi %oi0, %c4 : index
+            %msv0 = vector.broadcast %ms0 : f32 to vector<4xf32>
+            %ov0a = vector.load %so[%oi0] : memref<2048xf32, 3>, vector<4xf32>
+            %ow0a = arith.mulf %ov0a, %msv0 : vector<4xf32>
+            vector.store %ow0a, %so[%oi0] : memref<2048xf32, 3>, vector<4xf32>
+            %ov0b = vector.load %so[%oj0] : memref<2048xf32, 3>, vector<4xf32>
+            %ow0b = arith.mulf %ov0b, %msv0 : vector<4xf32>
+            vector.store %ow0b, %so[%oj0] : memref<2048xf32, 3>, vector<4xf32>
+            %r1 = arith.muli %j1, %c64 : index
+            %ia1 = arith.addi %r1, %l2 : index
+            %ib1 = arith.addi %ia1, %c1 : index
+            %sa1r = memref.load %ss[%ia1] : memref<512xf32, 3>
+            %sb1r = memref.load %ss[%ib1] : memref<512xf32, 3>
+            %sa1s = arith.mulf %sa1r, %scale : f32
+            %sb1s = arith.mulf %sb1r, %scale : f32
+            %pa1 = arith.addi %p0, %l2 : index
+            %pb1 = arith.addi %pa1, %c1 : index
+            %oka1 = arith.cmpi ule, %pa1, %qp1 : index
+            %okb1 = arith.cmpi ule, %pb1, %qp1 : index
+            %sa1 = arith.select %oka1, %sa1s, %neg : f32
+            %sb1 = arith.select %okb1, %sb1s, %neg : f32
+            %mx1 = arith.maxnumf %sa1, %sb1 : f32
+            %bm1 = gpu.subgroup_reduce maxnumf %mx1 : (f32) -> f32
+            %Mn1 = arith.maxnumf %M1, %bm1 : f32
+            %dm1 = arith.subf %M1, %Mn1 : f32
+            %ms1 = math.exp %dm1 : f32
+            %ea1 = arith.subf %sa1, %Mn1 : f32
+            %eb1 = arith.subf %sb1, %Mn1 : f32
+            %xa1 = math.exp %ea1 : f32
+            %xb1 = math.exp %eb1 : f32
+            %xs1 = arith.addf %xa1, %xb1 : f32
+            %bs1 = gpu.subgroup_reduce add %xs1 : (f32) -> f32
+            %Ss1 = arith.mulf %S1, %ms1 : f32
+            %Sn1 = arith.addf %Ss1, %bs1 : f32
+            %ha1 = arith.truncf %xa1 : f32 to f16
+            %hb1 = arith.truncf %xb1 : f32 to f16
+            memref.store %ha1, %sp[%ia1] : memref<512xf16, 3>
+            memref.store %hb1, %sp[%ib1] : memref<512xf16, 3>
+            %or1 = arith.muli %j1, %c256 : index
+            %oi1 = arith.addi %or1, %l8 : index
+            %oj1 = arith.addi %oi1, %c4 : index
+            %msv1 = vector.broadcast %ms1 : f32 to vector<4xf32>
+            %ov1a = vector.load %so[%oi1] : memref<2048xf32, 3>, vector<4xf32>
+            %ow1a = arith.mulf %ov1a, %msv1 : vector<4xf32>
+            vector.store %ow1a, %so[%oi1] : memref<2048xf32, 3>, vector<4xf32>
+            %ov1b = vector.load %so[%oj1] : memref<2048xf32, 3>, vector<4xf32>
+            %ow1b = arith.mulf %ov1b, %msv1 : vector<4xf32>
+            vector.store %ow1b, %so[%oj1] : memref<2048xf32, 3>, vector<4xf32>
+            gpu.barrier
+            %dv0c = arith.constant 0 : index
+            %dv0 = arith.addi %sg8, %dv0c : index
+            %o0i = gpu.subgroup_mma_load_matrix %so[%dv0] {leadDimension = 256 : index} : memref<2048xf32, 3> -> !gpu.mma_matrix<8x8xf32, "COp">
+            %vd0 = arith.addi %gD, %dv0 : index
+            %o0 = scf.for %kk = %c0 to %c8 step %c1 iter_args(%o = %o0i) -> (!gpu.mma_matrix<8x8xf32, "COp">) {
+              %k8 = arith.muli %kk, %c8 : index
+              %mp = gpu.subgroup_mma_load_matrix %sp[%k8] {leadDimension = 64 : index} : memref<512xf16, 3> -> !gpu.mma_matrix<8x8xf16, "AOp">
+              %vp = arith.addi %p0, %k8 : index
+              %mv = gpu.subgroup_mma_load_matrix %v[%vp, %vd0] {leadDimension = 0 : index} : memref<?x?xf16, strided<[?, 1]>> -> !gpu.mma_matrix<8x8xf16, "BOp">
+              %onx = gpu.subgroup_mma_compute %mp, %mv, %o : !gpu.mma_matrix<8x8xf16, "AOp">, !gpu.mma_matrix<8x8xf16, "BOp"> -> !gpu.mma_matrix<8x8xf32, "COp">
+              scf.yield %onx : !gpu.mma_matrix<8x8xf32, "COp">
+            }
+            gpu.subgroup_mma_store_matrix %o0, %so[%dv0] {leadDimension = 256 : index} : !gpu.mma_matrix<8x8xf32, "COp">, memref<2048xf32, 3>
+            %dv1c = arith.constant 32 : index
+            %dv1 = arith.addi %sg8, %dv1c : index
+            %o1i = gpu.subgroup_mma_load_matrix %so[%dv1] {leadDimension = 256 : index} : memref<2048xf32, 3> -> !gpu.mma_matrix<8x8xf32, "COp">
+            %vd1 = arith.addi %gD, %dv1 : index
+            %o1 = scf.for %kk = %c0 to %c8 step %c1 iter_args(%o = %o1i) -> (!gpu.mma_matrix<8x8xf32, "COp">) {
+              %k8 = arith.muli %kk, %c8 : index
+              %mp = gpu.subgroup_mma_load_matrix %sp[%k8] {leadDimension = 64 : index} : memref<512xf16, 3> -> !gpu.mma_matrix<8x8xf16, "AOp">
+              %vp = arith.addi %p0, %k8 : index
+              %mv = gpu.subgroup_mma_load_matrix %v[%vp, %vd1] {leadDimension = 0 : index} : memref<?x?xf16, strided<[?, 1]>> -> !gpu.mma_matrix<8x8xf16, "BOp">
+              %onx = gpu.subgroup_mma_compute %mp, %mv, %o : !gpu.mma_matrix<8x8xf16, "AOp">, !gpu.mma_matrix<8x8xf16, "BOp"> -> !gpu.mma_matrix<8x8xf32, "COp">
+              scf.yield %onx : !gpu.mma_matrix<8x8xf32, "COp">
+            }
+            gpu.subgroup_mma_store_matrix %o1, %so[%dv1] {leadDimension = 256 : index} : !gpu.mma_matrix<8x8xf32, "COp">, memref<2048xf32, 3>
+            %dv2c = arith.constant 64 : index
+            %dv2 = arith.addi %sg8, %dv2c : index
+            %o2i = gpu.subgroup_mma_load_matrix %so[%dv2] {leadDimension = 256 : index} : memref<2048xf32, 3> -> !gpu.mma_matrix<8x8xf32, "COp">
+            %vd2 = arith.addi %gD, %dv2 : index
+            %o2 = scf.for %kk = %c0 to %c8 step %c1 iter_args(%o = %o2i) -> (!gpu.mma_matrix<8x8xf32, "COp">) {
+              %k8 = arith.muli %kk, %c8 : index
+              %mp = gpu.subgroup_mma_load_matrix %sp[%k8] {leadDimension = 64 : index} : memref<512xf16, 3> -> !gpu.mma_matrix<8x8xf16, "AOp">
+              %vp = arith.addi %p0, %k8 : index
+              %mv = gpu.subgroup_mma_load_matrix %v[%vp, %vd2] {leadDimension = 0 : index} : memref<?x?xf16, strided<[?, 1]>> -> !gpu.mma_matrix<8x8xf16, "BOp">
+              %onx = gpu.subgroup_mma_compute %mp, %mv, %o : !gpu.mma_matrix<8x8xf16, "AOp">, !gpu.mma_matrix<8x8xf16, "BOp"> -> !gpu.mma_matrix<8x8xf32, "COp">
+              scf.yield %onx : !gpu.mma_matrix<8x8xf32, "COp">
+            }
+            gpu.subgroup_mma_store_matrix %o2, %so[%dv2] {leadDimension = 256 : index} : !gpu.mma_matrix<8x8xf32, "COp">, memref<2048xf32, 3>
+            %dv3c = arith.constant 96 : index
+            %dv3 = arith.addi %sg8, %dv3c : index
+            %o3i = gpu.subgroup_mma_load_matrix %so[%dv3] {leadDimension = 256 : index} : memref<2048xf32, 3> -> !gpu.mma_matrix<8x8xf32, "COp">
+            %vd3 = arith.addi %gD, %dv3 : index
+            %o3 = scf.for %kk = %c0 to %c8 step %c1 iter_args(%o = %o3i) -> (!gpu.mma_matrix<8x8xf32, "COp">) {
+              %k8 = arith.muli %kk, %c8 : index
+              %mp = gpu.subgroup_mma_load_matrix %sp[%k8] {leadDimension = 64 : index} : memref<512xf16, 3> -> !gpu.mma_matrix<8x8xf16, "AOp">
+              %vp = arith.addi %p0, %k8 : index
+              %mv = gpu.subgroup_mma_load_matrix %v[%vp, %vd3] {leadDimension = 0 : index} : memref<?x?xf16, strided<[?, 1]>> -> !gpu.mma_matrix<8x8xf16, "BOp">
+              %onx = gpu.subgroup_mma_compute %mp, %mv, %o : !gpu.mma_matrix<8x8xf16, "AOp">, !gpu.mma_matrix<8x8xf16, "BOp"> -> !gpu.mma_matrix<8x8xf32, "COp">
+              scf.yield %onx : !gpu.mma_matrix<8x8xf32, "COp">
+            }
+            gpu.subgroup_mma_store_matrix %o3, %so[%dv3] {leadDimension = 256 : index} : !gpu.mma_matrix<8x8xf32, "COp">, memref<2048xf32, 3>
+            %dv4c = arith.constant 128 : index
+            %dv4 = arith.addi %sg8, %dv4c : index
+            %o4i = gpu.subgroup_mma_load_matrix %so[%dv4] {leadDimension = 256 : index} : memref<2048xf32, 3> -> !gpu.mma_matrix<8x8xf32, "COp">
+            %vd4 = arith.addi %gD, %dv4 : index
+            %o4 = scf.for %kk = %c0 to %c8 step %c1 iter_args(%o = %o4i) -> (!gpu.mma_matrix<8x8xf32, "COp">) {
+              %k8 = arith.muli %kk, %c8 : index
+              %mp = gpu.subgroup_mma_load_matrix %sp[%k8] {leadDimension = 64 : index} : memref<512xf16, 3> -> !gpu.mma_matrix<8x8xf16, "AOp">
+              %vp = arith.addi %p0, %k8 : index
+              %mv = gpu.subgroup_mma_load_matrix %v[%vp, %vd4] {leadDimension = 0 : index} : memref<?x?xf16, strided<[?, 1]>> -> !gpu.mma_matrix<8x8xf16, "BOp">
+              %onx = gpu.subgroup_mma_compute %mp, %mv, %o : !gpu.mma_matrix<8x8xf16, "AOp">, !gpu.mma_matrix<8x8xf16, "BOp"> -> !gpu.mma_matrix<8x8xf32, "COp">
+              scf.yield %onx : !gpu.mma_matrix<8x8xf32, "COp">
+            }
+            gpu.subgroup_mma_store_matrix %o4, %so[%dv4] {leadDimension = 256 : index} : !gpu.mma_matrix<8x8xf32, "COp">, memref<2048xf32, 3>
+            %dv5c = arith.constant 160 : index
+            %dv5 = arith.addi %sg8, %dv5c : index
+            %o5i = gpu.subgroup_mma_load_matrix %so[%dv5] {leadDimension = 256 : index} : memref<2048xf32, 3> -> !gpu.mma_matrix<8x8xf32, "COp">
+            %vd5 = arith.addi %gD, %dv5 : index
+            %o5 = scf.for %kk = %c0 to %c8 step %c1 iter_args(%o = %o5i) -> (!gpu.mma_matrix<8x8xf32, "COp">) {
+              %k8 = arith.muli %kk, %c8 : index
+              %mp = gpu.subgroup_mma_load_matrix %sp[%k8] {leadDimension = 64 : index} : memref<512xf16, 3> -> !gpu.mma_matrix<8x8xf16, "AOp">
+              %vp = arith.addi %p0, %k8 : index
+              %mv = gpu.subgroup_mma_load_matrix %v[%vp, %vd5] {leadDimension = 0 : index} : memref<?x?xf16, strided<[?, 1]>> -> !gpu.mma_matrix<8x8xf16, "BOp">
+              %onx = gpu.subgroup_mma_compute %mp, %mv, %o : !gpu.mma_matrix<8x8xf16, "AOp">, !gpu.mma_matrix<8x8xf16, "BOp"> -> !gpu.mma_matrix<8x8xf32, "COp">
+              scf.yield %onx : !gpu.mma_matrix<8x8xf32, "COp">
+            }
+            gpu.subgroup_mma_store_matrix %o5, %so[%dv5] {leadDimension = 256 : index} : !gpu.mma_matrix<8x8xf32, "COp">, memref<2048xf32, 3>
+            %dv6c = arith.constant 192 : index
+            %dv6 = arith.addi %sg8, %dv6c : index
+            %o6i = gpu.subgroup_mma_load_matrix %so[%dv6] {leadDimension = 256 : index} : memref<2048xf32, 3> -> !gpu.mma_matrix<8x8xf32, "COp">
+            %vd6 = arith.addi %gD, %dv6 : index
+            %o6 = scf.for %kk = %c0 to %c8 step %c1 iter_args(%o = %o6i) -> (!gpu.mma_matrix<8x8xf32, "COp">) {
+              %k8 = arith.muli %kk, %c8 : index
+              %mp = gpu.subgroup_mma_load_matrix %sp[%k8] {leadDimension = 64 : index} : memref<512xf16, 3> -> !gpu.mma_matrix<8x8xf16, "AOp">
+              %vp = arith.addi %p0, %k8 : index
+              %mv = gpu.subgroup_mma_load_matrix %v[%vp, %vd6] {leadDimension = 0 : index} : memref<?x?xf16, strided<[?, 1]>> -> !gpu.mma_matrix<8x8xf16, "BOp">
+              %onx = gpu.subgroup_mma_compute %mp, %mv, %o : !gpu.mma_matrix<8x8xf16, "AOp">, !gpu.mma_matrix<8x8xf16, "BOp"> -> !gpu.mma_matrix<8x8xf32, "COp">
+              scf.yield %onx : !gpu.mma_matrix<8x8xf32, "COp">
+            }
+            gpu.subgroup_mma_store_matrix %o6, %so[%dv6] {leadDimension = 256 : index} : !gpu.mma_matrix<8x8xf32, "COp">, memref<2048xf32, 3>
+            %dv7c = arith.constant 224 : index
+            %dv7 = arith.addi %sg8, %dv7c : index
+            %o7i = gpu.subgroup_mma_load_matrix %so[%dv7] {leadDimension = 256 : index} : memref<2048xf32, 3> -> !gpu.mma_matrix<8x8xf32, "COp">
+            %vd7 = arith.addi %gD, %dv7 : index
+            %o7 = scf.for %kk = %c0 to %c8 step %c1 iter_args(%o = %o7i) -> (!gpu.mma_matrix<8x8xf32, "COp">) {
+              %k8 = arith.muli %kk, %c8 : index
+              %mp = gpu.subgroup_mma_load_matrix %sp[%k8] {leadDimension = 64 : index} : memref<512xf16, 3> -> !gpu.mma_matrix<8x8xf16, "AOp">
+              %vp = arith.addi %p0, %k8 : index
+              %mv = gpu.subgroup_mma_load_matrix %v[%vp, %vd7] {leadDimension = 0 : index} : memref<?x?xf16, strided<[?, 1]>> -> !gpu.mma_matrix<8x8xf16, "BOp">
+              %onx = gpu.subgroup_mma_compute %mp, %mv, %o : !gpu.mma_matrix<8x8xf16, "AOp">, !gpu.mma_matrix<8x8xf16, "BOp"> -> !gpu.mma_matrix<8x8xf32, "COp">
+              scf.yield %onx : !gpu.mma_matrix<8x8xf32, "COp">
+            }
+            gpu.subgroup_mma_store_matrix %o7, %so[%dv7] {leadDimension = 256 : index} : !gpu.mma_matrix<8x8xf32, "COp">, memref<2048xf32, 3>
+            gpu.barrier
+            scf.yield %Mn0, %Sn0, %Mn1, %Sn1 : f32, f32, f32, f32
           }
-        }
+          %hD = arith.muli %hi, %c256 : index
+          %gh = arith.addi %gatei, %hD : index
+          %one = arith.constant 1.0 : f32
+          %one4 = arith.constant dense<1.0> : vector<4xf32>
+          %inv0 = arith.divf %one, %st#1 : f32
+          %iv0 = vector.broadcast %inv0 : f32 to vector<4xf32>
+          %fr0 = arith.muli %j0, %c256 : index
+          %live0 = arith.cmpi ult, %qt0, %ni : index
+          scf.if %live0 {
+            %fl0a = arith.addi %l8, %c0 : index
+            %fi0a = arith.addi %fr0, %fl0a : index
+            %fv0a = vector.load %so[%fi0a] : memref<2048xf32, 3>, vector<4xf32>
+            %fw0a = arith.mulf %fv0a, %iv0 : vector<4xf32>
+            %gi0a = arith.addi %gh, %fl0a : index
+            %gv0a = vector.load %qkvg[%qt0, %gi0a] : memref<?x?xf32>, vector<4xf32>
+            %gn0a = arith.negf %gv0a : vector<4xf32>
+            %ge0a = math.exp %gn0a : vector<4xf32>
+            %gd0a = arith.addf %ge0a, %one4 : vector<4xf32>
+            %fg0a = arith.divf %fw0a, %gd0a : vector<4xf32>
+            %yc0a = arith.addi %hD, %fl0a : index
+            vector.store %fg0a, %y[%qt0, %yc0a] : memref<?x?xf32>, vector<4xf32>
+            %fl0b = arith.addi %l8, %c4 : index
+            %fi0b = arith.addi %fr0, %fl0b : index
+            %fv0b = vector.load %so[%fi0b] : memref<2048xf32, 3>, vector<4xf32>
+            %fw0b = arith.mulf %fv0b, %iv0 : vector<4xf32>
+            %gi0b = arith.addi %gh, %fl0b : index
+            %gv0b = vector.load %qkvg[%qt0, %gi0b] : memref<?x?xf32>, vector<4xf32>
+            %gn0b = arith.negf %gv0b : vector<4xf32>
+            %ge0b = math.exp %gn0b : vector<4xf32>
+            %gd0b = arith.addf %ge0b, %one4 : vector<4xf32>
+            %fg0b = arith.divf %fw0b, %gd0b : vector<4xf32>
+            %yc0b = arith.addi %hD, %fl0b : index
+            vector.store %fg0b, %y[%qt0, %yc0b] : memref<?x?xf32>, vector<4xf32>
+          }
+          %inv1 = arith.divf %one, %st#3 : f32
+          %iv1 = vector.broadcast %inv1 : f32 to vector<4xf32>
+          %fr1 = arith.muli %j1, %c256 : index
+          %live1 = arith.cmpi ult, %qt1, %ni : index
+          scf.if %live1 {
+            %fl1a = arith.addi %l8, %c0 : index
+            %fi1a = arith.addi %fr1, %fl1a : index
+            %fv1a = vector.load %so[%fi1a] : memref<2048xf32, 3>, vector<4xf32>
+            %fw1a = arith.mulf %fv1a, %iv1 : vector<4xf32>
+            %gi1a = arith.addi %gh, %fl1a : index
+            %gv1a = vector.load %qkvg[%qt1, %gi1a] : memref<?x?xf32>, vector<4xf32>
+            %gn1a = arith.negf %gv1a : vector<4xf32>
+            %ge1a = math.exp %gn1a : vector<4xf32>
+            %gd1a = arith.addf %ge1a, %one4 : vector<4xf32>
+            %fg1a = arith.divf %fw1a, %gd1a : vector<4xf32>
+            %yc1a = arith.addi %hD, %fl1a : index
+            vector.store %fg1a, %y[%qt1, %yc1a] : memref<?x?xf32>, vector<4xf32>
+            %fl1b = arith.addi %l8, %c4 : index
+            %fi1b = arith.addi %fr1, %fl1b : index
+            %fv1b = vector.load %so[%fi1b] : memref<2048xf32, 3>, vector<4xf32>
+            %fw1b = arith.mulf %fv1b, %iv1 : vector<4xf32>
+            %gi1b = arith.addi %gh, %fl1b : index
+            %gv1b = vector.load %qkvg[%qt1, %gi1b] : memref<?x?xf32>, vector<4xf32>
+            %gn1b = arith.negf %gv1b : vector<4xf32>
+            %ge1b = math.exp %gn1b : vector<4xf32>
+            %gd1b = arith.addf %ge1b, %one4 : vector<4xf32>
+            %fg1b = arith.divf %fw1b, %gd1b : vector<4xf32>
+            %yc1b = arith.addi %hD, %fl1b : index
+            vector.store %fg1b, %y[%qt1, %yc1b] : memref<?x?xf32>, vector<4xf32>
+          }
+          macro.yield %qb : i32
+        };
       }
     }
-  }
-  return;
-}
-
-/// Merges the 8 parts of each head of tokens first to first + m - 1, and multiplies by sigmoid of
-/// the gate, as `gated_attention_merge`.
-fn pf_gated_attention_merge(y : &mut Tensor<f32, [?, ?], Memory::HBM>, part : &Tensor<f32, [?, ?, ?, ?], Memory::HBM>, qkvg : &Tensor<f32, [?, ?], Memory::HBM>, first : i32, m : i32, q_heads : i32, gate_at : i32) -> void {
-  spawn on(Topology::Device) {
-    for tt in 0..m across blocks {
-      for h in 0..q_heads across blocks {
-        for dq in 0..8 across blocks {
-          for s in 0..1 across subgroups {
-            for l in 0..32 across lanes(32) {
-              let t = first + tt;
-              let d = dq * 32 + l;
-              let mut big : f32 = -3.0e38;
-              for c in 0..8 {
-                big = big.max(part[tt][h][c][256]);
-              }
-              let mut total : f32 = 0.0;
-              let mut acc : f32 = 0.0;
-              for c in 0..8 {
-                let w = (part[tt][h][c][256] - big).fast_exp();
-                total = total + w * part[tt][h][c][257];
-                acc = acc + w * part[tt][h][c][d];
-              }
-              let gate = qkvg[t][gate_at + h * 256 + d];
-              y[t][h * 256 + d] = acc / total / (1.0 + (0.0 - gate).fast_exp());
-            }
-          }
-        }
-      }
-    }
-  }
-  return;
-}
-
-/// The gated attention of the n tokens of the chunk, ATT_TOKENS at a time: y[t] for each token.
-fn pf_gated_attention(y : &mut Tensor<f32, [?, ?], Memory::HBM>, parts : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, qkvg : &Tensor<f32, [?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32) -> void {
-  let mut first = 0;
-  while first < n {
-    let m = i32::min(ATT_TOKENS, n - first);
-    pf_gated_attention_parts(parts, q, k_cache, v_cache, start, first, m, q_heads, q_heads / kv_heads, 0.0625);
-    pf_gated_attention_merge(y, parts, qkvg, first, m, q_heads, (q_heads + 2 * kv_heads) * 256);
-    first = first + m;
   }
   return;
 }
@@ -807,7 +1028,7 @@ fn pf35_chunk(w : &Qwen35Weights, s : &mut Qwen35State, p : &mut Prefill35, star
     if layer.full_attention {
       pf_mm(&mut p.proj, &layer.qkv, &p.xn, &p.rows, &p.zeros, 0, &p.no_bias, false, false, qkv_rows, c.hidden_size, tiles);
       pf_gated_norm_rope_and_store(&mut p.q, &mut ls.k, &mut ls.v, &p.proj, &layer.q_norm, &layer.k_norm, &s.cos, &s.sin, start, n, c.num_q_heads, c.num_kv_heads, c.rotary_dim, eps);
-      pf_gated_attention(&mut p.y, &mut p.parts, &p.q, &ls.k, &ls.v, &p.proj, start, n, c.num_q_heads, c.num_kv_heads);
+      pf_gated_flash_attention(&mut p.y, &p.q, &ls.k, &ls.v, &p.proj, start, n, c.num_q_heads, c.num_q_heads / c.num_kv_heads, qkv_rows - c.num_q_heads * 256, 0.0625);
       // The product goes to xn, which is free until the norm, as in `pf_chunk`.
       pf_mm(&mut p.xn, &layer.attn_out, &p.y, &p.rows, &p.zeros, 0, &p.no_bias, false, false, c.hidden_size, c.num_q_heads * 256, tiles);
     } else {

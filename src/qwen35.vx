@@ -78,14 +78,16 @@ fn new_qwen35_state(c : &Config, max_seq : i32) -> Qwen35State {
       hsin[p][i] = f64::sin(angle) as f32;
     }
   }
+  // The caches have a multiple of 64 rows, for `pf_gated_flash_attention`.
+  let rows = (max_seq + 63) / 64 * 64;
   let mut layers = Vec<Qwen35LayerState>::new();
   for l in 0..c.num_layers {
     if (l + 1) % c.full_attention_interval == 0 {
       layers.push(Qwen35LayerState {
         conv: transfer(Tensor<f32>([1, 1, 1]), Memory::HBM),
         s: transfer(Tensor<f32>([1, 1, 1]), Memory::HBM),
-        k: transfer(Tensor<f16>([max_seq, c.num_kv_heads, 256]), Memory::HBM),
-        v: transfer(Tensor<f16>([max_seq, c.num_kv_heads, 256]), Memory::HBM),
+        k: transfer(Tensor<f16>([rows, c.num_kv_heads, 256]), Memory::HBM),
+        v: transfer(Tensor<f16>([rows, c.num_kv_heads, 256]), Memory::HBM),
       });
     } else {
       layers.push(Qwen35LayerState {

@@ -6,6 +6,9 @@
 // - the bf16 and the Q4_0 files after a prompt of 2,100 tokens. So the prompt runs in 2 chunks
 //   (the state of each layer goes from one chunk to the next), and the full attention layer goes
 //   past position 2,048, where its blocks take 64 SIMD groups for each head in place of 32.
+// - the Q4_0 file with --draft 7, against the same file without it: the lines of the steps must be
+//   the same, logits too. The prompt repeats its first 10 tokens at its end, and the model gives
+//   109 and 99 after it, as it did after their first copy, so a round of 7 draft tokens runs.
 //
 // The products of a chunk round each Q4_0 weight, (code - 8) times its scale, to f16, as for the
 // Qwen3 models. So the Q4_0 files get 0.003, as in tests/prefill.vx, and the bf16 files 0.001.
@@ -30,8 +33,17 @@
 // RUN: python3 %S/../scripts/reference.py %t-long.vxw --tokens $(cat %t-long.ids) --steps 8 > %t-long.reference
 // RUN: vxc %S/../src/main.vx --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t-long.vxw --tokens $(cat %t-long.ids) --steps 8 > %t-long.vx
 // RUN: python3 %S/../scripts/compare.py %t-long.reference %t-long.vx --tolerance 0.003 | FileCheck %s --check-prefix=LONG
+// RUN: vxc %S/../src/main.vx --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t-q4.vxw --tokens 31,41,59,26,53,58,97,93,23,84,109,99,62,64,33,83,27,31,41,59,26,53,58,97,93,23,84 --steps 32 > %t-plain.vx
+// RUN: vxc %S/../src/main.vx --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t-q4.vxw --tokens 31,41,59,26,53,58,97,93,23,84,109,99,62,64,33,83,27,31,41,59,26,53,58,97,93,23,84 --steps 32 --draft 7 > %t-draft.vx
+// RUN: grep step= %t-plain.vx > %t-plain.steps
+// RUN: grep step= %t-draft.vx > %t-draft.steps
+// RUN: diff %t-plain.steps %t-draft.steps
+// RUN: grep -c step= %t-draft.steps | FileCheck %s --check-prefix=STEPS
+// RUN: grep rounds= %t-draft.vx | FileCheck %s --check-prefix=DRAFT
 //
 // CHECK: 16 steps, same tokens, logits within 0.001
 // Q4: 16 steps, same tokens, logits within 0.003
 // LONG-BF16: 8 steps, same tokens, logits within 0.001
 // LONG: 8 steps, same tokens, logits within 0.003
+// STEPS: {{^}}32{{$}}
+// DRAFT: rounds=1 drafted=7 accepted=0;
