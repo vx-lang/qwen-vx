@@ -21,7 +21,10 @@
 // format of the Instruct models and prints only the reply. --lines prints the lines of --tokens
 // in place of the text. Qwen3.5 and Qwen3.6 think before they reply by default; with --chat, the
 // prompt turns the thinking off, as the chat template does with enable_thinking=false, unless
-// --think is given.
+// --think is given. --ignore-eos does not stop at a special token, so the text runs for --steps
+// tokens, as llama.cpp's --ignore-eos. --prompt-runs K (Qwen3.5 and Qwen3.6) runs the prompt K
+// times, each on a fresh state, and prints the time of each run: the first run includes the first
+// launch of each kernel. The tokens come from the last run.
 import core::convert;
 import std::time;
 import std::vec;
@@ -61,6 +64,9 @@ struct Options {
   draft : *const i8,
   has_draft : bool,
   think : bool,
+  ignore_eos : bool,
+  prompt_runs : *const i8,
+  has_prompt_runs : bool,
 }
 
 /// The options of `argv`. Asserts that they are complete and that they fit together.
@@ -70,7 +76,7 @@ fn parse_options(argc : i32, argv : *mut *mut i8) -> Options {
   let mut o = Options {
     weights: unsafe { argv[1] }, tokens: empty, tokenizer: empty, prompt: empty, prompt_file: empty,
     steps: empty, has_tokens: false, has_tokenizer: false, has_prompt: false, has_prompt_file: false,
-    has_steps: false, context: empty, has_context: false, requests: empty, has_requests: false, replies: empty, has_replies: false, session: false, chat: false, lines: false, draft: empty, has_draft: false, think: false,
+    has_steps: false, context: empty, has_context: false, requests: empty, has_requests: false, replies: empty, has_replies: false, session: false, chat: false, lines: false, draft: empty, has_draft: false, think: false, ignore_eos: false, prompt_runs: empty, has_prompt_runs: false,
   };
   let mut i = 2;
   while i < argc {
@@ -80,6 +86,9 @@ fn parse_options(argc : i32, argv : *mut *mut i8) -> Options {
       i = i + 1;
     } else if same(name, "--think") {
       o.think = true;
+      i = i + 1;
+    } else if same(name, "--ignore-eos") {
+      o.ignore_eos = true;
       i = i + 1;
     } else if same(name, "--session") {
       o.session = true;
@@ -114,6 +123,9 @@ fn parse_options(argc : i32, argv : *mut *mut i8) -> Options {
       } else if same(name, "--draft") {
         o.draft = value;
         o.has_draft = true;
+      } else if same(name, "--prompt-runs") {
+        o.prompt_runs = value;
+        o.has_prompt_runs = true;
       } else {
         assert(same(name, "--steps"), "give: WEIGHTS --tokens 1,2,3 --steps N, or WEIGHTS --tokenizer FILE (--prompt TEXT | --prompt-file FILE) [--chat] [--lines] --steps N");
         o.steps = value;
@@ -238,10 +250,11 @@ fn prompt_ids(o : &Options, t : &Tokenizer) -> Vec<i32> {
 }
 
 /// Shows token number `step`, as the loop of `main` does: its text, or a line with its logit.
-/// Gives false at the end of the text, where the loop stops.
+/// Gives false at the end of the text, where the loop stops. With `eos` -1 (--ignore-eos), the text
+/// has no end.
 fn show(t : &Tokenizer, eos : i32, text_mode : bool, step : i32, token : i32, logit : f32) -> bool {
   if text_mode {
-    if is_special(t, token) || token == eos {
+    if ends_text(t, eos, token) {
       return false;
     }
     write_token(t, token);
@@ -249,6 +262,11 @@ fn show(t : &Tokenizer, eos : i32, text_mode : bool, step : i32, token : i32, lo
     println!("step={} token={} logit={};", step, token, logit);
   }
   return true;
+}
+
+/// True when `token` ends the text: a special token or `eos`. Nothing ends it when `eos` is -1.
+fn ends_text(t : &Tokenizer, eos : i32, token : i32) -> bool {
+  return eos >= 0 && (is_special(t, token) || token == eos);
 }
 
 /// The logit `token` of position j of a round.
@@ -263,7 +281,7 @@ fn round_logit(logits : &Tensor<f32, [?, ?], Memory::HBM>, j : i32, token : i32)
 /// row that accepted nothing, until a longer match than theirs appears. A draft has up to `max`
 /// tokens. `first` is the first generated token, from the logits in `s.logits`. Shows the same
 /// `steps` tokens as the loop of `main`, and gives the number of tokens after the first.
-fn generate_with_drafts(w : &Weights, s : &mut State, t : &Tokenizer, text_mode : bool, prompt : &Vec<i32>, first : i32, steps : i32, max : i32, start : &mut Instant) -> i32 {
+fn generate_with_drafts(w : &Weights, s : &mut State, t : &Tokenizer, eos : i32, text_mode : bool, prompt : &Vec<i32>, first : i32, steps : i32, max : i32, start : &mut Instant) -> i32 {
   assert(can_round(w), "--draft needs a model of Q4_0 experts with QK norms, head_dim 128 and a 6-bit lm_head");
   assert(max >= 1 && max < ROUND_MAX, "--draft must be 1 to ROUND_MAX - 1");
   assert(steps >= ROUND_MAX, "--draft needs --steps of at least ROUND_MAX");
@@ -304,7 +322,7 @@ fn generate_with_drafts(w : &Weights, s : &mut State, t : &Tokenizer, text_mode 
   // Rounds in a row that accepted nothing, and the length of the match of the last of them.
   let mut misses = 0;
   let mut missed_length = 0;
-  let mut going = show(t, w.config.eos_token_id, text_mode, 0, token, read_logit(&s.logits, token));
+  let mut going = show(t, eos, text_mode, 0, token, read_logit(&s.logits, token));
   while going && step + 1 < steps {
     let room = steps - step - 1;
     let m = longest_match(&context);
@@ -342,7 +360,7 @@ fn generate_with_drafts(w : &Weights, s : &mut State, t : &Tokenizer, text_mode 
         if !text_mode {
           logit = read_logit(&s.logits, token);
         }
-        going = show(t, w.config.eos_token_id, text_mode, step, token, logit);
+        going = show(t, eos, text_mode, step, token, logit);
         j = j + 1;
       }
       run = i32::min(run * 2, AHEAD);
@@ -368,7 +386,7 @@ fn generate_with_drafts(w : &Weights, s : &mut State, t : &Tokenizer, text_mode 
         if !text_mode {
           logit = round_logit(&r.logits, j, token);
         }
-        going = show(t, w.config.eos_token_id, text_mode, step, token, logit);
+        going = show(t, eos, text_mode, step, token, logit);
         more = j < k && draft[j] == token;
         if more {
           accepted = accepted + 1;
@@ -392,11 +410,10 @@ fn generate_with_drafts(w : &Weights, s : &mut State, t : &Tokenizer, text_mode 
 /// `commit_round35` writes the DeltaNet states of the tokens that the round keeps. The first step
 /// is a plain step that compiles the kernels of a token, so the clock starts after it and the
 /// count of tokens leaves it out.
-fn generate_with_drafts35(w : &Qwen35Weights, s : &mut Qwen35State, t : &Tokenizer, text_mode : bool, prompt : &Vec<i32>, first : i32, steps : i32, max : i32, start : &mut Instant) -> i32 {
+fn generate_with_drafts35(w : &Qwen35Weights, s : &mut Qwen35State, t : &Tokenizer, eos : i32, text_mode : bool, prompt : &Vec<i32>, first : i32, steps : i32, max : i32, start : &mut Instant) -> i32 {
   assert(can_round35(w), "--draft needs a model of Q4_0 layers and experts and a 6-bit lm_head");
   assert(max >= 1 && max < ROUND_MAX, "--draft must be 1 to ROUND_MAX - 1");
   assert(steps >= ROUND_MAX, "--draft needs --steps of at least ROUND_MAX");
-  let eos = w.config.eos_token_id;
   let mut r = new_round35(&w.config);
   let mut ring = Vec<Slot>::new();
   for j in 0..AHEAD {
@@ -531,8 +548,13 @@ fn generate_with_drafts35(w : &Qwen35Weights, s : &mut Qwen35State, t : &Tokeniz
 /// `main` for a Qwen3.5 or Qwen3.6 model (weight file v2, arch 1). The prompt runs in chunks
 /// (src/prefill35.vx). With --draft, the tokens come from `generate_with_drafts35`. Prints the
 /// same lines as `main`.
-fn run_qwen35(path : *const i8, t : &Tokenizer, text_mode : bool, chat : bool, prompt : &Vec<i32>, steps : i32, draft : i32) -> i32 {
+fn run_qwen35(path : *const i8, t : &Tokenizer, text_mode : bool, chat : bool, ignore_eos : bool, prompt : &Vec<i32>, steps : i32, draft : i32, runs : i32) -> i32 {
   let w = load_qwen35_weights(path);
+  let eos = if ignore_eos {
+    -1
+  } else {
+    w.config.eos_token_id
+  };
   let count = prompt.len();
   let mut s = new_qwen35_state(&w.config, count + steps);
   for i in 0..count {
@@ -565,16 +587,30 @@ fn run_qwen35(path : *const i8, t : &Tokenizer, text_mode : bool, chat : bool, p
     }
     println!(";");
   }
-  let prompt_start = Instant::now();
-  prefill_qwen35(&w, &mut s, prompt);
-  predict_qwen35(&w, &mut s, &mut slots[0].next);
+  // Each run of the prompt starts from a fresh state, made before its clock starts. The runs use the
+  // same tensors of the chunk, as a session does, made before the first clock starts, as llama.cpp
+  // makes its buffers when it loads the model.
+  let mut p = new_prefill35(&w.config, prefill35_chunk(count));
   let mut tokens = Vec<i32>::new();
-  tokens.push(read_token(&slots[0].next));
-  let prompt_ms = f64::from(prompt_start.elapsed().as_secs_f32()) * 1000.0;
+  let mut prompt_ms : f64 = 0.0;
+  for run in 0..runs {
+    if run > 0 {
+      s = new_qwen35_state(&w.config, count + steps);
+    }
+    let prompt_start = Instant::now();
+    prefill_qwen35_with(&w, &mut s, &mut p, prompt);
+    predict_qwen35(&w, &mut s, &mut slots[0].next);
+    tokens = Vec<i32>::new();
+    tokens.push(read_token(&slots[0].next));
+    prompt_ms = f64::from(prompt_start.elapsed().as_secs_f32()) * 1000.0;
+    if runs > 1 {
+      println!("time prompt_ms={};", prompt_ms);
+    }
+  }
   let mut start = Instant::now();
   let mut decoded = 0;
   if draft > 0 {
-    decoded = generate_with_drafts35(&w, &mut s, t, text_mode, prompt, tokens[0], steps, draft, &mut start);
+    decoded = generate_with_drafts35(&w, &mut s, t, eos, text_mode, prompt, tokens[0], steps, draft, &mut start);
   }
   for step in 0..steps {
     if draft > 0 {
@@ -582,7 +618,7 @@ fn run_qwen35(path : *const i8, t : &Tokenizer, text_mode : bool, chat : bool, p
     }
     let token = tokens[step];
     if text_mode {
-      if is_special(t, token) || token == w.config.eos_token_id {
+      if ends_text(t, eos, token) {
         break;
       }
       write_token(t, token);
@@ -649,9 +685,21 @@ fn main(argc : i32, argv : *mut *mut i8) -> i32 {
     } else {
       0
     };
-    return run_qwen35(o.weights, &t, text_mode, o.chat, &prompt, steps, draft);
+    let runs = if o.has_prompt_runs {
+      parse_numbers(o.prompt_runs)[0]
+    } else {
+      1
+    };
+    assert(runs >= 1, "--prompt-runs must be at least 1");
+    return run_qwen35(o.weights, &t, text_mode, o.chat, o.ignore_eos, &prompt, steps, draft, runs);
   }
+  assert(!o.has_prompt_runs, "--prompt-runs needs a Qwen3.5 or Qwen3.6 file");
   let w = load_weights(o.weights);
+  let eos = if o.ignore_eos {
+    -1
+  } else {
+    w.config.eos_token_id
+  };
   let mut s = new_state(&w.config, count + steps);
   for i in 0..count {
     assert(prompt[i] < w.config.vocab_size, "a token of the prompt is not in the vocabulary");
@@ -703,7 +751,7 @@ fn main(argc : i32, argv : *mut *mut i8) -> i32 {
   // The number of tokens that the loop ran through the model.
   let mut decoded = 0;
   if o.has_draft {
-    decoded = generate_with_drafts(&w, &mut s, &t, text_mode, &prompt, tokens[0], steps, parse_numbers(o.draft)[0], &mut start);
+    decoded = generate_with_drafts(&w, &mut s, &t, eos, text_mode, &prompt, tokens[0], steps, parse_numbers(o.draft)[0], &mut start);
   }
   for step in 0..steps {
     if o.has_draft {
@@ -711,7 +759,7 @@ fn main(argc : i32, argv : *mut *mut i8) -> i32 {
     }
     let token = tokens[step];
     if text_mode {
-      if is_special(&t, token) || token == w.config.eos_token_id {
+      if ends_text(&t, eos, token) {
         break;
       }
       write_token(&t, token);

@@ -9,6 +9,8 @@
 // - the Q4_0 file with --draft 7, against the same file without it: the lines of the steps must be
 //   the same, logits too. The prompt repeats its first 10 tokens at its end, and the model gives
 //   109 and 99 after it, as it did after their first copy, so a round of 7 draft tokens runs.
+// - the Q4_0 file with --prompt-runs 3: a time for each run of the prompt, and the lines of the
+//   steps of the file without it.
 //
 // The products of a chunk round each Q4_0 weight, (code - 8) times its scale, to f16, as for the
 // Qwen3 models. So the Q4_0 files get 0.003, as in tests/prefill.vx, and the bf16 files 0.001.
@@ -40,6 +42,11 @@
 // RUN: diff %t-plain.steps %t-draft.steps
 // RUN: grep -c step= %t-draft.steps | FileCheck %s --check-prefix=STEPS
 // RUN: grep rounds= %t-draft.vx | FileCheck %s --check-prefix=DRAFT
+// RUN: vxc %S/../src/main.vx --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t-q4.vxw --tokens 1,2,3,4 --steps 16 --prompt-runs 3 > %t-runs.vx
+// RUN: grep step= %t-q4.vx > %t-q4.steps
+// RUN: grep step= %t-runs.vx > %t-runs.steps
+// RUN: diff %t-q4.steps %t-runs.steps
+// RUN: grep -c "time prompt_ms=" %t-runs.vx | FileCheck %s --check-prefix=RUNS
 //
 // CHECK: 16 steps, same tokens, logits within 0.001
 // Q4: 16 steps, same tokens, logits within 0.003
@@ -47,3 +54,4 @@
 // LONG: 8 steps, same tokens, logits within 0.003
 // STEPS: {{^}}32{{$}}
 // DRAFT: rounds=1 drafted=7 accepted=0;
+// RUNS: {{^}}3{{$}}

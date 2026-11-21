@@ -1047,15 +1047,28 @@ fn pf35_chunk(w : &Qwen35Weights, s : &mut Qwen35State, p : &mut Prefill35, star
   return;
 }
 
+/// The chunk of `prefill_qwen35` for a prompt of `count` tokens: CHUNK, or fewer for a shorter
+/// prompt.
+fn prefill35_chunk(count : i32) -> i32 {
+  return i32::min(CHUNK, (count + 15) / 16 * 16);
+}
+
 /// Runs the prompt through every layer, in chunks of up to CHUNK tokens, from position 0. The
 /// hidden state of the last token is then in `s.x`, as after `run_qwen35_layers`, so
 /// `predict_qwen35` gives the next token.
 fn prefill_qwen35(w : &Qwen35Weights, s : &mut Qwen35State, prompt : &Vec<i32>) -> void {
+  let mut p = new_prefill35(&w.config, prefill35_chunk(prompt.len()));
+  prefill_qwen35_with(w, s, &mut p, prompt);
+  return;
+}
+
+/// `prefill_qwen35` with the tensors of `p`, from `new_prefill35`, so that more prompts can use the
+/// same tensors. Each chunk writes the parts of them that it reads.
+fn prefill_qwen35_with(w : &Qwen35Weights, s : &mut Qwen35State, p : &mut Prefill35, prompt : &Vec<i32>) -> void {
   let c = &w.config;
   let count = prompt.len();
   assert(count > 0 && count <= s.max_seq, "prefill_qwen35: the prompt must have tokens and fit in the state");
-  let chunk = i32::min(CHUNK, (count + 15) / 16 * 16);
-  let mut p = new_prefill35(c, chunk);
+  let chunk = p.tokens.len();
   let mut start = 0;
   let mut last = 0;
   while start < count {
@@ -1077,7 +1090,7 @@ fn prefill_qwen35(w : &Qwen35Weights, s : &mut Qwen35State, prompt : &Vec<i32>) 
     }
     p.tokens = transfer(ids, Memory::HBM);
     p.rows = transfer(rows, Memory::HBM);
-    pf35_chunk(w, s, &mut p, start, n);
+    pf35_chunk(w, s, p, start, n);
     last = n;
     start = start + n;
   }
