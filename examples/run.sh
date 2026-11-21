@@ -30,7 +30,7 @@ for task in "$@"; do
   [ -z "${SKILLS:-}" ] || [ -n "$skills" ] || continue
   ids=$(python3 "$here/harness.py" encode "$tokenizer" "$here/prompts/$task.txt" $skills)
   mkdir -p "$out/$task$suffix"
-  vxc src/main.vx --package qwen=src --host default \
+  vxc -O2 src/main.vx --package qwen=src --host default \
       --machine "$VX_HOME/current/fleet/m4-uma.vx" -- "$weights" --tokens "$ids" --steps 700 \
       2> "$out/$task$suffix/vxc.log" > "$out/$task$suffix/vx.txt"
   printf '%-24s ' "$task$suffix"

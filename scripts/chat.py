@@ -37,7 +37,7 @@ DONE = re.compile(rb"^done prompt=(\d+) reused=(\d+) ran=(\d+) generated=(\d+) p
 
 def vxc_command(weights, tokenizer, *program_args):
     vxc = os.environ.get("VXC", "vxc")
-    return [vxc, str(ROOT / "src" / "main.vx"), "--package", f"qwen={ROOT / 'src'}", "--host", "default",
+    return [vxc, "-O2", str(ROOT / "src" / "main.vx"), "--package", f"qwen={ROOT / 'src'}", "--host", "default",
             "--machine", str(VX_FLEET / "m4-uma.vx"), "--", str(weights), "--tokenizer", str(tokenizer), *program_args]
 
 

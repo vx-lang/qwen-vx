@@ -14,7 +14,7 @@ Qwen3-Coder-30B-A3B in Q4_0 on an M4 with 32 GB.
 ## Run them
 
 ```sh
-vxc decode/profile_decode.vx --package qwen=src --host default \
+vxc -O2 decode/profile_decode.vx --package qwen=src --host default \
     --machine ~/.vx/current/fleet/m4-uma.vx -- qwen3-30b-q4.vxw
 
 clang -O2 -fobjc-arc -framework Foundation -framework Metal decode/bandwidth.m -o bandwidth

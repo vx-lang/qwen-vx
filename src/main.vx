@@ -7,7 +7,7 @@
 //===----------------------------------------------------------------------===//
 // Generates tokens with greedy decoding, on the GPU:
 //
-//   vxc src/main.vx --package qwen=src --host default \
+//   vxc -O2 src/main.vx --package qwen=src --host default \
 //       --machine ~/.vx/current/fleet/m4-uma.vx -- WEIGHTS --tokens 750,75698,1445 --steps 16
 //   vxc src/main.vx ... -- WEIGHTS --tokenizer TOKENIZER --prompt "def fibonacci(n):" --steps 64
 //   vxc src/main.vx ... -- WEIGHTS --tokenizer TOKENIZER --chat --prompt-file FILE --steps 512

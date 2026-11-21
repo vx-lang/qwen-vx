@@ -81,10 +81,14 @@ pip install -r requirements.txt
 1. Generate text with the Vx program, on the GPU:
 
    ```sh
-   vxc src/main.vx --package qwen=src --host default \
+   vxc -O2 src/main.vx --package qwen=src --host default \
        --machine ~/.vx/current/fleet/m4-uma.vx -- qwen-0.5b.vxw \
        --tokenizer qwen.vxt --prompt "def fibonacci(n):" --steps 64
    ```
+
+   `-O2` optimizes the code that runs on the CPU, which vxc compiles at `-O0` by default. The
+   kernels are the same, but the prompt is faster: the CPU makes the tensors of a chunk in about
+   1 ms in place of about 50 ms for each 100 MB. Use `-O2` for every run that you time.
 
    `vxc` first warns that it cannot check the memory of some functions with a dynamic shape
    (W1029). These warnings are expected. The program then prints the prompt, the text that the
@@ -94,7 +98,7 @@ pip install -r requirements.txt
    reply, and it stops at the end of the reply. `--prompt-file FILE` reads the prompt from a file:
 
    ```sh
-   vxc src/main.vx --package qwen=src --host default \
+   vxc -O2 src/main.vx --package qwen=src --host default \
        --machine ~/.vx/current/fleet/m4-uma.vx -- qwen-0.5b.vxw \
        --tokenizer qwen.vxt --chat --prompt "Write a C++ function that reverses a string." --steps 300
    ```
@@ -117,9 +121,9 @@ pip install -r requirements.txt
    program prints the lines of `reference.py`. `--lines` prints the same lines for a text prompt:
 
    ```sh
-   vxc src/main.vx --package qwen=src --host default \
+   vxc -O2 src/main.vx --package qwen=src --host default \
        --machine ~/.vx/current/fleet/m4-uma.vx -- qwen-0.5b.vxw --tokens 750,75698,1445,1648 --steps 8
-   vxc src/main.vx --package qwen=src --host default \
+   vxc -O2 src/main.vx --package qwen=src --host default \
        --machine ~/.vx/current/fleet/m4-uma.vx -- qwen-0.5b.vxw \
        --tokenizer qwen.vxt --prompt "def fibonacci(n):" --lines --steps 8
    ```
@@ -212,7 +216,7 @@ Qwen3-Coder-30B-A3B is 61 GB in bf16, so this Mac runs it in Q4_0, at 17.8 GB:
 
 ```sh
 python3 scripts/convert.py --q4 ~/models/Qwen3-Coder-30B-A3B-Instruct qwen3-30b-q4.vxw
-vxc src/main.vx --package qwen=src --host default \
+vxc -O2 src/main.vx --package qwen=src --host default \
     --machine ~/.vx/current/fleet/m4-uma.vx -- qwen3-30b-q4.vxw --tokens 750,75698,1445,982,257 --steps 64
 ```
 
