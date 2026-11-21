@@ -237,7 +237,9 @@ def summary(out, rows):
     if wrong:
         say("llama.cpp read another number of tokens for: " + ", ".join(wrong))
         say("")
-    lines += [line.strip() for line in open(out / "env.txt") if line.startswith(("flash attention:", "draft lengths"))]
+    # Each start of run.sh adds these lines to env.txt. Show each line once.
+    lines += dict.fromkeys(line.strip() for line in open(out / "env.txt")
+                           if line.startswith(("flash attention:", "draft lengths")))
     say("")
 
     say("## Table A: generated tokens after a prompt")
@@ -330,6 +332,9 @@ def summary(out, rows):
         for p in programs:
             if p != "qwen-vx --draft":
                 compare("qwen-vx --draft", p)
+        for p in programs:
+            if p.startswith("llama.cpp "):
+                compare(p, "llama-completion")
         say("")
         say("### Drafts, table C, round 1")
         say("")
@@ -341,7 +346,9 @@ def summary(out, rows):
             for p in drafters:
                 rr = [r for r in timed(rows, "C", p) if r["round"] == "1" and (kind is None or r["kind"] == kind)]
                 acc, dr = sum(r["accepted"] or 0 for r in rr), sum(r["drafted"] or 0 for r in rr)
-                cells.append(f"{acc} / {dr} ({100 * acc / dr:.0f}%)" if dr else "")
+                checks = sum(r["checks"] or 0 for r in rr)
+                cells.append((f"{acc} / {dr} ({100 * acc / dr:.0f}%)" if dr else "")
+                             + (f", {acc / checks:.2f} per check" if checks else ""))
             say(f"| {kind or 'all 12'} | " + " | ".join(cells) + " |")
         say("")
         say_same_text(say, rows, "C")
