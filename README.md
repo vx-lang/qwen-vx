@@ -104,7 +104,8 @@ pip install -r requirements.txt
    read of the weights, and the text is the same as without `--draft`. This helps most when the
    reply repeats the prompt, as an edit of a file does: about 1.8 times as fast with the 30B
    model (`docs/optimizations.md`, entry 14). It needs the 30B model in Q4_0 with the 6-bit
-   `lm_head` (`scripts/convert.py --q4 --q6-lm-head`), and `--steps` of at least 16.
+   `lm_head` (`scripts/convert.py --q4 --q6-lm-head`), and `--steps` of at least 16. With Qwen3.6,
+   use `--draft 11`: its rule (`draft_length35` in `src/speculate.vx`) drafts up to 11 tokens.
 
 1. Generate a few tokens with the NumPy reference. It prints the prompt as token ids:
 
