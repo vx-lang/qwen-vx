@@ -1,0 +1,1975 @@
+//===- model.vx - Qwen app --------------------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// One token of a Qwen2 or Qwen3 MoE decoder on the GPU, with the kernels of `std::nn`. `State`
+// holds every tensor that a token writes, and the KV cache. It is made once, before the first
+// token, so the token loop allocates nothing.
+import core::convert;
+import core::num;
+import std::nn;
+import std::vec;
+import qwen::attention;
+import qwen::products;
+import qwen::q6;
+import qwen::weights;
+
+/// The keys and the values of every position so far, for one layer: [max_seq, kv_heads, head_dim].
+/// They are f16, half the memory of f32. The kernels compute in f32, and round only what they
+/// store here.
+struct Cache {
+  k : Tensor<f16, [?, ?, ?], Memory::HBM>,
+  v : Tensor<f16, [?, ?, ?], Memory::HBM>,
+}
+
+/// The tensors of a mixture-of-experts layer: the router's score of each expert, the chosen
+/// experts and their weights, and the SwiGLU output of each chosen expert, [experts_per_token,
+/// moe_intermediate_size].
+struct Experts {
+  router_logits : Tensor<f32, [?], Memory::HBM>,
+  ids : Tensor<i32, [?], Memory::HBM>,
+  weights : Tensor<f32, [?], Memory::HBM>,
+  mlp : Tensor<f32, [?, ?], Memory::HBM>,
+}
+
+/// The tensors that a token writes, in GPU memory, and one `Cache` for each layer. `cos` and `sin`
+/// are [max_seq, head_dim / 2].
+struct State {
+  max_seq : i32,
+  x : Tensor<f32, [?], Memory::HBM>,
+  xn : Tensor<f32, [?], Memory::HBM>,
+  q : Tensor<f32, [?, ?], Memory::HBM>,
+  k : Tensor<f32, [?, ?], Memory::HBM>,
+  v : Tensor<f32, [?, ?], Memory::HBM>,
+  q_turned : Tensor<f32, [?, ?], Memory::HBM>,
+  attended : Tensor<f32, [?, ?], Memory::HBM>,
+  attention_parts : Tensor<f32, [?, ?, ?, ?], Memory::HBM>,
+  vec_parts : Tensor<f32, [?, ?, ?], Memory::HBM>,
+  mlp : Tensor<f32, [?], Memory::HBM>,
+  experts : Experts,
+  logits : Tensor<f32, [?], Memory::HBM>,
+  cos : Tensor<f32, [?, ?], Memory::HBM>,
+  sin : Tensor<f32, [?, ?], Memory::HBM>,
+  caches : Vec<Cache>,
+}
+
+/// The state for up to `max_seq` positions. The angles of RoPE are computed in f64, as in
+/// `reference.py`, and rounded to f32 once.
+fn new_state(c : &Config, max_seq : i32) -> State {
+  assert(max_seq > 0 && max_seq <= c.max_positions, "max_seq must be between 1 and the max_positions of the model");
+  let half = c.head_dim / 2;
+  let mut hcos = Tensor<f32>([max_seq, half]);
+  let mut hsin = Tensor<f32>([max_seq, half]);
+  for p in 0..max_seq {
+    for i in 0..half {
+      let angle = f64::from(p) / f64::powf(c.rope_theta, f64::from(2 * i) / f64::from(c.head_dim));
+      hcos[p][i] = f64::cos(angle) as f32;
+      hsin[p][i] = f64::sin(angle) as f32;
+    }
+  }
+  // A dense model uses none of the tensors of the experts, so one value each is enough.
+  let experts = i32::max(c.num_experts, 1);
+  let chosen = i32::max(c.experts_per_token, 1);
+  let moe_inter = i32::max(c.moe_intermediate_size, 1);
+  // The flash attention of a prompt reads the cache in blocks of 64 positions.
+  let rows = (max_seq + 63) / 64 * 64;
+  let mut caches = Vec<Cache>::new();
+  for l in 0..c.num_layers {
+    caches.push(Cache {
+      k: transfer(Tensor<f16>([rows, c.num_kv_heads, c.head_dim]), Memory::HBM),
+      v: transfer(Tensor<f16>([rows, c.num_kv_heads, c.head_dim]), Memory::HBM),
+    });
+  }
+  return State {
+    max_seq: max_seq,
+    x: transfer(Tensor<f32>([c.hidden_size]), Memory::HBM),
+    xn: transfer(Tensor<f32>([c.hidden_size]), Memory::HBM),
+    q: transfer(Tensor<f32>([c.num_q_heads, c.head_dim]), Memory::HBM),
+    k: transfer(Tensor<f32>([c.num_kv_heads, c.head_dim]), Memory::HBM),
+    v: transfer(Tensor<f32>([c.num_kv_heads, c.head_dim]), Memory::HBM),
+    q_turned: transfer(Tensor<f32>([c.num_q_heads, c.head_dim]), Memory::HBM),
+    attended: transfer(Tensor<f32>([c.num_q_heads, c.head_dim]), Memory::HBM),
+    attention_parts: transfer(split_attention_scratch(max_seq, c.num_q_heads, c.num_kv_heads, c.head_dim), Memory::HBM),
+    vec_parts: transfer(vec_attention_scratch(c.num_q_heads), Memory::HBM),
+    mlp: transfer(Tensor<f32>([c.intermediate_size]), Memory::HBM),
+    experts: Experts {
+      router_logits: transfer(Tensor<f32>([experts]), Memory::HBM),
+      ids: transfer(Tensor<i32>([chosen]), Memory::HBM),
+      weights: transfer(Tensor<f32>([chosen]), Memory::HBM),
+      mlp: transfer(Tensor<f32>([chosen, moe_inter]), Memory::HBM),
+    },
+    logits: transfer(Tensor<f32>([c.vocab_size]), Memory::HBM),
+    cos: transfer(hcos, Memory::HBM),
+    sin: transfer(hsin, Memory::HBM),
+    caches: caches,
+  };
+}
+
+/// y = m x, with the kernel for the dtype of `m`, which has `rows` x `cols` weights.
+fn matvec(y : &mut Tensor<f32, [?], Memory::HBM>, m : &WeightMatrix, x : &Tensor<f32, [?], Memory::HBM>, rows : i32, cols : i32) -> void {
+  if m.dtype == U6 {
+    matvec_q6(y, &m.codes, &m.high, &m.group_scales, x, rows, cols);
+  } else if m.dtype == U4 {
+    nn_matvec_q4(y, &m.codes, &m.group_scales, x, rows, cols);
+  } else if m.dtype == F8E4M3 {
+    nn_matvec_fp8(y, &m.codes, &m.scales, x, rows, cols);
+  } else {
+    nn_matvec(y, &m.bf16, x, rows, cols);
+  }
+  return;
+}
+
+/// y += m x.
+fn matvec_add(y : &mut Tensor<f32, [?], Memory::HBM>, m : &WeightMatrix, x : &Tensor<f32, [?], Memory::HBM>, rows : i32, cols : i32) -> void {
+  if m.dtype == U4 {
+    nn_matvec_q4_add(y, &m.codes, &m.group_scales, x, rows, cols);
+  } else if m.dtype == F8E4M3 {
+    nn_matvec_fp8_add(y, &m.codes, &m.scales, x, rows, cols);
+  } else {
+    nn_matvec_add(y, &m.bf16, x, rows, cols);
+  }
+  return;
+}
+
+/// y += m x, for x of [heads, head_dim].
+fn matvec_heads_add(y : &mut Tensor<f32, [?], Memory::HBM>, m : &WeightMatrix, x : &Tensor<f32, [?, ?], Memory::HBM>, rows : i32, heads : i32, head_dim : i32) -> void {
+  if m.dtype == U4 {
+    matvec_q4_heads_add_blocks(y, &m.codes, &m.group_scales, x, rows, heads, head_dim);
+  } else if m.dtype == F8E4M3 {
+    nn_matvec_fp8_heads_add(y, &m.codes, &m.scales, x, rows, heads, head_dim);
+  } else {
+    nn_matvec_heads_add(y, &m.bf16, x, rows, heads, head_dim);
+  }
+  return;
+}
+
+/// The Q, K and V of x: m x + b, split by heads.
+fn qkv(q : &mut Tensor<f32, [?, ?], Memory::HBM>, k : &mut Tensor<f32, [?, ?], Memory::HBM>, v : &mut Tensor<f32, [?, ?], Memory::HBM>, m : &WeightMatrix, b : &Tensor<bf16, [?], Memory::HBM>, x : &Tensor<f32, [?], Memory::HBM>, c : &Config) -> void {
+  if m.dtype == U4 {
+    qkv_q4_blocks(q, k, v, &m.codes, &m.group_scales, b, x, c.num_q_heads, c.num_kv_heads, c.head_dim, c.hidden_size);
+  } else if m.dtype == F8E4M3 {
+    nn_qkv_fp8(q, k, v, &m.codes, &m.scales, b, x, c.num_q_heads, c.num_kv_heads, c.head_dim, c.hidden_size);
+  } else {
+    nn_qkv(q, k, v, &m.bf16, b, x, c.num_q_heads, c.num_kv_heads, c.head_dim, c.hidden_size);
+  }
+  return;
+}
+
+/// The SwiGLU of a dense MLP, for the gate rows and then the up rows of `m`.
+fn swiglu(out : &mut Tensor<f32, [?], Memory::HBM>, m : &WeightMatrix, x : &Tensor<f32, [?], Memory::HBM>, rows : i32, cols : i32) -> void {
+  if m.dtype == U4 {
+    nn_swiglu_q4(out, &m.codes, &m.group_scales, x, rows, cols);
+  } else if m.dtype == F8E4M3 {
+    nn_swiglu_fp8(out, &m.codes, &m.scales, x, rows, cols);
+  } else {
+    nn_swiglu(out, &m.bf16, x, rows, cols);
+  }
+  return;
+}
+
+/// The mixture of experts of a layer: the router chooses experts_per_token experts and their
+/// weights, and x gets the sum of their outputs for xn, each times its weight.
+fn add_experts(e : &mut Experts, x : &mut Tensor<f32, [?], Memory::HBM>, xn : &Tensor<f32, [?], Memory::HBM>, layer : &Layer, c : &Config) -> void {
+  let k = c.experts_per_token;
+  let inter = c.moe_intermediate_size;
+  nn_matvec(&mut e.router_logits, &layer.router, xn, c.num_experts, c.hidden_size);
+  nn_top_k(&mut e.ids, &mut e.weights, &e.router_logits, c.num_experts, k);
+  let gate_up = &layer.gate_up;
+  let down = &layer.down;
+  if gate_up.dtype == U4 {
+    moe_swiglu_q4_blocks(&mut e.mlp, &gate_up.codes, &gate_up.group_scales, &e.ids, xn, k, inter, c.hidden_size, c.num_experts);
+    moe_down_q4_add_blocks(x, &down.codes, &down.group_scales, &e.ids, &e.weights, &e.mlp, k, c.hidden_size, inter, c.num_experts);
+  } else {
+    assert(gate_up.dtype == BF16, "the experts of a mixture-of-experts model must be bf16 or Q4_0");
+    nn_moe_swiglu(&mut e.mlp, &gate_up.bf16, &e.ids, xn, k, inter, c.hidden_size, c.num_experts);
+    nn_moe_down_add(x, &down.bf16, &e.ids, &e.weights, &e.mlp, k, c.hidden_size, inter, c.num_experts);
+  }
+  return;
+}
+
+/// Runs the token in `token` at position `pos` through every layer. The hidden state of the
+/// token is then in `s.x`, and its keys and values are in the caches.
+fn run_layers(w : &Weights, s : &mut State, token : &Tensor<i32, [?], Memory::HBM>, pos : i32) -> void {
+  let c = &w.config;
+  let eps = c.rms_norm_eps as f32;
+  assert(pos >= 0 && pos < s.max_seq, "the position is past the end of the KV cache");
+  nn_embed(&mut s.x, &w.embed, token, c.hidden_size);
+  let mut l = 0;
+  for cache in s.caches.iter_mut() {
+    let layer = &w.layers[l];
+    nn_rms_norm(&mut s.xn, &s.x, &layer.attn_norm, c.hidden_size, eps);
+    qkv(&mut s.q, &mut s.k, &mut s.v, &layer.qkv, &layer.qkv_bias, &s.xn, c);
+    if c.qk_norm {
+      norm_rope_and_store(&mut s.q_turned, &mut cache.k, &mut cache.v, &s.q, &s.k, &s.v, &layer.q_norm, &layer.k_norm, &s.cos, &s.sin, pos, c.num_q_heads, c.num_kv_heads, c.head_dim, eps);
+    } else {
+      rope_and_store(&mut s.q_turned, &mut cache.k, &mut cache.v, &s.q, &s.k, &s.v, &s.cos, &s.sin, pos, c.num_q_heads, c.num_kv_heads, c.head_dim);
+    }
+    if c.head_dim == 128 {
+      vec_attention(&mut s.attended, &mut s.vec_parts, &s.q_turned, &cache.k, &cache.v, pos, c.num_q_heads, c.num_kv_heads, c.head_dim);
+    } else {
+      split_attention(&mut s.attended, &mut s.attention_parts, &s.q_turned, &cache.k, &cache.v, pos, c.num_q_heads, c.num_kv_heads, c.head_dim);
+    }
+    matvec_heads_add(&mut s.x, &layer.attn_out, &s.attended, c.hidden_size, c.num_q_heads, c.head_dim);
+    nn_rms_norm(&mut s.xn, &s.x, &layer.mlp_norm, c.hidden_size, eps);
+    if c.num_experts > 0 {
+      add_experts(&mut s.experts, &mut s.x, &s.xn, layer, c);
+    } else {
+      swiglu(&mut s.mlp, &layer.gate_up, &s.xn, c.intermediate_size, c.hidden_size);
+      matvec_add(&mut s.x, &layer.down, &s.mlp, c.hidden_size, c.intermediate_size);
+    }
+    l = l + 1;
+  }
+  return;
+}
+
+/// The logits of the token whose hidden state is in `s.x`, and in `next` the index of the largest
+/// one. Both stay in GPU memory.
+fn predict(w : &Weights, s : &mut State, next : &mut Tensor<i32, [?], Memory::HBM>) -> void {
+  let c = &w.config;
+  nn_rms_norm(&mut s.xn, &s.x, &w.final_norm, c.hidden_size, c.rms_norm_eps as f32);
+  if c.tied_embeddings {
+    nn_matvec(&mut s.logits, &w.embed, &s.xn, c.vocab_size, c.hidden_size);
+  } else {
+    matvec(&mut s.logits, &w.lm_head, &s.xn, c.vocab_size, c.hidden_size);
+  }
+  nn_argmax(next, &s.logits, c.vocab_size);
+  return;
+}
+//===- attention.vx - Qwen app ----------------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// The attention of one generated token, with the positions split among blocks. This is a copy of
+// `nn_attention` and its kernels from `std::nn` on Vx main (vx-lang/Vx#3216), with `split_` in place
+// of `nn_` in their names. Vx v0.0.4 has the older `nn_attention`, which has one block for each head
+// of Q, so its time grows with the number of positions. Remove this file, and call `nn_attention`
+// of `std::nn`, when a Vx release has the new one (#4).
+//
+// `vec_attention`, for head_dim 128, has the design of llama.cpp's flash attention for one token
+// (kernel_flash_attn_ext_vec and kernel_flash_attn_ext_vec_reduce), MIT License, Copyright (c) 2023-2026
+// The ggml authors. scripts/mlir_kernels/decode_attention.py writes its kernels: change that script, not
+// the MLIR.
+import core::num;
+import std::nn;
+
+/// Attention of the token at position `pos` over rows 0 to `pos` of the KV cache, with a softmax
+/// of the scores q . k / sqrt(head_dim). `part` is scratch space from `split_attention_scratch`.
+///
+/// The blocks of the first kernel split the positions, 32 to a block below position 640 and 64 from
+/// there on. A block serves the 8 heads of Q that share a head of K and V, so it reads each row of
+/// the cache once for all 8. A second kernel merges the parts of the blocks for each head.
+fn split_attention<M : Memory>(out : &mut Tensor<f32, [?, ?], Memory::M>, part : &mut Tensor<f32, [?, ?, ?, ?], Memory::M>, q : &Tensor<f32, [?, ?], Memory::M>, k_cache : &Tensor<f16, [?, ?, ?], Memory::M>, v_cache : &Tensor<f16, [?, ?, ?], Memory::M>, pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+  nn_check_heads(q.extent(0), q.extent(1), q_heads, head_dim);
+  nn_check_heads(out.extent(0), out.extent(1), q_heads, head_dim);
+  nn_check_cache(k_cache.extent(0), k_cache.extent(1), k_cache.extent(2), pos, kv_heads, head_dim);
+  nn_check_cache(v_cache.extent(0), v_cache.extent(1), v_cache.extent(2), pos, kv_heads, head_dim);
+  assert(q_heads % kv_heads == 0, "split_attention: q_heads must be a multiple of kv_heads");
+  assert(head_dim % 32 == 0 && head_dim <= 128, "split_attention: head_dim must be a multiple of 32, and at most 128");
+  let mut n_pos = 32;
+  if pos >= 640 {
+    n_pos = 64;
+  }
+  assert(part.extent(0) >= kv_heads * ((q_heads / kv_heads + 7) / 8) && part.extent(1) >= (pos + n_pos) / n_pos && part.extent(2) >= 8 && part.extent(3) >= head_dim + 2, "split_attention: `part` is too small for this position. Make it with split_attention_scratch");
+  if n_pos == 32 {
+    split_attention_parts_32(part, q, k_cache, v_cache, pos, q_heads, kv_heads, head_dim);
+  } else {
+    split_attention_parts_64(part, q, k_cache, v_cache, pos, q_heads, kv_heads, head_dim);
+  }
+  split_attention_merge(out, part, pos, n_pos, q_heads, kv_heads, head_dim);
+  return;
+}
+
+/// Attention of the token at position `pos`, as `split_attention`, for head_dim 128, with the kernels of
+/// llama.cpp's flash attention for one token. `vec_attention_parts` splits the blocks of 32 positions among
+/// `nwg` SIMD groups for each head of Q: 32 of them, or 64 when each of 32 would have more than 2 blocks.
+/// (llama.cpp goes on to 4 SIMD groups of 32 a block, but 128 parts are no faster here: their merge costs what
+/// they save.) `vec_attention_merge` then merges the parts. `part` is scratch space from
+/// `vec_attention_scratch`.
+fn vec_attention(out : &mut Tensor<f32, [?, ?], Memory::HBM>, part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+  nn_check_heads(q.extent(0), q.extent(1), q_heads, head_dim);
+  nn_check_heads(out.extent(0), out.extent(1), q_heads, head_dim);
+  nn_check_cache(k_cache.extent(0), k_cache.extent(1), k_cache.extent(2), pos, kv_heads, head_dim);
+  nn_check_cache(v_cache.extent(0), v_cache.extent(1), v_cache.extent(2), pos, kv_heads, head_dim);
+  assert(q_heads % kv_heads == 0 && head_dim == 128, "vec_attention: q_heads must be a multiple of kv_heads, and head_dim 128");
+  assert(part.extent(0) >= q_heads && part.extent(1) >= 128 && part.extent(2) == 132, "vec_attention: `part` is too small. Make it with vec_attention_scratch");
+  let mut nwg = 32;
+  if 2 * nwg * 32 < pos + 1 {
+    nwg = nwg * 2;
+  }
+  vec_attention_parts(part, q, k_cache, v_cache, pos, q_heads, q_heads / kv_heads, nwg, 1.0 / (head_dim as f32).sqrt());
+  vec_attention_merge(out, part, nwg, q_heads);
+  return;
+}
+
+/// The scratch space of `vec_attention`, on the CPU: up to 128 parts for each head of Q, each the sum of V
+/// (128 values), the largest score, and the sum of the weights. A part has 132 values, so that each starts
+/// at a multiple of 16 bytes.
+fn vec_attention_scratch(q_heads : i32) -> Tensor<f32, [?, ?, ?]> {
+  return Tensor<f32>([q_heads, 128, 132]);
+}
+
+/// The parts of `vec_attention`, as llama.cpp's kernel_flash_attn_ext_vec. Block (h, w) is a SIMD group for
+/// query head h. It does the blocks of 32 positions w, w + nwg, w + 2 nwg, ... up to `pos`, and writes
+/// part[h][w]. Lane l owns values 4 l to 4 l + 3 of the head, so that the 32 lanes read a row of K or V in
+/// one 256-byte load. For each row, the lanes add up their parts of q . k; then each lane keeps the score
+/// of one row, and the lanes take the weights of the rows from each other for the sum of V. A part is the
+/// sum of V, not divided, then the largest score and the sum of the weights.
+fn vec_attention_parts(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, pos : i32, q_heads : i32, group : i32, nwg : i32, scale : f32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..q_heads across blocks {
+      for w in 0..nwg across blocks {
+        let g = h / group;
+        let _d = mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
+          %c0 = arith.constant 0 : index
+          %c1 = arith.constant 1 : index
+          %c4 = arith.constant 4 : index
+          %c32 = arith.constant 32 : index
+          %c128 = arith.constant 128 : index
+          %c129 = arith.constant 129 : index
+          %c32i = arith.constant 32 : i32
+          %neg = arith.constant -3.0e38 : f32
+          %zero = arith.constant 0.0 : f32
+          %vz4 = arith.constant dense<0.0> : vector<4xf32>
+          %l = gpu.thread_id x
+          %l4 = arith.muli %l, %c4 : index
+          %hi = arith.index_cast %h : i32 to index
+          %wi = arith.index_cast %w : i32 to index
+          %gi = arith.index_cast %g : i32 to index
+          %posi = arith.index_cast %pos : i32 to index
+          %nwgi = arith.index_cast %nwg : i32 to index
+          %g128 = arith.muli %gi, %c128 : index
+          %kd = arith.addi %g128, %l4 : index
+          %P = memref.dim %k3, %c0 : memref<?x?x?xf16>
+          %KH = memref.dim %k3, %c1 : memref<?x?x?xf16>
+          %Wd = arith.muli %KH, %c128 : index
+          %k = memref.reinterpret_cast %k3 to offset: [0], sizes: [%P, %Wd], strides: [%Wd, 1] : memref<?x?x?xf16> to memref<?x?xf16, strided<[?, 1]>>
+          %v = memref.reinterpret_cast %v3 to offset: [0], sizes: [%P, %Wd], strides: [%Wd, 1] : memref<?x?x?xf16> to memref<?x?xf16, strided<[?, 1]>>
+          %qv = vector.load %q[%hi, %l4] {alignment = 16} : memref<?x?xf32>, vector<4xf32>
+          %scv = vector.broadcast %scale : f32 to vector<4xf32>
+          %qs = arith.mulf %qv, %scv : vector<4xf32>
+          %nkv = arith.addi %posi, %c32 : index
+          %chunks = arith.divui %nkv, %c32 : index
+          %st:3 = scf.for %ic = %wi to %chunks step %nwgi iter_args(%M = %neg, %S = %zero, %o = %vz4) -> (f32, f32, vector<4xf32>) {
+            %r0 = arith.muli %ic, %c32 : index
+            %my = scf.for %cc = %c0 to %c32 step %c1 iter_args(%m = %neg) -> (f32) {
+              %row = arith.addi %r0, %cc : index
+              %rowc = arith.minui %row, %posi : index
+              %kh = vector.load %k[%rowc, %kd] {alignment = 8} : memref<?x?xf16, strided<[?, 1]>>, vector<4xf16>
+              %kf = arith.extf %kh : vector<4xf16> to vector<4xf32>
+              %pr = arith.mulf %kf, %qs : vector<4xf32>
+              %pl = vector.reduction <add>, %pr : vector<4xf32> into f32
+              %sc = gpu.subgroup_reduce add %pl : (f32) -> f32
+              %live = arith.cmpi ule, %row, %posi : index
+              %scm = arith.select %live, %sc, %neg : f32
+              %mine = arith.cmpi eq, %cc, %l : index
+              %m2 = arith.select %mine, %scm, %m : f32
+              scf.yield %m2 : f32
+            }
+            %bm = gpu.subgroup_reduce maxnumf %my : (f32) -> f32
+            %Mn = arith.maxnumf %M, %bm : f32
+            %dm = arith.subf %M, %Mn : f32
+            %ms = math.exp %dm : f32
+            %dp = arith.subf %my, %Mn : f32
+            %p = math.exp %dp : f32
+            %bs = gpu.subgroup_reduce add %p : (f32) -> f32
+            %Ss = arith.mulf %S, %ms : f32
+            %Sn = arith.addf %Ss, %bs : f32
+            %msv = vector.broadcast %ms : f32 to vector<4xf32>
+            %o1 = arith.mulf %o, %msv : vector<4xf32>
+            %o2 = scf.for %cc = %c0 to %c32 step %c1 iter_args(%oa = %o1) -> (vector<4xf32>) {
+              %row = arith.addi %r0, %cc : index
+              %rowc = arith.minui %row, %posi : index
+              %vh = vector.load %v[%rowc, %kd] {alignment = 8} : memref<?x?xf16, strided<[?, 1]>>, vector<4xf16>
+              %vf = arith.extf %vh : vector<4xf16> to vector<4xf32>
+              %cci = arith.index_cast %cc : index to i32
+              %pc, %pv = gpu.shuffle idx %p, %cci, %c32i : f32
+              %pcv = vector.broadcast %pc : f32 to vector<4xf32>
+              %on = vector.fma %vf, %pcv, %oa : vector<4xf32>
+              scf.yield %on : vector<4xf32>
+            }
+            scf.yield %Mn, %Sn, %o2 : f32, f32, vector<4xf32>
+          }
+          vector.store %st#2, %part[%hi, %wi, %l4] : memref<?x?x?xf32>, vector<4xf32>
+          %lane0 = arith.cmpi eq, %l, %c0 : index
+          scf.if %lane0 {
+            memref.store %st#0, %part[%hi, %wi, %c128] : memref<?x?x?xf32>
+            memref.store %st#1, %part[%hi, %wi, %c129] : memref<?x?x?xf32>
+          }
+          macro.yield %h : i32
+        };
+      }
+    }
+  }
+  return;
+}
+
+/// Merges the first `parts` parts of `vec_attention_parts` for each head of Q, as llama.cpp's
+/// kernel_flash_attn_ext_vec_reduce. A block of 4 SIMD groups does one head: each lane weighs up to 4 parts,
+/// and the SIMD groups add them up for 4 values of the head at a time.
+fn vec_attention_merge(out : &mut Tensor<f32, [?, ?], Memory::HBM>, part : &Tensor<f32, [?, ?, ?], Memory::HBM>, parts : i32, q_heads : i32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..q_heads across blocks {
+      let _d = mlir!( threads : 128, inputs : (%out = out : memref<?x?xf32>, %part = part : memref<?x?x?xf32>, %parts = parts : i32, %h = h : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(part), writes_only(out[h])]) {
+        %c0 = arith.constant 0 : index
+        %c1 = arith.constant 1 : index
+        %c2 = arith.constant 2 : index
+        %c3 = arith.constant 3 : index
+        %c4 = arith.constant 4 : index
+        %c16 = arith.constant 16 : index
+        %c32 = arith.constant 32 : index
+        %c64 = arith.constant 64 : index
+        %c96 = arith.constant 96 : index
+        %c128 = arith.constant 128 : index
+        %c129 = arith.constant 129 : index
+        %neg = arith.constant -3.0e38 : f32
+        %zero = arith.constant 0.0 : f32
+        %one = arith.constant 1.0 : f32
+        %tid = gpu.thread_id x
+        %sg = arith.divui %tid, %c32 : index
+        %l = arith.remui %tid, %c32 : index
+        %hi = arith.index_cast %h : i32 to index
+        %np = arith.index_cast %parts : i32 to index
+        %last = arith.subi %np, %c1 : index
+        %p0 = arith.addi %l, %c0 : index
+        %live0 = arith.cmpi ult, %p0, %np : index
+        %pc0 = arith.minui %p0, %last : index
+        %mr0 = memref.load %part[%hi, %pc0, %c128] : memref<?x?x?xf32>
+        %m0 = arith.select %live0, %mr0, %neg : f32
+        %p1 = arith.addi %l, %c32 : index
+        %live1 = arith.cmpi ult, %p1, %np : index
+        %pc1 = arith.minui %p1, %last : index
+        %mr1 = memref.load %part[%hi, %pc1, %c128] : memref<?x?x?xf32>
+        %m1 = arith.select %live1, %mr1, %neg : f32
+        %p2 = arith.addi %l, %c64 : index
+        %live2 = arith.cmpi ult, %p2, %np : index
+        %pc2 = arith.minui %p2, %last : index
+        %mr2 = memref.load %part[%hi, %pc2, %c128] : memref<?x?x?xf32>
+        %m2 = arith.select %live2, %mr2, %neg : f32
+        %p3 = arith.addi %l, %c96 : index
+        %live3 = arith.cmpi ult, %p3, %np : index
+        %pc3 = arith.minui %p3, %last : index
+        %mr3 = memref.load %part[%hi, %pc3, %c128] : memref<?x?x?xf32>
+        %m3 = arith.select %live3, %mr3, %neg : f32
+        %m01 = arith.maxnumf %m0, %m1 : f32
+        %m23 = arith.maxnumf %m2, %m3 : f32
+        %mx = arith.maxnumf %m01, %m23 : f32
+        %big = gpu.subgroup_reduce maxnumf %mx : (f32) -> f32
+        %dm0 = arith.subf %m0, %big : f32
+        %w0 = math.exp %dm0 : f32
+        %s0 = memref.load %part[%hi, %pc0, %c129] : memref<?x?x?xf32>
+        %ws0 = arith.mulf %w0, %s0 : f32
+        %wv0 = vector.broadcast %w0 : f32 to vector<4xf32>
+        %dm1 = arith.subf %m1, %big : f32
+        %w1 = math.exp %dm1 : f32
+        %s1 = memref.load %part[%hi, %pc1, %c129] : memref<?x?x?xf32>
+        %ws1 = arith.mulf %w1, %s1 : f32
+        %wv1 = vector.broadcast %w1 : f32 to vector<4xf32>
+        %dm2 = arith.subf %m2, %big : f32
+        %w2 = math.exp %dm2 : f32
+        %s2 = memref.load %part[%hi, %pc2, %c129] : memref<?x?x?xf32>
+        %ws2 = arith.mulf %w2, %s2 : f32
+        %wv2 = vector.broadcast %w2 : f32 to vector<4xf32>
+        %dm3 = arith.subf %m3, %big : f32
+        %w3 = math.exp %dm3 : f32
+        %s3 = memref.load %part[%hi, %pc3, %c129] : memref<?x?x?xf32>
+        %ws3 = arith.mulf %w3, %s3 : f32
+        %wv3 = vector.broadcast %w3 : f32 to vector<4xf32>
+        %t01 = arith.addf %ws0, %ws1 : f32
+        %t23 = arith.addf %ws2, %ws3 : f32
+        %ts = arith.addf %t01, %t23 : f32
+        %total = gpu.subgroup_reduce add %ts : (f32) -> f32
+        %inv = arith.divf %one, %total : f32
+        %lane0 = arith.cmpi eq, %l, %c0 : index
+        %sg4 = arith.muli %sg, %c4 : index
+        %vz4 = arith.constant dense<0.0> : vector<4xf32>
+        scf.for %n = %c0 to %c128 step %c16 {
+          %d = arith.addi %n, %sg4 : index
+          %x0 = vector.load %part[%hi, %pc0, %d] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %a0 = vector.fma %x0, %wv0, %vz4 : vector<4xf32>
+          %x1 = vector.load %part[%hi, %pc1, %d] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %a1 = vector.fma %x1, %wv1, %a0 : vector<4xf32>
+          %x2 = vector.load %part[%hi, %pc2, %d] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %a2 = vector.fma %x2, %wv2, %a1 : vector<4xf32>
+          %x3 = vector.load %part[%hi, %pc3, %d] {alignment = 16} : memref<?x?x?xf32>, vector<4xf32>
+          %a3 = vector.fma %x3, %wv3, %a2 : vector<4xf32>
+          %e0 = vector.extract %a3[0] : f32 from vector<4xf32>
+          %r0 = gpu.subgroup_reduce add %e0 : (f32) -> f32
+          %o0 = arith.mulf %r0, %inv : f32
+          %e1 = vector.extract %a3[1] : f32 from vector<4xf32>
+          %r1 = gpu.subgroup_reduce add %e1 : (f32) -> f32
+          %o1 = arith.mulf %r1, %inv : f32
+          %e2 = vector.extract %a3[2] : f32 from vector<4xf32>
+          %r2 = gpu.subgroup_reduce add %e2 : (f32) -> f32
+          %o2 = arith.mulf %r2, %inv : f32
+          %e3 = vector.extract %a3[3] : f32 from vector<4xf32>
+          %r3 = gpu.subgroup_reduce add %e3 : (f32) -> f32
+          %o3 = arith.mulf %r3, %inv : f32
+          scf.if %lane0 {
+            %d0 = arith.addi %d, %c0 : index
+            memref.store %o0, %out[%hi, %d0] : memref<?x?xf32>
+            %d1 = arith.addi %d, %c1 : index
+            memref.store %o1, %out[%hi, %d1] : memref<?x?xf32>
+            %d2 = arith.addi %d, %c2 : index
+            memref.store %o2, %out[%hi, %d2] : memref<?x?xf32>
+            %d3 = arith.addi %d, %c3 : index
+            memref.store %o3, %out[%hi, %d3] : memref<?x?xf32>
+          }
+        }
+        macro.yield %h : i32
+      };
+    }
+  }
+  return;
+}
+
+/// The scratch space of `split_attention` for positions below `max_seq`, on the CPU. Transfer it to the
+/// memory of the other tensors. Each block of positions writes the weighted sum of V for each of its
+/// heads, then the largest score and the sum of the weights.
+fn split_attention_scratch(max_seq : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> Tensor<f32, [?, ?, ?, ?]> {
+  // 20 blocks of 32 positions below position 640, and blocks of 64 positions from there on.
+  let mut splits = (max_seq + 63) / 64;
+  if splits < 20 {
+    splits = 20;
+  }
+  return Tensor<f32>([kv_heads * ((q_heads / kv_heads + 7) / 8), splits, 8, head_dim + 2]);
+}
+
+/// The parts of `split_attention` for blocks of 32 positions: 4 SIMD groups of 2 heads of Q.
+fn split_attention_parts_32<M : Memory>(part : &mut Tensor<f32, [?, ?, ?, ?], Memory::M>, q : &Tensor<f32, [?, ?], Memory::M>, k_cache : &Tensor<f16, [?, ?, ?], Memory::M>, v_cache : &Tensor<f16, [?, ?, ?], Memory::M>, pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+  let group = q_heads / kv_heads;
+  let tiles = (group + 7) / 8;
+  let scale = 1.0 / (head_dim as f32).sqrt();
+  spawn on(Topology::Device) {
+    for gt in 0..kv_heads * tiles across blocks {
+      for c in 0..(pos + 32) / 32 across blocks {
+        let mut w = unsafe { Tensor<f32, [4, 2, 32], Memory::SMEM>::uninit() };
+        let mut top = unsafe {
+          Tensor<f32, [4, 2, 32], Memory::SMEM>::uninit()
+        };
+        let mut sums = unsafe {
+          Tensor<f32, [4, 2, 32], Memory::SMEM>::uninit()
+        };
+        let g = gt / tiles;
+        let base = g * group + (gt - g * tiles) * 8;
+        let left = group - (gt - g * tiles) * 8;
+        for s in 0..4 across subgroups {
+          let first = base + s * 2;
+          let mut heads = left - s * 2;
+          if heads > 2 {
+            heads = 2;
+          }
+          // A head past the last one of the group reads the last one again, and its sums go nowhere.
+          let mut h0 = first + 0;
+          if 0 >= heads {
+            h0 = first + heads - 1;
+          }
+          let mut h1 = first + 1;
+          if 1 >= heads {
+            h1 = first + heads - 1;
+          }
+          for l in 0..32 across lanes(32) {
+            // The scores of the position of the lane, for each head. A position past `pos` reads row
+            // `pos`, and its score is -3e38.
+            let mut t0 = c * 32 + 0 + l;
+            if t0 > pos {
+              t0 = pos;
+            }
+            let mut dot0_0 : f32 = 0.0;
+            let mut dot0_1 : f32 = 0.0;
+            for d in 0..head_dim {
+              let k0 = k_cache[t0][g][d] as f32;
+              let q0 = q[h0][d];
+              dot0_0 = dot0_0 + q0 * k0;
+              let q1 = q[h1][d];
+              dot0_1 = dot0_1 + q1 * k0;
+            }
+            let mut s0_0 : f32 = -3.0e38;
+            if c * 32 + 0 + l <= pos {
+              s0_0 = dot0_0 * scale;
+            }
+            w[s][0][0 + l] = s0_0;
+            top[s][0][l] = s0_0;
+            let mut s0_1 : f32 = -3.0e38;
+            if c * 32 + 0 + l <= pos {
+              s0_1 = dot0_1 * scale;
+            }
+            w[s][1][0 + l] = s0_1;
+            top[s][1][l] = s0_1;
+          }
+          let big0 = lanes::max(&top[s][0], 32);
+          let big1 = lanes::max(&top[s][1], 32);
+          // The weight of each position, as exp(score - the largest score of the block).
+          for l in 0..32 across lanes(32) {
+            let e0_0 = (w[s][0][0 + l] - big0).fast_exp();
+            w[s][0][0 + l] = e0_0;
+            sums[s][0][l] = e0_0;
+            let e0_1 = (w[s][1][0 + l] - big1).fast_exp();
+            w[s][1][0 + l] = e0_1;
+            sums[s][1][l] = e0_1;
+          }
+          let total0 = lanes::sum(&sums[s][0], 32);
+          let total1 = lanes::sum(&sums[s][1], 32);
+          // The weighted sum of the rows of V. Lane l takes values l, l + 32, l + 64 and l + 96.
+          for l in 0..32 across lanes(32) {
+            let mut acc0_0 : f32 = 0.0;
+            let mut acc0_1 : f32 = 0.0;
+            let mut acc0_2 : f32 = 0.0;
+            let mut acc0_3 : f32 = 0.0;
+            let mut acc1_0 : f32 = 0.0;
+            let mut acc1_1 : f32 = 0.0;
+            let mut acc1_2 : f32 = 0.0;
+            let mut acc1_3 : f32 = 0.0;
+            // With head_dim below 128, values past it read others again, and their sums go nowhere.
+            let d0 = (0 + l) % head_dim;
+            let d1 = (32 + l) % head_dim;
+            let d2 = (64 + l) % head_dim;
+            let d3 = (96 + l) % head_dim;
+            let mut last = pos - c * 32;
+            if last > 31 {
+              last = 31;
+            }
+            for t in 0..last + 1 {
+              let row = c * 32 + t;
+              let v0 = v_cache[row][g][d0] as f32;
+              let v1 = v_cache[row][g][d1] as f32;
+              let v2 = v_cache[row][g][d2] as f32;
+              let v3 = v_cache[row][g][d3] as f32;
+              let w0 = w[s][0][t];
+              acc0_0 = acc0_0 + w0 * v0;
+              acc0_1 = acc0_1 + w0 * v1;
+              acc0_2 = acc0_2 + w0 * v2;
+              acc0_3 = acc0_3 + w0 * v3;
+              let w1 = w[s][1][t];
+              acc1_0 = acc1_0 + w1 * v0;
+              acc1_1 = acc1_1 + w1 * v1;
+              acc1_2 = acc1_2 + w1 * v2;
+              acc1_3 = acc1_3 + w1 * v3;
+            }
+            if 0 < heads {
+              if 0 < head_dim {
+                part[gt][c][s * 2 + 0][0 + l] = acc0_0;
+              }
+              if 32 < head_dim {
+                part[gt][c][s * 2 + 0][32 + l] = acc0_1;
+              }
+              if 64 < head_dim {
+                part[gt][c][s * 2 + 0][64 + l] = acc0_2;
+              }
+              if 96 < head_dim {
+                part[gt][c][s * 2 + 0][96 + l] = acc0_3;
+              }
+            }
+            if 1 < heads {
+              if 0 < head_dim {
+                part[gt][c][s * 2 + 1][0 + l] = acc1_0;
+              }
+              if 32 < head_dim {
+                part[gt][c][s * 2 + 1][32 + l] = acc1_1;
+              }
+              if 64 < head_dim {
+                part[gt][c][s * 2 + 1][64 + l] = acc1_2;
+              }
+              if 96 < head_dim {
+                part[gt][c][s * 2 + 1][96 + l] = acc1_3;
+              }
+            }
+          }
+          if 0 < heads {
+            part[gt][c][s * 2 + 0][head_dim] = big0;
+            part[gt][c][s * 2 + 0][head_dim + 1] = total0;
+          }
+          if 1 < heads {
+            part[gt][c][s * 2 + 1][head_dim] = big1;
+            part[gt][c][s * 2 + 1][head_dim + 1] = total1;
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// The parts of `split_attention` for blocks of 64 positions: 2 SIMD groups of 4 heads of Q.
+fn split_attention_parts_64<M : Memory>(part : &mut Tensor<f32, [?, ?, ?, ?], Memory::M>, q : &Tensor<f32, [?, ?], Memory::M>, k_cache : &Tensor<f16, [?, ?, ?], Memory::M>, v_cache : &Tensor<f16, [?, ?, ?], Memory::M>, pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+  let group = q_heads / kv_heads;
+  let tiles = (group + 7) / 8;
+  let scale = 1.0 / (head_dim as f32).sqrt();
+  spawn on(Topology::Device) {
+    for gt in 0..kv_heads * tiles across blocks {
+      for c in 0..(pos + 64) / 64 across blocks {
+        let mut w = unsafe { Tensor<f32, [2, 4, 64], Memory::SMEM>::uninit() };
+        let mut top = unsafe {
+          Tensor<f32, [2, 4, 32], Memory::SMEM>::uninit()
+        };
+        let mut sums = unsafe {
+          Tensor<f32, [2, 4, 32], Memory::SMEM>::uninit()
+        };
+        let g = gt / tiles;
+        let base = g * group + (gt - g * tiles) * 8;
+        let left = group - (gt - g * tiles) * 8;
+        for s in 0..2 across subgroups {
+          let first = base + s * 4;
+          let mut heads = left - s * 4;
+          if heads > 4 {
+            heads = 4;
+          }
+          // A head past the last one of the group reads the last one again, and its sums go nowhere.
+          let mut h0 = first + 0;
+          if 0 >= heads {
+            h0 = first + heads - 1;
+          }
+          let mut h1 = first + 1;
+          if 1 >= heads {
+            h1 = first + heads - 1;
+          }
+          let mut h2 = first + 2;
+          if 2 >= heads {
+            h2 = first + heads - 1;
+          }
+          let mut h3 = first + 3;
+          if 3 >= heads {
+            h3 = first + heads - 1;
+          }
+          for l in 0..32 across lanes(32) {
+            // The scores of each of the 2 positions of the lane, for each head. A position past `pos` reads row
+            // `pos`, and its score is -3e38.
+            let mut t0 = c * 64 + 0 + l;
+            if t0 > pos {
+              t0 = pos;
+            }
+            let mut dot0_0 : f32 = 0.0;
+            let mut dot0_1 : f32 = 0.0;
+            let mut dot0_2 : f32 = 0.0;
+            let mut dot0_3 : f32 = 0.0;
+            let mut t1 = c * 64 + 32 + l;
+            if t1 > pos {
+              t1 = pos;
+            }
+            let mut dot1_0 : f32 = 0.0;
+            let mut dot1_1 : f32 = 0.0;
+            let mut dot1_2 : f32 = 0.0;
+            let mut dot1_3 : f32 = 0.0;
+            for d in 0..head_dim {
+              let k0 = k_cache[t0][g][d] as f32;
+              let k1 = k_cache[t1][g][d] as f32;
+              let q0 = q[h0][d];
+              dot0_0 = dot0_0 + q0 * k0;
+              dot1_0 = dot1_0 + q0 * k1;
+              let q1 = q[h1][d];
+              dot0_1 = dot0_1 + q1 * k0;
+              dot1_1 = dot1_1 + q1 * k1;
+              let q2 = q[h2][d];
+              dot0_2 = dot0_2 + q2 * k0;
+              dot1_2 = dot1_2 + q2 * k1;
+              let q3 = q[h3][d];
+              dot0_3 = dot0_3 + q3 * k0;
+              dot1_3 = dot1_3 + q3 * k1;
+            }
+            let mut s0_0 : f32 = -3.0e38;
+            if c * 64 + 0 + l <= pos {
+              s0_0 = dot0_0 * scale;
+            }
+            w[s][0][0 + l] = s0_0;
+            let mut s1_0 : f32 = -3.0e38;
+            if c * 64 + 32 + l <= pos {
+              s1_0 = dot1_0 * scale;
+            }
+            w[s][0][32 + l] = s1_0;
+            top[s][0][l] = s0_0.max(s1_0);
+            let mut s0_1 : f32 = -3.0e38;
+            if c * 64 + 0 + l <= pos {
+              s0_1 = dot0_1 * scale;
+            }
+            w[s][1][0 + l] = s0_1;
+            let mut s1_1 : f32 = -3.0e38;
+            if c * 64 + 32 + l <= pos {
+              s1_1 = dot1_1 * scale;
+            }
+            w[s][1][32 + l] = s1_1;
+            top[s][1][l] = s0_1.max(s1_1);
+            let mut s0_2 : f32 = -3.0e38;
+            if c * 64 + 0 + l <= pos {
+              s0_2 = dot0_2 * scale;
+            }
+            w[s][2][0 + l] = s0_2;
+            let mut s1_2 : f32 = -3.0e38;
+            if c * 64 + 32 + l <= pos {
+              s1_2 = dot1_2 * scale;
+            }
+            w[s][2][32 + l] = s1_2;
+            top[s][2][l] = s0_2.max(s1_2);
+            let mut s0_3 : f32 = -3.0e38;
+            if c * 64 + 0 + l <= pos {
+              s0_3 = dot0_3 * scale;
+            }
+            w[s][3][0 + l] = s0_3;
+            let mut s1_3 : f32 = -3.0e38;
+            if c * 64 + 32 + l <= pos {
+              s1_3 = dot1_3 * scale;
+            }
+            w[s][3][32 + l] = s1_3;
+            top[s][3][l] = s0_3.max(s1_3);
+          }
+          let big0 = lanes::max(&top[s][0], 32);
+          let big1 = lanes::max(&top[s][1], 32);
+          let big2 = lanes::max(&top[s][2], 32);
+          let big3 = lanes::max(&top[s][3], 32);
+          // The weight of each position, as exp(score - the largest score of the block).
+          for l in 0..32 across lanes(32) {
+            let e0_0 = (w[s][0][0 + l] - big0).fast_exp();
+            w[s][0][0 + l] = e0_0;
+            let e1_0 = (w[s][0][32 + l] - big0).fast_exp();
+            w[s][0][32 + l] = e1_0;
+            sums[s][0][l] = e0_0 + e1_0;
+            let e0_1 = (w[s][1][0 + l] - big1).fast_exp();
+            w[s][1][0 + l] = e0_1;
+            let e1_1 = (w[s][1][32 + l] - big1).fast_exp();
+            w[s][1][32 + l] = e1_1;
+            sums[s][1][l] = e0_1 + e1_1;
+            let e0_2 = (w[s][2][0 + l] - big2).fast_exp();
+            w[s][2][0 + l] = e0_2;
+            let e1_2 = (w[s][2][32 + l] - big2).fast_exp();
+            w[s][2][32 + l] = e1_2;
+            sums[s][2][l] = e0_2 + e1_2;
+            let e0_3 = (w[s][3][0 + l] - big3).fast_exp();
+            w[s][3][0 + l] = e0_3;
+            let e1_3 = (w[s][3][32 + l] - big3).fast_exp();
+            w[s][3][32 + l] = e1_3;
+            sums[s][3][l] = e0_3 + e1_3;
+          }
+          let total0 = lanes::sum(&sums[s][0], 32);
+          let total1 = lanes::sum(&sums[s][1], 32);
+          let total2 = lanes::sum(&sums[s][2], 32);
+          let total3 = lanes::sum(&sums[s][3], 32);
+          // The weighted sum of the rows of V. Lane l takes values l, l + 32, l + 64 and l + 96.
+          for l in 0..32 across lanes(32) {
+            let mut acc0_0 : f32 = 0.0;
+            let mut acc0_1 : f32 = 0.0;
+            let mut acc0_2 : f32 = 0.0;
+            let mut acc0_3 : f32 = 0.0;
+            let mut acc1_0 : f32 = 0.0;
+            let mut acc1_1 : f32 = 0.0;
+            let mut acc1_2 : f32 = 0.0;
+            let mut acc1_3 : f32 = 0.0;
+            let mut acc2_0 : f32 = 0.0;
+            let mut acc2_1 : f32 = 0.0;
+            let mut acc2_2 : f32 = 0.0;
+            let mut acc2_3 : f32 = 0.0;
+            let mut acc3_0 : f32 = 0.0;
+            let mut acc3_1 : f32 = 0.0;
+            let mut acc3_2 : f32 = 0.0;
+            let mut acc3_3 : f32 = 0.0;
+            // With head_dim below 128, values past it read others again, and their sums go nowhere.
+            let d0 = (0 + l) % head_dim;
+            let d1 = (32 + l) % head_dim;
+            let d2 = (64 + l) % head_dim;
+            let d3 = (96 + l) % head_dim;
+            let mut last = pos - c * 64;
+            if last > 63 {
+              last = 63;
+            }
+            for t in 0..last + 1 {
+              let row = c * 64 + t;
+              let v0 = v_cache[row][g][d0] as f32;
+              let v1 = v_cache[row][g][d1] as f32;
+              let v2 = v_cache[row][g][d2] as f32;
+              let v3 = v_cache[row][g][d3] as f32;
+              let w0 = w[s][0][t];
+              acc0_0 = acc0_0 + w0 * v0;
+              acc0_1 = acc0_1 + w0 * v1;
+              acc0_2 = acc0_2 + w0 * v2;
+              acc0_3 = acc0_3 + w0 * v3;
+              let w1 = w[s][1][t];
+              acc1_0 = acc1_0 + w1 * v0;
+              acc1_1 = acc1_1 + w1 * v1;
+              acc1_2 = acc1_2 + w1 * v2;
+              acc1_3 = acc1_3 + w1 * v3;
+              let w2 = w[s][2][t];
+              acc2_0 = acc2_0 + w2 * v0;
+              acc2_1 = acc2_1 + w2 * v1;
+              acc2_2 = acc2_2 + w2 * v2;
+              acc2_3 = acc2_3 + w2 * v3;
+              let w3 = w[s][3][t];
+              acc3_0 = acc3_0 + w3 * v0;
+              acc3_1 = acc3_1 + w3 * v1;
+              acc3_2 = acc3_2 + w3 * v2;
+              acc3_3 = acc3_3 + w3 * v3;
+            }
+            if 0 < heads {
+              if 0 < head_dim {
+                part[gt][c][s * 4 + 0][0 + l] = acc0_0;
+              }
+              if 32 < head_dim {
+                part[gt][c][s * 4 + 0][32 + l] = acc0_1;
+              }
+              if 64 < head_dim {
+                part[gt][c][s * 4 + 0][64 + l] = acc0_2;
+              }
+              if 96 < head_dim {
+                part[gt][c][s * 4 + 0][96 + l] = acc0_3;
+              }
+            }
+            if 1 < heads {
+              if 0 < head_dim {
+                part[gt][c][s * 4 + 1][0 + l] = acc1_0;
+              }
+              if 32 < head_dim {
+                part[gt][c][s * 4 + 1][32 + l] = acc1_1;
+              }
+              if 64 < head_dim {
+                part[gt][c][s * 4 + 1][64 + l] = acc1_2;
+              }
+              if 96 < head_dim {
+                part[gt][c][s * 4 + 1][96 + l] = acc1_3;
+              }
+            }
+            if 2 < heads {
+              if 0 < head_dim {
+                part[gt][c][s * 4 + 2][0 + l] = acc2_0;
+              }
+              if 32 < head_dim {
+                part[gt][c][s * 4 + 2][32 + l] = acc2_1;
+              }
+              if 64 < head_dim {
+                part[gt][c][s * 4 + 2][64 + l] = acc2_2;
+              }
+              if 96 < head_dim {
+                part[gt][c][s * 4 + 2][96 + l] = acc2_3;
+              }
+            }
+            if 3 < heads {
+              if 0 < head_dim {
+                part[gt][c][s * 4 + 3][0 + l] = acc3_0;
+              }
+              if 32 < head_dim {
+                part[gt][c][s * 4 + 3][32 + l] = acc3_1;
+              }
+              if 64 < head_dim {
+                part[gt][c][s * 4 + 3][64 + l] = acc3_2;
+              }
+              if 96 < head_dim {
+                part[gt][c][s * 4 + 3][96 + l] = acc3_3;
+              }
+            }
+          }
+          if 0 < heads {
+            part[gt][c][s * 4 + 0][head_dim] = big0;
+            part[gt][c][s * 4 + 0][head_dim + 1] = total0;
+          }
+          if 1 < heads {
+            part[gt][c][s * 4 + 1][head_dim] = big1;
+            part[gt][c][s * 4 + 1][head_dim + 1] = total1;
+          }
+          if 2 < heads {
+            part[gt][c][s * 4 + 2][head_dim] = big2;
+            part[gt][c][s * 4 + 2][head_dim + 1] = total2;
+          }
+          if 3 < heads {
+            part[gt][c][s * 4 + 3][head_dim] = big3;
+            part[gt][c][s * 4 + 3][head_dim + 1] = total3;
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// Merges the parts of `split_attention` of blocks of `n_pos` positions. A block does 32 values of one
+/// head of Q, a value for each lane.
+fn split_attention_merge<M : Memory>(out : &mut Tensor<f32, [?, ?], Memory::M>, part : &Tensor<f32, [?, ?, ?, ?], Memory::M>, pos : i32, n_pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+  let group = q_heads / kv_heads;
+  let tiles = (group + 7) / 8;
+  let splits = (pos + n_pos) / n_pos;
+  spawn on(Topology::Device) {
+    for h in 0..q_heads across blocks {
+      for dq in 0..head_dim / 32 across blocks {
+        let mut top = unsafe {
+          Tensor<f32, [1, 1, 32], Memory::SMEM>::uninit()
+        };
+        let g = h / group;
+        let tile = (h - g * group) / 8;
+        let gt = g * tiles + tile;
+        let at = h - g * group - tile * 8;
+        for s in 0..1 across subgroups {
+          for l in 0..32 across lanes(32) {
+            let mut m : f32 = -3.0e38;
+            let mut c = l;
+            while c < splits {
+              m = m.max(part[gt][c][at][head_dim]);
+              c = c + 32;
+            }
+            top[s][0][l] = m;
+          }
+          let big = lanes::max(&top[s][0], 32);
+          for l in 0..32 across lanes(32) {
+            let d = dq * 32 + l;
+            let mut total : f32 = 0.0;
+            let mut acc : f32 = 0.0;
+            for c in 0..splits {
+              let w = (part[gt][c][at][head_dim] - big).fast_exp();
+              total = total + w * part[gt][c][at][head_dim + 1];
+              acc = acc + w * part[gt][c][at][d];
+            }
+            out[h][d] = acc / total;
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+// The kernels that store the K and V of a generated token: copies of `nn_rope_and_store` and
+// `nn_norm_rope_and_store` of `std::nn`, with a KV cache of f16. They compute in f32 and round
+// what they store.
+
+/// RoPE for the token at position `pos`, and its K and V into the KV cache. Writes each head of
+/// q, turned, to `q_out`, and each head of k, turned, and of v to row `pos` of the cache. Value i
+/// of a head pairs with value i + head_dim / 2, as in the Llama and Qwen models of Hugging Face.
+/// Both turn by the angle whose cosine and sine are cos[pos][i] and sin[pos][i].
+fn rope_and_store<M : Memory>(q_out : &mut Tensor<f32, [?, ?], Memory::M>, k_cache : &mut Tensor<f16, [?, ?, ?], Memory::M>, v_cache : &mut Tensor<f16, [?, ?, ?], Memory::M>, q : &Tensor<f32, [?, ?], Memory::M>, k : &Tensor<f32, [?, ?], Memory::M>, v : &Tensor<f32, [?, ?], Memory::M>, cos : &Tensor<f32, [?, ?], Memory::M>, sin : &Tensor<f32, [?, ?], Memory::M>, pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+  let half = head_dim / 2;
+  nn_check_heads(q.extent(0), q.extent(1), q_heads, head_dim);
+  nn_check_heads(q_out.extent(0), q_out.extent(1), q_heads, head_dim);
+  nn_check_heads(k.extent(0), k.extent(1), kv_heads, head_dim);
+  nn_check_heads(v.extent(0), v.extent(1), kv_heads, head_dim);
+  nn_check_cache(k_cache.extent(0), k_cache.extent(1), k_cache.extent(2), pos, kv_heads, head_dim);
+  nn_check_cache(v_cache.extent(0), v_cache.extent(1), v_cache.extent(2), pos, kv_heads, head_dim);
+  assert(pos < cos.extent(0) && pos < sin.extent(0) && half <= cos.extent(1) && half <= sin.extent(1), "rope_and_store: `cos` and `sin` need a row for `pos` with head_dim / 2 values");
+  spawn on(Topology::Device) {
+    for h in 0..q_heads + kv_heads across blocks {
+      for i in 0..128 across lanes {
+        if i < head_dim {
+          // Value i of the head, its partner, and the angle that they share.
+          let mut j = i;
+          let mut sign : f32 = -1.0;
+          let mut partner = i + half;
+          if i >= half {
+            j = i - half;
+            sign = 1.0;
+            partner = i - half;
+          }
+          let c = cos[pos][j];
+          let s = sin[pos][j];
+          if h < q_heads {
+            q_out[h][i] = q[h][i] * c + sign * q[h][partner] * s;
+          } else {
+            k_cache[pos][h - q_heads][i] = (k[h - q_heads][i] * c + sign * k[h - q_heads][partner] * s) as f16;
+            v_cache[pos][h - q_heads][i] = v[h - q_heads][i] as f16;
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// As `rope_and_store`, after an RMSNorm over each head of q and of k: value i of a head x
+/// becomes x[i] / sqrt(mean(x^2) + eps) * norm[i], where `norm` is `q_norm` for q and `k_norm`
+/// for k. Qwen3 has these norms.
+fn norm_rope_and_store<M : Memory>(q_out : &mut Tensor<f32, [?, ?], Memory::M>, k_cache : &mut Tensor<f16, [?, ?, ?], Memory::M>, v_cache : &mut Tensor<f16, [?, ?, ?], Memory::M>, q : &Tensor<f32, [?, ?], Memory::M>, k : &Tensor<f32, [?, ?], Memory::M>, v : &Tensor<f32, [?, ?], Memory::M>, q_norm : &Tensor<bf16, [?], Memory::M>, k_norm : &Tensor<bf16, [?], Memory::M>, cos : &Tensor<f32, [?, ?], Memory::M>, sin : &Tensor<f32, [?, ?], Memory::M>, pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32, eps : f32) -> void {
+  let half = head_dim / 2;
+  nn_check_heads(q.extent(0), q.extent(1), q_heads, head_dim);
+  nn_check_heads(q_out.extent(0), q_out.extent(1), q_heads, head_dim);
+  nn_check_heads(k.extent(0), k.extent(1), kv_heads, head_dim);
+  nn_check_heads(v.extent(0), v.extent(1), kv_heads, head_dim);
+  nn_check_cache(k_cache.extent(0), k_cache.extent(1), k_cache.extent(2), pos, kv_heads, head_dim);
+  nn_check_cache(v_cache.extent(0), v_cache.extent(1), v_cache.extent(2), pos, kv_heads, head_dim);
+  assert(q_norm.len() >= head_dim && k_norm.len() >= head_dim, "norm_rope_and_store: `q_norm` and `k_norm` need head_dim values");
+  assert(pos < cos.extent(0) && pos < sin.extent(0) && half <= cos.extent(1) && half <= sin.extent(1), "norm_rope_and_store: `cos` and `sin` need a row for `pos` with head_dim / 2 values");
+  spawn on(Topology::Device) {
+    for h in 0..q_heads + kv_heads across blocks {
+      let mut x = unsafe { Tensor<f32, [128], Memory::SMEM>::uninit() };
+      let mut part = unsafe { Tensor<f32, [128], Memory::SMEM>::uninit() };
+      for i in 0..128 across lanes {
+        let mut a : f32 = 0.0;
+        if i < head_dim {
+          if h < q_heads {
+            a = q[h][i];
+          } else {
+            a = k[h - q_heads][i];
+          }
+        }
+        x[i] = a;
+        part[i] = a * a;
+      }
+      let ss = lanes::sum(&part, 128);
+      let inv = 1.0 / (ss / (head_dim as f32) + eps).sqrt();
+      for i in 0..128 across lanes {
+        if i < head_dim {
+          // Value i of the head, its partner, and the angle that they share.
+          let mut j = i;
+          let mut sign : f32 = -1.0;
+          let mut partner = i + half;
+          if i >= half {
+            j = i - half;
+            sign = 1.0;
+            partner = i - half;
+          }
+          let c = cos[pos][j];
+          let s = sin[pos][j];
+          if h < q_heads {
+            let a = x[i] * inv * (q_norm[i] as f32);
+            let b = x[partner] * inv * (q_norm[partner] as f32);
+            q_out[h][i] = a * c + sign * b * s;
+          } else {
+            let a = x[i] * inv * (k_norm[i] as f32);
+            let b = x[partner] * inv * (k_norm[partner] as f32);
+            k_cache[pos][h - q_heads][i] = (a * c + sign * b * s) as f16;
+            v_cache[pos][h - q_heads][i] = v[h - q_heads][i] as f16;
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+//===- deltanet.vx - Qwen app -----------------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// One generated token through the Gated DeltaNet of a linear attention layer of Qwen3.5 and
+// Qwen3.6 (#89), after the product `linear_in` and before the product `linear_out`. The math is
+// that of `modeling_qwen3_5_moe.py` of transformers:
+//
+// - `proj`, the output of `linear_in`, has q (k_heads x 128), k (k_heads x 128), v (v_heads x 128),
+//   z (v_heads x 128), then b and a (v_heads each), at the offsets that the caller gives.
+// - q, k and v go through a causal depthwise convolution of width 4 and a SiLU. q and k then get an
+//   L2 norm for each head (eps 1e-6 inside the square root), and q is multiplied by 1/sqrt(128).
+// - beta = sigmoid(b), and the decay exp(g) with g = -exp(A_log) softplus(a + dt_bias). The weight
+//   file stores -exp(A_log) as `neg_a`.
+// - Head h of v uses head h / (v_heads / k_heads) of q and k. Its state S[k][v] decays, then
+//   S += k (beta (v - k . S)), and the output is q . S.
+// - The output gets an RMS norm for each head, times the norm weight, times silu(z).
+//
+// All the heads have 128 values. The state of a layer is `conv_state` [2 k_heads + v_heads, 128, 3],
+// the last 3 inputs of each channel of the convolution, oldest first, and `state` [v_heads, 128, 128]
+// as S[v][k]: the 128 values of k for one value of v are next to each other, so that the 32 lanes of
+// a SIMD group read them in one load. Both start at zero.
+import core::num;
+import std::nn;
+import qwen::simd;
+
+/// The scratch tensors of one token, in GPU memory: q and k after the convolution and the norm
+/// [k_heads, 128], v after the convolution [v_heads, 128], beta and the decay exp(g) of each head of
+/// v, and q . S [v_heads, 128].
+struct DeltaNetScratch {
+  q : Tensor<f32, [?, ?], Memory::HBM>,
+  k : Tensor<f32, [?, ?], Memory::HBM>,
+  v : Tensor<f32, [?, ?], Memory::HBM>,
+  beta : Tensor<f32, [?], Memory::HBM>,
+  decay : Tensor<f32, [?], Memory::HBM>,
+  o : Tensor<f32, [?, ?], Memory::HBM>,
+}
+
+fn deltanet_scratch(k_heads : i32, v_heads : i32) -> DeltaNetScratch {
+  return DeltaNetScratch {
+    q : transfer(Tensor<f32>([k_heads, 128]), Memory::HBM),
+    k : transfer(Tensor<f32>([k_heads, 128]), Memory::HBM),
+    v : transfer(Tensor<f32>([v_heads, 128]), Memory::HBM),
+    beta : transfer(Tensor<f32>([v_heads]), Memory::HBM),
+    decay : transfer(Tensor<f32>([v_heads]), Memory::HBM),
+    o : transfer(Tensor<f32>([v_heads, 128]), Memory::HBM),
+  };
+}
+
+/// A tensor of zeros in GPU memory.
+fn dn_zeros(a : i32, b : i32, c : i32) -> Tensor<f32, [?, ?, ?], Memory::HBM> {
+  let mut x = Tensor<f32>([a, b, c]);
+  for i in 0..a {
+    for j in 0..b {
+      for k in 0..c {
+        x[i][j][k] = 0.0;
+      }
+    }
+  }
+  return transfer(x, Memory::HBM);
+}
+
+/// The state of one layer at the start: zero.
+fn deltanet_conv_state(k_heads : i32, v_heads : i32) -> Tensor<f32, [?, ?, ?], Memory::HBM> {
+  return dn_zeros(2 * k_heads + v_heads, 128, 3);
+}
+
+fn deltanet_state(v_heads : i32) -> Tensor<f32, [?, ?, ?], Memory::HBM> {
+  return dn_zeros(v_heads, 128, 128);
+}
+
+/// The Gated DeltaNet of one token: `y` (v_heads x 128 values, the input of `linear_out`) from `proj`
+/// (the output of `linear_in`). z starts at `z_at` of `proj`, b at `b_at` and a at `a_at`. `conv` has
+/// 4 taps for each of the (2 k_heads + v_heads) x 128 channels, channel c at 4 c, oldest tap
+/// first. `neg_a` and `dt_bias` have v_heads values, and `norm` 128.
+fn deltanet_step(y : &mut Tensor<f32, [?], Memory::HBM>, conv_state : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, state : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, t : &mut DeltaNetScratch, proj : &Tensor<f32, [?], Memory::HBM>, conv : &Tensor<f32, [?], Memory::HBM>, neg_a : &Tensor<f32, [?], Memory::HBM>, dt_bias : &Tensor<f32, [?], Memory::HBM>, norm : &Tensor<f32, [?], Memory::HBM>, z_at : i32, b_at : i32, a_at : i32, k_heads : i32, v_heads : i32, eps : f32) -> void {
+  let channels = (2 * k_heads + v_heads) * 128;
+  assert(k_heads > 0 && v_heads % k_heads == 0 && v_heads <= 64, "deltanet_step: v_heads must be a multiple of k_heads, and at most 64");
+  assert(conv_state.extent(0) == 2 * k_heads + v_heads && conv_state.extent(1) == 128 && conv_state.extent(2) == 3, "deltanet_step: conv_state must be [2 k_heads + v_heads, 128, 3]");
+  assert(state.extent(0) == v_heads && state.extent(1) == 128 && state.extent(2) == 128, "deltanet_step: state must be [v_heads, 128, 128]");
+  assert(conv.len() == channels * 4, "deltanet_step: conv must have 4 taps for each channel");
+  assert(proj.len() >= channels && proj.len() >= z_at + v_heads * 128 && proj.len() >= b_at + v_heads && proj.len() >= a_at + v_heads, "deltanet_step: proj is too short for its offsets");
+  assert(neg_a.len() >= v_heads && dt_bias.len() >= v_heads && norm.len() >= 128 && y.len() >= v_heads * 128, "deltanet_step: a tensor is too short");
+  deltanet_conv(&mut t.q, &mut t.k, &mut t.v, conv_state, proj, conv, k_heads, v_heads);
+  deltanet_gates(&mut t.beta, &mut t.decay, proj, neg_a, dt_bias, b_at, a_at, v_heads);
+  deltanet_recur(&mut t.o, state, &t.q, &t.k, &t.v, &t.beta, &t.decay, v_heads / k_heads, v_heads);
+  deltanet_gated_norm(y, &t.o, proj, norm, z_at, v_heads, eps);
+  return;
+}
+
+/// The convolution and the SiLU of q, k and v, and the L2 norms of q and k. Block h does the 128
+/// channels of one head: heads 0 to k_heads - 1 of q, then those of k, then those of v. The channels
+/// of `proj` are in the same order, so channel i of block h is h * 128 + i.
+fn deltanet_conv(qn : &mut Tensor<f32, [?, ?], Memory::HBM>, kn : &mut Tensor<f32, [?, ?], Memory::HBM>, vv : &mut Tensor<f32, [?, ?], Memory::HBM>, conv_state : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, proj : &Tensor<f32, [?], Memory::HBM>, conv : &Tensor<f32, [?], Memory::HBM>, k_heads : i32, v_heads : i32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..2 * k_heads + v_heads across blocks {
+      let mut y = unsafe { Tensor<f32, [128], Memory::SMEM>::uninit() };
+      let mut part = unsafe { Tensor<f32, [128], Memory::SMEM>::uninit() };
+      for i in 0..128 across lanes {
+        let c = h * 128 + i;
+        let x0 = conv_state[h][i][0];
+        let x1 = conv_state[h][i][1];
+        let x2 = conv_state[h][i][2];
+        let x3 = proj[c];
+        let a = conv[c * 4] * x0 + conv[c * 4 + 1] * x1 + conv[c * 4 + 2] * x2 + conv[c * 4 + 3] * x3;
+        let s = a / (1.0 + (0.0 - a).fast_exp());
+        conv_state[h][i][0] = x1;
+        conv_state[h][i][1] = x2;
+        conv_state[h][i][2] = x3;
+        y[i] = s;
+        part[i] = s * s;
+      }
+      let ss = lanes::sum(&part, 128);
+      let inv = 1.0 / (ss + 0.000001).sqrt();
+      for i in 0..128 across lanes {
+        if h < k_heads {
+          qn[h][i] = y[i] * inv * 0.08838834764831845;
+        } else if h < 2 * k_heads {
+          kn[h - k_heads][i] = y[i] * inv;
+        } else {
+          vv[h - 2 * k_heads][i] = y[i];
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// beta = sigmoid(b) and the decay exp(neg_a softplus(a + dt_bias)) of each head of v. softplus(x)
+/// is x above 20, as in torch.
+fn deltanet_gates(beta : &mut Tensor<f32, [?], Memory::HBM>, decay : &mut Tensor<f32, [?], Memory::HBM>, proj : &Tensor<f32, [?], Memory::HBM>, neg_a : &Tensor<f32, [?], Memory::HBM>, dt_bias : &Tensor<f32, [?], Memory::HBM>, b_at : i32, a_at : i32, v_heads : i32) -> void {
+  spawn on(Topology::Device) {
+    for blk in 0..1 across blocks {
+      for j in 0..64 across lanes {
+        if j < v_heads {
+          let b = proj[b_at + j];
+          beta[j] = 1.0 / (1.0 + (0.0 - b).fast_exp());
+          let x = proj[a_at + j] + dt_bias[j];
+          let mut sp = x;
+          if x <= 20.0 {
+            sp = simd_log(1.0 + x.fast_exp());
+          }
+          decay[j] = (neg_a[j] * sp).fast_exp();
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// The update of the state and the output q . S, for each head h of v. Block (h, vq) is one SIMD
+/// group for values vq * 32 to vq * 32 + 31 of v. Lane l owns values 4 l to 4 l + 3 of k. For each
+/// value of v, the lanes add up k . S, then each lane updates its 4 values of S and the lanes add up
+/// q . S. Lane m keeps the output of value m.
+fn deltanet_recur(o : &mut Tensor<f32, [?, ?], Memory::HBM>, state : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, qn : &Tensor<f32, [?, ?], Memory::HBM>, kn : &Tensor<f32, [?, ?], Memory::HBM>, vv : &Tensor<f32, [?, ?], Memory::HBM>, beta : &Tensor<f32, [?], Memory::HBM>, decay : &Tensor<f32, [?], Memory::HBM>, group : i32, v_heads : i32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..v_heads across blocks {
+      for vq in 0..4 across blocks {
+        for s in 0..1 across subgroups {
+          for l in 0..32 across lanes(32) {
+            let g = h / group;
+            let d = 4 * l;
+            let q0 = qn[g][d];
+            let q1 = qn[g][d + 1];
+            let q2 = qn[g][d + 2];
+            let q3 = qn[g][d + 3];
+            let k0 = kn[g][d];
+            let k1 = kn[g][d + 1];
+            let k2 = kn[g][d + 2];
+            let k3 = kn[g][d + 3];
+            let b = beta[h];
+            let dec = decay[h];
+            let mut mine : f32 = 0.0;
+            for m in 0..32 {
+              let v = vq * 32 + m;
+              let s0 = state[h][v][d] * dec;
+              let s1 = state[h][v][d + 1] * dec;
+              let s2 = state[h][v][d + 2] * dec;
+              let s3 = state[h][v][d + 3] * dec;
+              let kv = simd_sum(s0 * k0 + s1 * k1 + s2 * k2 + s3 * k3);
+              let delta = (vv[h][v] - kv) * b;
+              let n0 = s0 + k0 * delta;
+              let n1 = s1 + k1 * delta;
+              let n2 = s2 + k2 * delta;
+              let n3 = s3 + k3 * delta;
+              state[h][v][d] = n0;
+              state[h][v][d + 1] = n1;
+              state[h][v][d + 2] = n2;
+              state[h][v][d + 3] = n3;
+              let out = simd_sum(n0 * q0 + n1 * q1 + n2 * q2 + n3 * q3);
+              if m == l {
+                mine = out;
+              }
+            }
+            o[h][vq * 32 + l] = mine;
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// y = rms_norm(o) * norm * silu(z), for each head of v. Block h does one head.
+fn deltanet_gated_norm(y : &mut Tensor<f32, [?], Memory::HBM>, o : &Tensor<f32, [?, ?], Memory::HBM>, proj : &Tensor<f32, [?], Memory::HBM>, norm : &Tensor<f32, [?], Memory::HBM>, z_at : i32, v_heads : i32, eps : f32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..v_heads across blocks {
+      let mut part = unsafe { Tensor<f32, [128], Memory::SMEM>::uninit() };
+      for i in 0..128 across lanes {
+        let a = o[h][i];
+        part[i] = a * a;
+      }
+      let ss = lanes::sum(&part, 128);
+      let inv = 1.0 / (ss / 128.0 + eps).sqrt();
+      for i in 0..128 across lanes {
+        let z = proj[z_at + h * 128 + i];
+        y[h * 128 + i] = o[h][i] * inv * norm[i] * (z / (1.0 + (0.0 - z).fast_exp()));
+      }
+    }
+  }
+  return;
+}
+//===- gated_attention.vx - Qwen app ----------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// The full attention of one token in a layer of Qwen3.5 and Qwen3.6 (#89), between the product
+// `qkv` and the product `attn_out`, with the math of `modeling_qwen3_5_moe.py` of transformers:
+//
+// - `qkvg`, the output of `qkv`, has q (q_heads x 256), k (kv_heads x 256), v (kv_heads x 256),
+//   then the gate (q_heads x 256).
+// - q and k get an RMS norm for each head, times their norm weights, which the weight file stores
+//   as 1 + w. RoPE then turns the first `rot` values of each head (rotate_half inside those
+//   values), and leaves the others.
+// - Attention with the scale 1/sqrt(256) over the KV cache, which is f16 [position, kv_head, 256].
+// - The output is multiplied by sigmoid(gate).
+//
+// The attention has the design of `vec_attention` (llama.cpp's kernel_flash_attn_ext_vec, MIT
+// License, Copyright (c) 2023-2026 The ggml authors), for 256 values a head: each block is a SIMD
+// group of one head of q, and lane l owns values 8 l to 8 l + 7.
+import core::num;
+import std::nn;
+import qwen::simd;
+
+/// The norms and RoPE of q and k at position `pos`, and the store of k and v into the caches. Block h
+/// does head h of q, then the heads of k. `cos` and `sin` have rot / 2 values for each position.
+fn gated_norm_rope_and_store(q_out : &mut Tensor<f32, [?, ?], Memory::HBM>, k_cache : &mut Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &mut Tensor<f16, [?, ?, ?], Memory::HBM>, qkvg : &Tensor<f32, [?], Memory::HBM>, q_norm : &Tensor<f32, [?], Memory::HBM>, k_norm : &Tensor<f32, [?], Memory::HBM>, cos : &Tensor<f32, [?, ?], Memory::HBM>, sin : &Tensor<f32, [?, ?], Memory::HBM>, pos : i32, q_heads : i32, kv_heads : i32, rot : i32, eps : f32) -> void {
+  let half = rot / 2;
+  assert(q_out.extent(0) == q_heads && q_out.extent(1) == 256, "gated_norm_rope_and_store: q_out must be [q_heads, 256]");
+  assert(k_cache.extent(0) > pos && k_cache.extent(1) == kv_heads && k_cache.extent(2) == 256 && v_cache.extent(0) > pos && v_cache.extent(1) == kv_heads && v_cache.extent(2) == 256, "gated_norm_rope_and_store: the caches must be [positions, kv_heads, 256] with a row for pos");
+  assert(qkvg.len() >= (2 * q_heads + 2 * kv_heads) * 256 && q_norm.len() >= 256 && k_norm.len() >= 256, "gated_norm_rope_and_store: a tensor is too short");
+  assert(rot % 2 == 0 && rot <= 256 && pos < cos.extent(0) && pos < sin.extent(0) && half <= cos.extent(1) && half <= sin.extent(1), "gated_norm_rope_and_store: `cos` and `sin` need a row for `pos` with rot / 2 values");
+  spawn on(Topology::Device) {
+    for h in 0..q_heads + kv_heads across blocks {
+      let mut x = unsafe { Tensor<f32, [256], Memory::SMEM>::uninit() };
+      let mut part = unsafe { Tensor<f32, [256], Memory::SMEM>::uninit() };
+      for i in 0..256 across lanes {
+        let a = qkvg[h * 256 + i];
+        x[i] = a;
+        part[i] = a * a;
+      }
+      let ss = lanes::sum(&part, 256);
+      let inv = 1.0 / (ss / 256.0 + eps).sqrt();
+      for i in 0..256 across lanes {
+        let mut w = q_norm[i];
+        if h >= q_heads {
+          w = k_norm[i];
+        }
+        let a = x[i] * inv * w;
+        let mut r = a;
+        if i < rot {
+          // Value i, its partner, and the angle that they share.
+          let mut j = i;
+          let mut sign : f32 = -1.0;
+          let mut partner = i + half;
+          if i >= half {
+            j = i - half;
+            sign = 1.0;
+            partner = i - half;
+          }
+          let mut wp = q_norm[partner];
+          if h >= q_heads {
+            wp = k_norm[partner];
+          }
+          let b = x[partner] * inv * wp;
+          r = a * cos[pos][j] + sign * b * sin[pos][j];
+        }
+        if h < q_heads {
+          q_out[h][i] = r;
+        } else {
+          k_cache[pos][h - q_heads][i] = r as f16;
+          v_cache[pos][h - q_heads][i] = qkvg[(q_heads + kv_heads + h - q_heads) * 256 + i] as f16;
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// The attention of the token at position `pos`, times sigmoid(gate): y[h * 256 + d] for each head
+/// h of q. `part` is scratch space from `gated_attention_scratch`.
+fn gated_attention(y : &mut Tensor<f32, [?], Memory::HBM>, part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, qkvg : &Tensor<f32, [?], Memory::HBM>, pos : i32, q_heads : i32, kv_heads : i32) -> void {
+  assert(q.extent(0) == q_heads && q.extent(1) == 256 && q_heads % kv_heads == 0, "gated_attention: q must be [q_heads, 256], and q_heads a multiple of kv_heads");
+  assert(k_cache.extent(0) > pos && k_cache.extent(1) == kv_heads && k_cache.extent(2) == 256 && v_cache.extent(0) > pos && v_cache.extent(1) == kv_heads && v_cache.extent(2) == 256, "gated_attention: the caches must be [positions, kv_heads, 256] with a row for pos");
+  assert(part.extent(0) >= q_heads && part.extent(1) >= 64 && part.extent(2) == 260, "gated_attention: `part` is too small. Make it with gated_attention_scratch");
+  assert(y.len() >= q_heads * 256 && qkvg.len() >= (2 * q_heads + 2 * kv_heads) * 256, "gated_attention: a tensor is too short");
+  let mut nwg = 32;
+  if 2 * nwg * 32 < pos + 1 {
+    nwg = nwg * 2;
+  }
+  gated_attention_parts(part, q, k_cache, v_cache, pos, q_heads, q_heads / kv_heads, nwg, 0.0625);
+  gated_attention_merge(y, part, qkvg, nwg, q_heads, (q_heads + 2 * kv_heads) * 256);
+  return;
+}
+
+/// The scratch space of `gated_attention`, on the CPU: up to 64 parts for each head of q, each the sum
+/// of V (256 values), the largest score, and the sum of the weights.
+fn gated_attention_scratch(q_heads : i32) -> Tensor<f32, [?, ?, ?]> {
+  return Tensor<f32>([q_heads, 64, 260]);
+}
+
+/// The parts of `gated_attention`. Block (h, w) is a SIMD group for head h of q. It does the blocks of
+/// 32 positions w, w + nwg, w + 2 nwg, ... up to `pos`, and writes part[h][w]: the sum of V, not
+/// divided, then the largest score and the sum of the weights. For each row, the lanes add up their
+/// parts of q . k, and lane r keeps the score of row r. Each lane then takes the weight of each row
+/// from the lane that keeps it, for the sum of V.
+fn gated_attention_parts(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, pos : i32, q_heads : i32, group : i32, nwg : i32, scale : f32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..q_heads across blocks {
+      for w in 0..nwg across blocks {
+        let mut stats = unsafe { Tensor<f32, [1, 2], Memory::SMEM>::uninit() };
+        for s in 0..1 across subgroups {
+          for l in 0..32 across lanes(32) {
+            let g = h / group;
+            let d = 8 * l;
+            let q0 = q[h][d] * scale;
+            let q1 = q[h][d + 1] * scale;
+            let q2 = q[h][d + 2] * scale;
+            let q3 = q[h][d + 3] * scale;
+            let q4 = q[h][d + 4] * scale;
+            let q5 = q[h][d + 5] * scale;
+            let q6 = q[h][d + 6] * scale;
+            let q7 = q[h][d + 7] * scale;
+            let mut big : f32 = -3.0e38;
+            let mut total : f32 = 0.0;
+            let mut o0 : f32 = 0.0;
+            let mut o1 : f32 = 0.0;
+            let mut o2 : f32 = 0.0;
+            let mut o3 : f32 = 0.0;
+            let mut o4 : f32 = 0.0;
+            let mut o5 : f32 = 0.0;
+            let mut o6 : f32 = 0.0;
+            let mut o7 : f32 = 0.0;
+            let chunks = (pos + 32) / 32;
+            let mut c = w;
+            while c < chunks {
+              let r0 = c * 32;
+              let mut mine : f32 = -3.0e38;
+              for r in 0..32 {
+                let row = r0 + r;
+                let mut kept = row;
+                if row > pos {
+                  kept = pos;
+                }
+                let k0 = half4_at(k_cache, kept, g, d, 0);
+                let k1 = half4_at(k_cache, kept, g, d, 1);
+                let k2 = half4_at(k_cache, kept, g, d, 2);
+                let k3 = half4_at(k_cache, kept, g, d, 3);
+                let k4 = half4_at(k_cache, kept, g, d + 4, 0);
+                let k5 = half4_at(k_cache, kept, g, d + 4, 1);
+                let k6 = half4_at(k_cache, kept, g, d + 4, 2);
+                let k7 = half4_at(k_cache, kept, g, d + 4, 3);
+                let mut score = simd_sum(((k0 * q0 + k1 * q1) + (k2 * q2 + k3 * q3)) + ((k4 * q4 + k5 * q5) + (k6 * q6 + k7 * q7)));
+                if row > pos {
+                  score = -3.0e38;
+                }
+                if r == l {
+                  mine = score;
+                }
+              }
+              let top = big.max(simd_max(mine));
+              let shrink = (big - top).fast_exp();
+              let p = (mine - top).fast_exp();
+              total = total * shrink + simd_sum(p);
+              o0 = o0 * shrink;
+              o1 = o1 * shrink;
+              o2 = o2 * shrink;
+              o3 = o3 * shrink;
+              o4 = o4 * shrink;
+              o5 = o5 * shrink;
+              o6 = o6 * shrink;
+              o7 = o7 * shrink;
+              for r in 0..32 {
+                let row = r0 + r;
+                let mut kept = row;
+                if row > pos {
+                  kept = pos;
+                }
+                let pr = simd_value(p, r);
+                o0 = o0 + half4_at(v_cache, kept, g, d, 0) * pr;
+                o1 = o1 + half4_at(v_cache, kept, g, d, 1) * pr;
+                o2 = o2 + half4_at(v_cache, kept, g, d, 2) * pr;
+                o3 = o3 + half4_at(v_cache, kept, g, d, 3) * pr;
+                o4 = o4 + half4_at(v_cache, kept, g, d + 4, 0) * pr;
+                o5 = o5 + half4_at(v_cache, kept, g, d + 4, 1) * pr;
+                o6 = o6 + half4_at(v_cache, kept, g, d + 4, 2) * pr;
+                o7 = o7 + half4_at(v_cache, kept, g, d + 4, 3) * pr;
+              }
+              big = top;
+              c = c + nwg;
+            }
+            part[h][w][d] = o0;
+            part[h][w][d + 1] = o1;
+            part[h][w][d + 2] = o2;
+            part[h][w][d + 3] = o3;
+            part[h][w][d + 4] = o4;
+            part[h][w][d + 5] = o5;
+            part[h][w][d + 6] = o6;
+            part[h][w][d + 7] = o7;
+            // Every lane has the same largest score and sum of the weights. Lanes 0 and 1 keep them for
+            // the next loop.
+            if l < 2 {
+              let mut x = big;
+              if l == 1 {
+                x = total;
+              }
+              stats[s][l] = x;
+            }
+          }
+          for l in 0..2 across lanes(32) {
+            part[h][w][256 + l] = stats[s][l];
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// Merges the first `parts` parts of `gated_attention_parts` for each head of q, and multiplies by
+/// sigmoid of the gate, which starts at `gate_at` of `qkvg`. A block of 32 lanes does 32 values of one
+/// head, a value for each lane.
+fn gated_attention_merge(y : &mut Tensor<f32, [?], Memory::HBM>, part : &Tensor<f32, [?, ?, ?], Memory::HBM>, qkvg : &Tensor<f32, [?], Memory::HBM>, parts : i32, q_heads : i32, gate_at : i32) -> void {
+  spawn on(Topology::Device) {
+    for h in 0..q_heads across blocks {
+      for dq in 0..8 across blocks {
+        let mut top = unsafe { Tensor<f32, [1, 32], Memory::SMEM>::uninit() };
+        for s in 0..1 across subgroups {
+          for l in 0..32 across lanes(32) {
+            let mut m : f32 = -3.0e38;
+            let mut c = l;
+            while c < parts {
+              m = m.max(part[h][c][256]);
+              c = c + 32;
+            }
+            top[s][l] = m;
+          }
+          let big = lanes::max(&top[s], 32);
+          for l in 0..32 across lanes(32) {
+            let d = dq * 32 + l;
+            let mut total : f32 = 0.0;
+            let mut acc : f32 = 0.0;
+            for c in 0..parts {
+              let w = (part[h][c][256] - big).fast_exp();
+              total = total + w * part[h][c][257];
+              acc = acc + w * part[h][c][d];
+            }
+            let gate = qkvg[gate_at + h * 256 + d];
+            y[h * 256 + d] = acc / total / (1.0 + (0.0 - gate).fast_exp());
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+//===- main.vx - Qwen app ---------------------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// Generates tokens with greedy decoding, on the GPU:
+//
+//   vxc src/main.vx --package qwen=src --host default \
+//       --machine ~/.vx/current/fleet/m4-uma.vx -- WEIGHTS --tokens 750,75698,1445 --steps 16
+//   vxc src/main.vx ... -- WEIGHTS --tokenizer TOKENIZER --prompt "def fibonacci(n):" --steps 64
+//   vxc src/main.vx ... -- WEIGHTS --tokenizer TOKENIZER --chat --prompt-file FILE --steps 512
+//
+// With --tokens, it prints the lines that `scripts/reference.py` prints, without the margin, and
+// then the time of a token. `scripts/compare.py` compares the two outputs.
+//
+// With --tokenizer, a file of `scripts/convert_tokenizer.py`, the prompt is text: --prompt TEXT or
+// --prompt-file FILE. The program prints the prompt and the text that it generates. It stops at a
+// special token, such as <|im_end|>, or after --steps tokens. --chat puts the prompt in the chat
+// format of the Instruct models and prints only the reply. --lines prints the lines of --tokens
+// in place of the text.
+import core::convert;
+import std::time;
+import std::vec;
+import qwen::weights;
+import qwen::model;
+import qwen::qwen35;
+import qwen::prefill35;
+import qwen::prefill;
+import qwen::session;
+import qwen::speculate;
+import qwen::round;
+import qwen::tokenizer;
+
+/// The options of the command line.
+struct Options {
+  weights : *const i8,
+  tokens : *const i8,
+  tokenizer : *const i8,
+  prompt : *const i8,
+  prompt_file : *const i8,
+  steps : *const i8,
+  has_tokens : bool,
+  has_tokenizer : bool,
+  has_prompt : bool,
+  has_prompt_file : bool,
+  has_steps : bool,
+  context : *const i8,
+  has_context : bool,
+  requests : *const i8,
+  has_requests : bool,
+  replies : *const i8,
+  has_replies : bool,
+  session : bool,
+  chat : bool,
+  lines : bool,
+  draft : *const i8,
+  has_draft : bool,
+}
+
+/// The options of `argv`. Asserts that they are complete and that they fit together.
+fn parse_options(argc : i32, argv : *mut *mut i8) -> Options {
+  assert(argc >= 4, "give: WEIGHTS --tokens 1,2,3 --steps N, or WEIGHTS --tokenizer FILE (--prompt TEXT | --prompt-file FILE) [--chat] [--lines] --steps N");
+  let empty : *const i8 = "";
+  let mut o = Options {
+    weights: unsafe { argv[1] }, tokens: empty, tokenizer: empty, prompt: empty, prompt_file: empty,
+    steps: empty, has_tokens: false, has_tokenizer: false, has_prompt: false, has_prompt_file: false,
+    has_steps: false, context: empty, has_context: false, requests: empty, has_requests: false, replies: empty, has_replies: false, session: false, chat: false, lines: false, draft: empty, has_draft: false,
+  };
+  let mut i = 2;
+  while i < argc {
+    let name = unsafe { argv[i] };
+    if same(name, "--chat") {
+      o.chat = true;
+      i = i + 1;
+    } else if same(name, "--session") {
+      o.session = true;
+      i = i + 1;
+    } else if same(name, "--lines") {
+      o.lines = true;
+      i = i + 1;
+    } else {
+      assert(i + 1 < argc, "give: WEIGHTS --tokens 1,2,3 --steps N, or WEIGHTS --tokenizer FILE (--prompt TEXT | --prompt-file FILE) [--chat] [--lines] --steps N");
+      let value = unsafe { argv[i + 1] };
+      if same(name, "--tokens") {
+        o.tokens = value;
+        o.has_tokens = true;
+      } else if same(name, "--tokenizer") {
+        o.tokenizer = value;
+        o.has_tokenizer = true;
+      } else if same(name, "--prompt") {
+        o.prompt = value;
+        o.has_prompt = true;
+      } else if same(name, "--prompt-file") {
+        o.prompt_file = value;
+        o.has_prompt_file = true;
+      } else if same(name, "--context") {
+        o.context = value;
+        o.has_context = true;
+      } else if same(name, "--requests") {
+        o.requests = value;
+        o.has_requests = true;
+      } else if same(name, "--replies") {
+        o.replies = value;
+        o.has_replies = true;
+      } else if same(name, "--draft") {
+        o.draft = value;
+        o.has_draft = true;
+      } else {
+        assert(same(name, "--steps"), "give: WEIGHTS --tokens 1,2,3 --steps N, or WEIGHTS --tokenizer FILE (--prompt TEXT | --prompt-file FILE) [--chat] [--lines] --steps N");
+        o.steps = value;
+        o.has_steps = true;
+      }
+      i = i + 2;
+    }
+  }
+  if o.session {
+    assert(o.has_tokenizer && o.has_context && o.has_requests && o.has_replies && !o.has_tokens && !o.has_prompt && !o.has_prompt_file && !o.has_steps, "give: WEIGHTS --tokenizer FILE --session --context N --requests FILE --replies FILE");
+    return o;
+  }
+  assert(o.has_steps, "give: WEIGHTS --tokens 1,2,3 --steps N, or WEIGHTS --tokenizer FILE (--prompt TEXT | --prompt-file FILE) [--chat] [--lines] --steps N");
+  let one_text = o.has_prompt != o.has_prompt_file;
+  let no_text = !o.has_prompt && !o.has_prompt_file;
+  assert((o.has_tokens && no_text) || (o.has_tokenizer && !o.has_tokens && one_text), "give: WEIGHTS --tokens 1,2,3 --steps N, or WEIGHTS --tokenizer FILE (--prompt TEXT | --prompt-file FILE) [--chat] [--lines] --steps N");
+  assert(o.has_tokenizer || (!o.chat && !o.lines), "--chat and --lines need --tokenizer");
+  return o;
+}
+
+/// The comma-separated numbers of `text`. Asserts that it has only digits and commas, and no empty
+/// number.
+fn parse_numbers(text : *const i8) -> Vec<i32> {
+  let mut numbers = Vec<i32>::new();
+  let mut value : i32 = 0;
+  let mut digits = 0;
+  let mut empty = false;
+  let mut i : i64 = 0;
+  let mut ch = i32::from(unsafe { text[0] });
+  while ch != 0 {
+    if ch == 44 {
+      empty = empty || digits == 0;
+      numbers.push(value);
+      value = 0;
+      digits = 0;
+    } else {
+      assert(ch >= 48 && ch <= 57, "a list of numbers can have only digits and commas");
+      value = value * 10 + (ch - 48);
+      digits = digits + 1;
+    }
+    i = i + 1;
+    ch = i32::from(unsafe { text[i] });
+  }
+  assert(!empty && digits > 0, "an empty number in a comma-separated list");
+  numbers.push(value);
+  return numbers;
+}
+
+/// The number of tokens that text mode runs through the model before it reads them. A read waits
+/// for all the work that the GPU was given, and then the GPU has nothing to do until the CPU gives
+/// it the next token: about 0.37 ms of a 21.9 ms token on the M4. The input of a token is the
+/// argmax of the token before it, in GPU memory, so the GPU can run several tokens without the
+/// CPU. Then the GPU waits only once for each AHEAD tokens. Up to AHEAD - 1 tokens after the end
+/// of the text are run and thrown away.
+const AHEAD : i32 = 8;
+
+/// The GPU tensor of one token.
+struct Slot {
+  next : Tensor<i32, [?], Memory::HBM>,
+}
+
+/// The token in `t`. Reading it waits for the GPU to finish the work before it.
+fn read_token(t : &Tensor<i32, [?], Memory::HBM>) -> i32 {
+  let h = transfer(t, Memory::CPU_DRAM);
+  return h[0];
+}
+
+/// The logit `token` of `logits`.
+fn read_logit(logits : &Tensor<f32, [?], Memory::HBM>, token : i32) -> f32 {
+  let h = transfer(logits, Memory::CPU_DRAM);
+  return h[token];
+}
+
+/// Whether the C string `a` is `b`.
+fn same(a : *const i8, b : *const i8) -> bool {
+  return unsafe { strcmp(a, b) } == 0;
+}
+
+/// The token ids of the prompt: the numbers of --tokens, or the tokens of the text.
+fn prompt_ids(o : &Options, t : &Tokenizer) -> Vec<i32> {
+  if o.has_tokens {
+    return parse_numbers(o.tokens);
+  }
+  let text = if o.has_prompt {
+    c_text(o.prompt)
+  } else {
+    read_text_file(o.prompt_file)
+  };
+  let full = if o.chat {
+    chat_text(&text)
+  } else {
+    text
+  };
+  let ids = encode(t, full.bytes, full.length);
+  assert(ids.len() > 0, "the prompt has no tokens");
+  return ids;
+}
+
+/// Shows token number `step`, as the loop of `main` does: its text, or a line with its logit.
+/// Gives false at the end of the text, where the loop stops.
+fn show(t : &Tokenizer, w : &Weights, text_mode : bool, step : i32, token : i32, logit : f32) -> bool {
+  if text_mode {
+    if is_special(t, token) || token == w.config.eos_token_id {
+      return false;
+    }
+    write_token(t, token);
+  } else {
+    println!("step={} token={} logit={};", step, token, logit);
+  }
+  return true;
+}
+
+/// The logit `token` of position j of a round.
+fn round_logit(r : &Round, j : i32, token : i32) -> f32 {
+  let h = transfer(&r.logits, Memory::CPU_DRAM);
+  return h[j][token];
+}
+
+/// The loop of `main` with speculative decoding (src/speculate.vx). Each step is a round of the
+/// last token and a draft from the context, or a plain step when the draft would not pay: when the
+/// longest earlier match of the end of the context is shorter than 6 tokens, or after 2 rounds in a
+/// row that accepted nothing, until a longer match than theirs appears. A draft has up to `max`
+/// tokens. `first` is the first generated token, from the logits in `s.logits`. Shows the same
+/// `steps` tokens as the loop of `main`, and gives the number of tokens after the first.
+fn generate_with_drafts(w : &Weights, s : &mut State, t : &Tokenizer, text_mode : bool, prompt : &Vec<i32>, first : i32, steps : i32, max : i32, start : &mut Instant) -> i32 {
+  assert(can_round(w), "--draft needs a model of Q4_0 experts with QK norms, head_dim 128 and a 6-bit lm_head");
+  assert(max >= 1 && max < ROUND_MAX, "--draft must be 1 to ROUND_MAX - 1");
+  assert(steps >= ROUND_MAX, "--draft needs --steps of at least ROUND_MAX");
+  let mut r = new_round(&w.config);
+  // One run of the round kernels for each n to 8, so that their compile time is not in the time
+  // of a token: it restarts the clock. Larger rounds use the same kernels. The rounds write rows of
+  // the KV cache that the steps write again before they read them.
+  let mut warm = Vec<i32>::new();
+  for n in 1..9 {
+    warm.push(first);
+    run_round(w, s, &mut r, &warm, prompt.len(), n);
+  }
+  let _ready = transfer(&r.next, Memory::CPU_DRAM);
+  *start = Instant::now();
+  // The tokens of a run of plain steps: token j is in ring[j].
+  let mut ring = Vec<Slot>::new();
+  for j in 0..AHEAD {
+    ring.push(Slot {
+      next: transfer(Tensor<i32>([1]), Memory::HBM),
+    });
+  }
+  // The length of the next run of plain steps: 1 after a round, then 2, 4 and up to AHEAD while
+  // no draft comes up. The GPU runs the tokens of a run before the CPU reads them. Lines mode
+  // prints the logit of each token, so it reads each one.
+  let mut run = 1;
+  let mut context = Vec<i32>::new();
+  for i in 0..prompt.len() {
+    context.push(prompt[i]);
+  }
+  let mut token = first;
+  context.push(token);
+  // The position of `token`, which is not in the KV cache yet.
+  let mut pos = prompt.len();
+  let mut step = 0;
+  let mut rounds = 0;
+  let mut drafted = 0;
+  let mut accepted = 0;
+  // Rounds in a row that accepted nothing, and the length of the match of the last of them.
+  let mut misses = 0;
+  let mut missed_length = 0;
+  let mut going = show(t, w, text_mode, 0, token, read_logit(&s.logits, token));
+  while going && step + 1 < steps {
+    let room = steps - step - 1;
+    let m = longest_match(&context);
+    if misses >= 2 && m.length > missed_length {
+      misses = 0;
+    }
+    let mut k = i32::min(i32::min(draft_length(m.length), max), room - 1);
+    if misses >= 2 {
+      k = 0;
+    }
+    let draft = tokens_after(&context, m.end, k);
+    k = draft.len();
+    if k == 0 {
+      // Plain steps, with the kernels of one token each.
+      let mut n = 1;
+      if text_mode {
+        n = i32::min(run, room);
+      }
+      let mut h = Tensor<i32>([1]);
+      h[0] = token;
+      let input = transfer(h, Memory::HBM);
+      run_layers(w, s, &input, pos);
+      predict(w, s, &mut ring[0].next);
+      for j in 1..n {
+        run_layers(w, s, &ring[j - 1].next, pos + j);
+        predict(w, s, &mut ring[j].next);
+      }
+      let mut j = 0;
+      while j < n && going {
+        token = read_token(&ring[j].next);
+        context.push(token);
+        step = step + 1;
+        pos = pos + 1;
+        let mut logit : f32 = 0.0;
+        if !text_mode {
+          logit = read_logit(&s.logits, token);
+        }
+        going = show(t, w, text_mode, step, token, logit);
+        j = j + 1;
+      }
+      run = i32::min(run * 2, AHEAD);
+    } else {
+      run = 1;
+      let mut inputs = Vec<i32>::new();
+      inputs.push(token);
+      for i in 0..k {
+        inputs.push(draft[i]);
+      }
+      run_round(w, s, &mut r, &inputs, pos, k + 1);
+      let choice = transfer(&r.next, Memory::CPU_DRAM);
+      rounds = rounds + 1;
+      drafted = drafted + k;
+      // c0 is the next token; each draft token that equals the choice before it adds the next one.
+      let mut j = 0;
+      let mut more = true;
+      while more && going {
+        token = choice[j];
+        context.push(token);
+        step = step + 1;
+        let mut logit : f32 = 0.0;
+        if !text_mode {
+          logit = round_logit(&r, j, token);
+        }
+        going = show(t, w, text_mode, step, token, logit);
+        more = j < k && draft[j] == token;
+        if more {
+          accepted = accepted + 1;
+          j = j + 1;
+        }
+      }
+      pos = pos + j + 1;
+      if j == 0 {
+        misses = misses + 1;
+        missed_length = m.length;
+      } else {
+        misses = 0;
+      }
+    }
+  }
+  println!("rounds={} drafted={} accepted={};", rounds, drafted, accepted);
+  return step;
+}
+
+/// `main` for a Qwen3.5 or Qwen3.6 model (weight file v2, arch 1). The prompt runs in chunks
+/// (src/prefill35.vx). There are no drafts yet (#89). Prints the same lines

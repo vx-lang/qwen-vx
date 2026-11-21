@@ -1,0 +1,7 @@
+<|im_start|>user
+Write a Rust struct Trie with new, insert, contains and starts_with for lowercase ASCII words. Add unit tests.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+

@@ -1,0 +1,7 @@
+<|im_start|>user
+Write a C function `int parse_csv_line(const char *line, char **fields, int max_fields)` that handles quoted fields and doubled quotes inside them. Add a main() that tests it.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+

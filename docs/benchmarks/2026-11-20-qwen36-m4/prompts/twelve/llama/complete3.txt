@@ -1,0 +1,136 @@
+<|im_start|>user
+`src/session.rs`:
+
+```rust
+//===- session.rs - Vx Compiler --------------------------------*- Rust -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// This file defines the core compiler session and local worker states.
+// It orchestrates the compilation pipeline across multiple threads, managing shared
+// diagnostics, module registries, and global state required during the lowering
+// of Vx source code to MLIR.
+//
+//===----------------------------------------------------------------------===//
+use crate::bytecode::HirInstruction;
+use crate::gid::{TypeId, UnboundedFunctionMetadata};
+use std::sync::Arc;
+
+// The frozen nominal-type registry (layouts + module indices + cycle-checked). Built once per
+// compilation at the Phase 2 freeze point and shared read-only across worker threads. Re-exported
+// here so `GlobalSession` and the verifier name it via `session`, but the type lives in `registry`.
+pub use crate::registry::ImmutableGlobalRegistry;
+
+/// Represents the frozen past of the compilation process.
+/// It contains everything compiled before the current phase.
+///
+/// # Data-Oriented Design (DOD) Constraints
+/// This session deliberately separates dynamic compiler metadata into strictly
+/// typed, homogeneous arenas rather than using a single polymorphic `Enum` array
+/// (e.g., `enum SlowPathData { Function(...), Generics(...) }`).
+///
+/// 1. **Cache-Line Density**: `UnboundedFunctionMetadata` is a dense structure of `u64`
+///    bitfields. Iterating over it is highly predictable. `Vec<TypeId>`, however,
+///    is a heap-allocated fat pointer with variable lengths. Mixing them would introduce
+///    unpredictable struct padding and pointer-chasing overhead.
+/// 2. **Hardware Prefetching**: By keeping `generics_arena` separate, the CPU's spatial
+///    prefetcher can stream through the dense `slow_path_arena` at maximum bandwidth
+///    during the critical lifetime subtyping pass, without stalling on scattered `Vec` pointers.
+pub struct GlobalSession {
+    pub epoch: u64,
+    /// How this compilation forms a generic instantiation's identity.
+    ///
+    /// A per-compilation fact, frozen with the rest of the epoch, because that is what it is: two
+    /// compilations in one process may legitimately want different strategies, and a worker must
+    /// not be able to observe a choice that belongs to someone else's compile. It lived in a
+    /// process-global until Vx#381 -- set from `--intern-mode` on one thread and read by every
+    /// worker from inside the parallel type-check.
+    pub intern_mode: crate::intern_mode::InternMode,
+    /// `-fauto-schedule-levels`: an `across` loop on an arch that cannot launch its levels runs
+    /// as a plain `for` that carries its level, instead of E6032.
+    pub auto_schedule_levels: bool,
+    pub registry: Arc<ImmutableGlobalRegistry>,
+
+    /// The dense, homogeneous arena for complex parameter and lifetime evaluation.
+    /// Accessed heavily during Phase 1 type-checking and borrow checking.
+    pub slow_path_arena: Arc<Vec<UnboundedFunctionMetadata>>,
+
+    /// The heterogeneous arena for structural generic instantiations.
+    /// Separated to prevent cache fragmentation in the `slow_path_arena`.
+    pub generics_arena: Arc<Vec<TypeId>>,
+    pub generics_offsets: Arc<Vec<(usize, usize)>>,
+}
+
+impl GlobalSession {
+    /// A session with an *empty* frozen registry — for callers that don't build one (the
+    /// sequential driver, unit tests). The parallel pipeline uses [`Self::with_registry`].
+    pub fn new(epoch: u64) -> Self {
+        Self::with_registry(
+            epoch,
+            ImmutableGlobalRegistry::build_and_validate(Vec::new())
+                .expect("an empty registry is always valid"),
+        )
+    }
+
+    /// A session holding the frozen registry built at the Phase 2 freeze point.
+    pub fn with_registry(epoch: u64, registry: ImmutableGlobalRegistry) -> Self {
+        Self {
+            epoch,
+            intern_mode: crate::intern_mode::InternMode::Deferred,
+            auto_schedule_levels: false,
+            registry: Arc::new(registry),
+            slow_path_arena: Arc::new(Vec::new()),
+            generics_arena: Arc::new(Vec::new()),
+            generics_offsets: Arc::new(Vec::new()),
+        }
+    }
+
+    /// The same session with a chosen interning strategy. Consuming rather than a setter, because
+    /// the session is frozen once it is shared: every worker holds an `Arc` of it and reads it by
+    /// `&`, so it must be settled before it is wrapped.
+    pub fn in_intern_mode(mut self, mode: crate::intern_mode::InternMode) -> Self {
+        self.intern_mode = mode;
+        self
+    }
+
+    /// The same session with `-fauto-schedule-levels` on or off.
+    pub fn auto_schedule_levels(mut self, on: bool) -> Self {
+        self.auto_schedule_levels = on;
+        self
+    }
+}
+
+/// Represents the mutable present of a single worker thread during Phase 1.
+pub struct LocalWorkerState {
+    pub global: Arc<GlobalSession>,
+
+    // Completely lock-free, thread-local mutation
+    pub local_slow_path_arena: Vec<UnboundedFunctionMetadata>,
+    pub local_generics_arena: Vec<TypeId>,
+    pub local_generics_offsets: Vec<(usize, usize)>,
+
+    // The flat arrays replacing the AST
+    pub local_type_stream: Vec<TypeId>, // array of 256-bit GIDs
+    pub local_hir_stream: Vec<HirInstruction>,
+
+    /// Tensor-type side table: `GID -> (element, shape)` for every tensor type this function's stream
+    /// references. Tensor GIDs are content hashes (not invertible) and tensors are structural (never
+    /// in the nominal registry), so codegen can't reconstruct a tensor's memref type from the stream
+    /// alone -- most acutely for `TensorAlloc`. The lowerer records it here as it emits tensor values;
+    /// the flat codegen consumes it (the tensor analogue of the registry's struct `layouts`).
+    pub local_tensor_types: Vec<(TypeId, crate::syntax::ElementType, Vec<String>)>,
+
+    /// String side table: the string-literal bytes for each `PrintStr` this function's stream emits,
+```
+
+This file stops in the middle. Continue it from exactly where it stops. Output only the rest of the file.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+
