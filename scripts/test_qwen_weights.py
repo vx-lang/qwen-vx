@@ -474,5 +474,76 @@ class Qwen35Files(unittest.TestCase):
         np.testing.assert_array_equal(q.as_f32(read["layers.2.experts_gate_up"])[5 * 256 : 6 * 256], hf[p + "2.mlp.experts.gate_up_proj"][5])
 
 
+def table_entries(path):
+    """The name and the 8 words after it (dtype, rank, dims, offset, bytes) of each tensor."""
+    with open(path, "rb") as f:
+        head = f.read(1 << 20)
+    count, table = int.from_bytes(head[16:24], "little"), int.from_bytes(head[32:40], "little")
+    entries = {}
+    for i in range(count):
+        entry = head[table + 128 * i : table + 128 * (i + 1)]
+        entries[entry[:64].rstrip(b"\0").decode()] = np.frombuffer(entry[64:], dtype="<i8").tolist()
+    return entries
+
+
+class Qwen35MtpFiles(unittest.TestCase):
+    """The weight file of the tiny Qwen3.5 MoE model with its MTP layer."""
+
+    def setUp(self):
+        self.hf = make_tiny_model.tiny_qwen35_model(mtp=True)
+        self.config, self.tensors = convert.convert_tensors(q.config_from_json(make_tiny_model.QWEN35_MTP_CONFIG), self.hf)
+
+    def test_the_other_tensors_keep_their_values_order_and_offsets(self):
+        plain = make_tiny_model.tiny_qwen35_model()
+        self.assertEqual(list(self.hf)[: len(plain)], list(plain))
+        for name, (_, array) in plain.items():
+            np.testing.assert_array_equal(self.hf[name][1], array, name)
+        config, tensors = convert.convert_tensors(q.config_from_json(make_tiny_model.QWEN35_CONFIG), plain)
+        self.assertEqual(config["mtp_layers"], 0)
+        with tempfile.TemporaryDirectory() as directory:
+            old, new = os.path.join(directory, "old.vxw"), os.path.join(directory, "new.vxw")
+            q.write_weight_file(old, *q.quantize(config, tensors, "q4_0_q6"))
+            q.write_weight_file(new, *q.quantize(self.config, self.tensors, "q4_0_q6"))
+            old_entries, new_entries = table_entries(old), table_entries(new)
+            self.assertEqual(list(new_entries)[: len(old_entries)], list(old_entries))
+            # The longer table of the tiny model moves the data by one page of 16 KiB; that of
+            # Qwen3.6-35B-A3B does not.
+            start, shift = old_entries["embed"][6], new_entries["embed"][6] - old_entries["embed"][6]
+            self.assertIn(shift, (0, q.ALIGNMENT))
+            moved = {n: e[:6] + [e[6] + shift, e[7]] for n, e in old_entries.items()}
+            self.assertEqual({n: new_entries[n] for n in old_entries}, moved)
+            with open(old, "rb") as a, open(new, "rb") as b:
+                a.seek(start)
+                b.seek(start + shift)
+                self.assertEqual(a.read(), b.read(os.path.getsize(old) - start))
+
+    def test_the_mtp_layer_reads_back(self):
+        config, tensors = q.quantize(self.config, self.tensors, "q4_0_q6")
+        version, c, read = write_and_read("tiny-qwen35-mtp.vxw", config, tensors)
+        self.assertEqual((version, c["mtp_layers"]), (2, 1))
+        self.assertEqual(list(read), q.tensor_names(c))
+        names = q.tensor_names(c)
+        self.assertEqual(names[names.index("lm_head.scale") + 1 :][:4], ["mtp.embed_norm", "mtp.hidden_norm", "mtp.fc", "mtp.fc.scale"])
+        self.assertEqual(names[-1], "mtp.final_norm")
+        dtype = {name: d for name, (d, _) in read.items()}
+        self.assertEqual((dtype["mtp.fc"], dtype["mtp.layers.0.qkv"], dtype["mtp.layers.0.experts_down"]), ("u4", "u4", "u4"))
+        self.assertEqual((dtype["mtp.embed_norm"], dtype["mtp.layers.0.router"]), ("f32", "bf16"))
+        self.assertEqual(read["mtp.fc.scale"][1].shape, (256, 512 // 32))
+        self.assertEqual(read["mtp.layers.0.qkv.scale"][1].shape, (2 * 1024 + 2 * 512, 256 // 32))
+
+    def test_the_bf16_mtp_layer_holds_the_hugging_face_tensors(self):
+        _, _, read = write_and_read("tiny-qwen35-mtp.vxw", self.config, self.tensors)
+        hf = {name: q.as_f32(entry) for name, entry in self.hf.items()}
+        np.testing.assert_array_equal(q.as_f32(read["mtp.fc"]), hf["mtp.fc.weight"])
+        np.testing.assert_array_equal(q.as_f32(read["mtp.embed_norm"]), hf["mtp.pre_fc_norm_embedding.weight"] + 1)
+        np.testing.assert_array_equal(q.as_f32(read["mtp.hidden_norm"]), hf["mtp.pre_fc_norm_hidden.weight"] + 1)
+        np.testing.assert_array_equal(q.as_f32(read["mtp.final_norm"]), hf["mtp.norm.weight"] + 1)
+        np.testing.assert_array_equal(q.as_f32(read["mtp.layers.0.attn_norm"]), hf["mtp.layers.0.input_layernorm.weight"] + 1)
+        qkv, q_proj = q.as_f32(read["mtp.layers.0.qkv"]), hf["mtp.layers.0.self_attn.q_proj.weight"]
+        np.testing.assert_array_equal(qkv[256:512], q_proj[512:768])
+        np.testing.assert_array_equal(qkv[2048:2304], q_proj[256:512])
+        np.testing.assert_array_equal(q.as_f32(read["mtp.layers.0.router"])[8], hf["mtp.layers.0.mlp.shared_expert_gate.weight"][0])
+
+
 if __name__ == "__main__":
     unittest.main()
