@@ -689,7 +689,11 @@ fn run_round35(w : &Qwen35Weights, s : &mut Qwen35State, r : &mut Round35, token
     l = l + 1;
   }
   rms_norm_f32_rows(&mut r.xn, &r.x, &w.final_norm, n, c.hidden_size, eps);
-  matvec_q6_rows(&mut r.logits, &w.lm_head.codes, &w.lm_head.high, &w.lm_head.group_scales, &r.xn, n, c.vocab_size, c.hidden_size);
+  if n >= 3 {
+    matvec_q6_rows4(&mut r.logits, &w.lm_head.codes, &w.lm_head.high, &w.lm_head.group_scales, &r.xn, n, c.vocab_size, c.hidden_size);
+  } else {
+    matvec_q6_rows(&mut r.logits, &w.lm_head.codes, &w.lm_head.high, &w.lm_head.group_scales, &r.xn, n, c.vocab_size, c.hidden_size);
+  }
   nn_argmax_rows(&mut r.next, &r.logits, n, c.vocab_size);
   return;
 }
