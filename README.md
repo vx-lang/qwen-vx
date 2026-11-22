@@ -110,6 +110,13 @@ pip install -r requirements.txt
    model (`docs/optimizations.md`, entry 14). It needs the 30B model in Q4_0 with the 6-bit
    `lm_head` (`scripts/convert.py --q4 --q6-lm-head`), and `--steps` of at least 16.
 
+   With `--mtp 3`, a Qwen3.6 model drafts tokens with its multi-token prediction (MTP) layer, and
+   checks them as `--draft` does, so the text is the same as without `--mtp`. This helps also when
+   the reply is new text. A round drafts up to 3 tokens while the model keeps most drafts, and 1
+   token otherwise. The drafts come from the 65,536 tokens of the lowest ids; `--mtp-vocab N`
+   gives another number, a multiple of 8. It needs a weight file with the MTP layer, which
+   `scripts/convert.py --q4 --q6-lm-head` writes for Qwen3.6-35B-A3B.
+
 1. Generate a few tokens with the NumPy reference. It prints the prompt as token ids:
 
    ```sh
