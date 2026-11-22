@@ -26,16 +26,21 @@ import qwen::prefill;
 import qwen::prefill35;
 import qwen::products;
 import qwen::qwen35;
+import qwen::round;
+import qwen::round35;
 import qwen::weights;
 
 /// The state of the MTP layer: its KV cache, and `token` and `h`, the inputs of the next row.
-/// `cat` holds the two norms of a row, the embedding first, for `fc`.
+/// `cat` holds the two norms of a row, the embedding first, for `fc`. `cat_rows` and `proj` are
+/// for the rows of `mtp35_rows`.
 struct Mtp35State {
   k : Tensor<f16, [?, ?, ?], Memory::HBM>,
   v : Tensor<f16, [?, ?, ?], Memory::HBM>,
   token : Tensor<i32, [?], Memory::HBM>,
   h : Tensor<f32, [?], Memory::HBM>,
   cat : Tensor<f32, [?], Memory::HBM>,
+  cat_rows : Tensor<f32, [?, ?], Memory::HBM>,
+  proj : Tensor<f32, [?, ?], Memory::HBM>,
 }
 
 /// The MTP state for the `max_seq` positions of `s`.
@@ -48,6 +53,8 @@ fn new_mtp35_state(c : &Config, max_seq : i32) -> Mtp35State {
     token: transfer(Tensor<i32>([1]), Memory::HBM),
     h: transfer(Tensor<f32>([c.hidden_size]), Memory::HBM),
     cat: transfer(Tensor<f32>([2 * c.hidden_size]), Memory::HBM),
+    cat_rows: transfer(Tensor<f32>([ROUND_MAX, 2 * c.hidden_size]), Memory::HBM),
+    proj: transfer(Tensor<f32>([ROUND_MAX, (2 * c.num_q_heads + 2 * c.num_kv_heads) * 256]), Memory::HBM),
   };
 }
 
@@ -59,6 +66,8 @@ fn new_mtp35_state_none() -> Mtp35State {
     token: transfer(Tensor<i32>([1]), Memory::HBM),
     h: transfer(Tensor<f32>([1]), Memory::HBM),
     cat: transfer(Tensor<f32>([1]), Memory::HBM),
+    cat_rows: transfer(Tensor<f32>([1, 1]), Memory::HBM),
+    proj: transfer(Tensor<f32>([1, 1]), Memory::HBM),
   };
 }
 
@@ -184,6 +193,47 @@ fn mtp35_step(w : &Qwen35Weights, s : &mut Qwen35State, m : &mut Mtp35State, pos
     matvec(&mut s.logits, &w.lm_head, &m.h, vocab, hidden);
     nn_argmax(&mut m.token, &s.logits, vocab);
   }
+  return;
+}
+
+/// Rows start to start + n - 1 of the MTP layer after a round at `start` that keeps n tokens, then
+/// the draft of the last row, with the bits of `mtp35_step` for each row in turn. Row i takes h
+/// of position start + i, r.xn[i], and r.next[i], the token that the round gives after it. The
+/// rows use the kernels and the tensors of the round, so they come after `commit_round35`. After
+/// them, m.token and m.h are the inputs of the next draft.
+fn mtp35_rows(w : &Qwen35Weights, s : &mut Qwen35State, r : &mut Round35, m : &mut Mtp35State, start : i32, n : i32, vocab : i32) -> void {
+  let c = &w.config;
+  let eps = c.rms_norm_eps as f32;
+  let hidden = c.hidden_size;
+  let qkv_rows = (2 * c.num_q_heads + 2 * c.num_kv_heads) * 256;
+  assert(w.mtp.len() == 1 && n >= 1 && n <= ROUND_MAX && start + n <= s.max_seq, "mtp35_rows: the model needs an MTP layer, and the rows must fit in the KV cache");
+  assert(vocab >= 8 && vocab % 8 == 0 && vocab <= c.vocab_size, "mtp35_rows: vocab must be a multiple of 8, up to the vocabulary of the model");
+  let mtp = &w.mtp[0];
+  let layer = &mtp.layer;
+  assert(mtp.fc.dtype == U4 && layer.qkv.dtype == U4 && layer.attn_out.dtype == U4 && layer.gate_up.dtype == U4, "mtp35_rows: the MTP layer must be Q4_0");
+  pf35_rms_norm_at(&mut m.cat_rows, hidden, &r.xn, &mtp.hidden_norm, n, hidden, eps);
+  nn_embed_rows(&mut r.x, &w.embed, &r.next, n, hidden);
+  pf35_rms_norm_at(&mut m.cat_rows, 0, &r.x, &mtp.embed_norm, n, hidden, eps);
+  nn_matvec_q4_rows(&mut r.x, &mtp.fc.codes, &mtp.fc.group_scales, &m.cat_rows, n, hidden, 2 * hidden);
+  rms_norm_f32_rows(&mut r.xn, &r.x, &layer.attn_norm, n, hidden, eps);
+  nn_matvec_q4_rows(&mut m.proj, &layer.qkv.codes, &layer.qkv.group_scales, &r.xn, n, qkv_rows, hidden);
+  pf_gated_norm_rope_and_store(&mut r.q, &mut m.k, &mut m.v, &m.proj, &layer.q_norm, &layer.k_norm, &s.cos, &s.sin, start, n, c.num_q_heads, c.num_kv_heads, c.rotary_dim, eps);
+  gated_attention_rows(&mut r.y, &mut r.parts, &r.q, &m.k, &m.v, &m.proj, start, n, c.num_q_heads, c.num_kv_heads);
+  nn_matvec_q4_rows(&mut r.add, &layer.attn_out.codes, &layer.attn_out.group_scales, &r.y, n, hidden, c.num_q_heads * 256);
+  add_rows(&mut r.x, &r.add, n, hidden);
+  rms_norm_f32_rows(&mut r.xn, &r.x, &layer.mlp_norm, n, hidden, eps);
+  let k = c.experts_per_token;
+  nn_matvec_rows(&mut r.router, &layer.router, &r.xn, n, c.num_experts + 1, hidden);
+  nn_top_k_rows(&mut r.ids, &mut r.weights, &r.router, n, c.num_experts, k);
+  shared_gate_rows(&mut r.shared_weight, &r.router, n, c.num_experts);
+  moe_swiglu_q4_blocks_rows(&mut r.mlp, &layer.gate_up.codes, &layer.gate_up.group_scales, &r.ids, &r.xn, n, k, c.moe_intermediate_size, hidden, c.num_experts);
+  moe_down_q4_add_blocks_rows(&mut r.x, &layer.down.codes, &layer.down.group_scales, &r.ids, &r.weights, &r.mlp, n, k, hidden, c.moe_intermediate_size, c.num_experts);
+  moe_swiglu_q4_blocks_rows(&mut r.shared_mlp, &layer.shared_gate_up.codes, &layer.shared_gate_up.group_scales, &r.shared_ids, &r.xn, n, 1, c.shared_expert_inter, hidden, 1);
+  moe_down_q4_add_blocks_rows(&mut r.x, &layer.shared_down.codes, &layer.shared_down.group_scales, &r.shared_ids, &r.shared_weight, &r.shared_mlp, n, 1, hidden, c.shared_expert_inter, 1);
+  rms_norm_f32_rows(&mut r.xn, &r.x, &mtp.final_norm, n, hidden, eps);
+  take_row(&mut m.h, &r.xn, n - 1, hidden);
+  matvec(&mut s.logits, &w.lm_head, &m.h, vocab, hidden);
+  nn_argmax(&mut m.token, &s.logits, vocab);
   return;
 }
 

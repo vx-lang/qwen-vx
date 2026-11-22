@@ -608,12 +608,18 @@ fn generate_with_mtp35(w : &Qwen35Weights, s : &mut Qwen35State, m : &mut Mtp35S
   // One run of the round kernels for each n to max + 1, so that their compile time is not in the
   // time of a token. They write rows of the KV cache that later tokens write again before they
   // read them, and no DeltaNet state.
+  // The same for the MTP rows after a round, which write MTP rows that later drafts write again
+  // before they read them, and m.token and m.h, which the first round sets again.
   let mut warm = Vec<i32>::new();
   for n in 1..max + 2 {
     warm.push(token);
     run_round35(w, s, &mut r, &warm, pos, n);
+    mtp35_rows(w, s, &mut r, m, pos, n, vocab);
   }
+  copy_f32(&mut m.h, &s.xn, c.hidden_size);
   let _ready = transfer(&r.next, Memory::CPU_DRAM);
+  // m.token has the first draft of the next round when the last round ran the MTP rows.
+  let mut first_draft = false;
   *start = Instant::now();
   let first_step = step;
   let mut rounds = 0;
@@ -643,8 +649,12 @@ fn generate_with_mtp35(w : &Qwen35Weights, s : &mut Qwen35State, m : &mut Mtp35S
       going = show(t, eos, text_mode, step, token, logit);
     } else {
       // Draft j + 1, from row pos - 1 + j of the MTP layer, goes to slots[j].
-      m.token = upload_token(token);
-      for j in 0..k {
+      if !first_draft {
+        m.token = upload_token(token);
+        mtp35_step(w, s, m, pos - 1, true, vocab);
+      }
+      copy_token(&mut slots[0].next, &m.token);
+      for j in 1..k {
         mtp35_step(w, s, m, pos - 1 + j, true, vocab);
         copy_token(&mut slots[j].next, &m.token);
       }
@@ -681,15 +691,12 @@ fn generate_with_mtp35(w : &Qwen35Weights, s : &mut Qwen35State, m : &mut Mtp35S
         }
       }
       // Inputs 0 to j of the round are kept: the last token and the j drafts before the first
-      // miss. MTP rows pos to pos + j - 1 then run with the true h of positions pos to pos + j - 1
-      // and the kept drafts; h of position pos + j is the input of the next round.
+      // miss. MTP rows pos to pos + j then run with the true h of positions pos to pos + j and
+      // the tokens after them, the kept drafts and `token`. The last row gives the first draft of
+      // the next round.
       commit_round35(w, s, &r, j + 1);
-      for i in 0..j {
-        take_row(&mut m.h, &r.xn, i, c.hidden_size);
-        m.token = upload_token(draft[i]);
-        mtp35_step(w, s, m, pos + i, false, vocab);
-      }
-      take_row(&mut m.h, &r.xn, j, c.hidden_size);
+      mtp35_rows(w, s, &mut r, m, pos, j + 1, vocab);
+      first_draft = true;
       pos = pos + j + 1;
     }
   }
