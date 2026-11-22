@@ -255,3 +255,200 @@ fn gated_attention_merge(y : &mut Tensor<f32, [?], Memory::HBM>, part : &Tensor<
   }
   return;
 }
+
+// ------------------------------------------------------------------ the positions of a round ---
+
+/// `gated_attention` for the n positions of a round, after `pf_gated_norm_rope_and_store` stored
+/// their rows in the caches: position t is at start + t, with q[t], qkvg[t] and y[t]. Each position
+/// gets the bits of `gated_attention` at its position, with 2 launches for all n. `part` is scratch
+/// space from `gated_attention_rows_scratch`.
+fn gated_attention_rows(y : &mut Tensor<f32, [?, ?], Memory::HBM>, part : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, qkvg : &Tensor<f32, [?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32) -> void {
+  assert(n >= 1 && q.extent(0) >= n && q.extent(1) == q_heads && q.extent(2) == 256 && q_heads % kv_heads == 0, "gated_attention_rows: q must be [n, q_heads, 256], and q_heads a multiple of kv_heads");
+  assert(k_cache.extent(0) >= start + n && k_cache.extent(1) == kv_heads && k_cache.extent(2) == 256 && v_cache.extent(0) >= start + n && v_cache.extent(1) == kv_heads && v_cache.extent(2) == 256, "gated_attention_rows: the caches must be [positions, kv_heads, 256] with rows for the n positions");
+  assert(part.extent(0) >= n && part.extent(1) == q_heads && part.extent(2) >= 64 && part.extent(3) == 260, "gated_attention_rows: `part` is too small. Make it with gated_attention_rows_scratch");
+  assert(y.extent(0) >= n && y.extent(1) >= q_heads * 256 && qkvg.extent(0) >= n && qkvg.extent(1) >= (2 * q_heads + 2 * kv_heads) * 256, "gated_attention_rows: a tensor is too short");
+  gated_attention_parts_rows(part, q, k_cache, v_cache, start, n, q_heads, q_heads / kv_heads, 0.0625);
+  gated_attention_merge_rows(y, part, qkvg, start, n, q_heads, (q_heads + 2 * kv_heads) * 256);
+  return;
+}
+
+/// The scratch space of `gated_attention_rows` for up to n positions, on the CPU.
+fn gated_attention_rows_scratch(n : i32, q_heads : i32) -> Tensor<f32, [?, ?, ?, ?]> {
+  return Tensor<f32>([n, q_heads, 64, 260]);
+}
+
+/// `gated_attention_parts` for the n positions of a round: position t is at start + t, with q[t],
+/// and with the parts that `gated_attention` takes at start + t. Block (t, h, w) does part[t][h][w]
+/// with the arithmetic of block (h, w) of `gated_attention_parts`, so each position gets the bits
+/// of `gated_attention`. A block with w at or above the parts of its position writes a part that
+/// `gated_attention_merge_rows` does not read.
+fn gated_attention_parts_rows(part : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, group : i32, scale : f32) -> void {
+  spawn on(Topology::Device) {
+    for t in 0..n across blocks {
+      for h in 0..q_heads across blocks {
+        for w in 0..64 across blocks {
+          let mut stats = unsafe { Tensor<f32, [1, 2], Memory::SMEM>::uninit() };
+          for s in 0..1 across subgroups {
+            for l in 0..32 across lanes(32) {
+              let pos = start + t;
+              // The parts of `gated_attention` at pos.
+              let mut nwg = 32;
+              if 2 * nwg * 32 < pos + 1 {
+                nwg = nwg * 2;
+              }
+              let g = h / group;
+              let d = 8 * l;
+              let q0 = q[t][h][d] * scale;
+              let q1 = q[t][h][d + 1] * scale;
+              let q2 = q[t][h][d + 2] * scale;
+              let q3 = q[t][h][d + 3] * scale;
+              let q4 = q[t][h][d + 4] * scale;
+              let q5 = q[t][h][d + 5] * scale;
+              let q6 = q[t][h][d + 6] * scale;
+              let q7 = q[t][h][d + 7] * scale;
+              let mut big : f32 = -3.0e38;
+              let mut total : f32 = 0.0;
+              let mut o0 : f32 = 0.0;
+              let mut o1 : f32 = 0.0;
+              let mut o2 : f32 = 0.0;
+              let mut o3 : f32 = 0.0;
+              let mut o4 : f32 = 0.0;
+              let mut o5 : f32 = 0.0;
+              let mut o6 : f32 = 0.0;
+              let mut o7 : f32 = 0.0;
+              let chunks = (pos + 32) / 32;
+              let mut c = w;
+              if w >= nwg {
+                c = chunks;
+              }
+              while c < chunks {
+                let r0 = c * 32;
+                let mut mine : f32 = -3.0e38;
+                for r in 0..32 {
+                  let row = r0 + r;
+                  let mut kept = row;
+                  if row > pos {
+                    kept = pos;
+                  }
+                  let k0 = half4_at(k_cache, kept, g, d, 0);
+                  let k1 = half4_at(k_cache, kept, g, d, 1);
+                  let k2 = half4_at(k_cache, kept, g, d, 2);
+                  let k3 = half4_at(k_cache, kept, g, d, 3);
+                  let k4 = half4_at(k_cache, kept, g, d + 4, 0);
+                  let k5 = half4_at(k_cache, kept, g, d + 4, 1);
+                  let k6 = half4_at(k_cache, kept, g, d + 4, 2);
+                  let k7 = half4_at(k_cache, kept, g, d + 4, 3);
+                  let mut score = simd_sum(((k0 * q0 + k1 * q1) + (k2 * q2 + k3 * q3)) + ((k4 * q4 + k5 * q5) + (k6 * q6 + k7 * q7)));
+                  if row > pos {
+                    score = -3.0e38;
+                  }
+                  if r == l {
+                    mine = score;
+                  }
+                }
+                let top = big.max(simd_max(mine));
+                let shrink = (big - top).fast_exp();
+                let p = (mine - top).fast_exp();
+                total = total * shrink + simd_sum(p);
+                o0 = o0 * shrink;
+                o1 = o1 * shrink;
+                o2 = o2 * shrink;
+                o3 = o3 * shrink;
+                o4 = o4 * shrink;
+                o5 = o5 * shrink;
+                o6 = o6 * shrink;
+                o7 = o7 * shrink;
+                for r in 0..32 {
+                  let row = r0 + r;
+                  let mut kept = row;
+                  if row > pos {
+                    kept = pos;
+                  }
+                  let pr = simd_value(p, r);
+                  o0 = o0 + half4_at(v_cache, kept, g, d, 0) * pr;
+                  o1 = o1 + half4_at(v_cache, kept, g, d, 1) * pr;
+                  o2 = o2 + half4_at(v_cache, kept, g, d, 2) * pr;
+                  o3 = o3 + half4_at(v_cache, kept, g, d, 3) * pr;
+                  o4 = o4 + half4_at(v_cache, kept, g, d + 4, 0) * pr;
+                  o5 = o5 + half4_at(v_cache, kept, g, d + 4, 1) * pr;
+                  o6 = o6 + half4_at(v_cache, kept, g, d + 4, 2) * pr;
+                  o7 = o7 + half4_at(v_cache, kept, g, d + 4, 3) * pr;
+                }
+                big = top;
+                c = c + nwg;
+              }
+              part[t][h][w][d] = o0;
+              part[t][h][w][d + 1] = o1;
+              part[t][h][w][d + 2] = o2;
+              part[t][h][w][d + 3] = o3;
+              part[t][h][w][d + 4] = o4;
+              part[t][h][w][d + 5] = o5;
+              part[t][h][w][d + 6] = o6;
+              part[t][h][w][d + 7] = o7;
+              // Every lane has the same largest score and sum of the weights. Lanes 0 and 1 keep
+              // them for the next loop.
+              if l < 2 {
+                let mut x = big;
+                if l == 1 {
+                  x = total;
+                }
+                stats[s][l] = x;
+              }
+            }
+            for l in 0..2 across lanes(32) {
+              part[t][h][w][256 + l] = stats[s][l];
+            }
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// `gated_attention_merge` for the n positions of `gated_attention_parts_rows`: y[t] and qkvg[t]
+/// are the rows of position t, at start + t.
+fn gated_attention_merge_rows(y : &mut Tensor<f32, [?, ?], Memory::HBM>, part : &Tensor<f32, [?, ?, ?, ?], Memory::HBM>, qkvg : &Tensor<f32, [?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, gate_at : i32) -> void {
+  spawn on(Topology::Device) {
+    for t in 0..n across blocks {
+      for h in 0..q_heads across blocks {
+        for dq in 0..8 across blocks {
+          let mut top = unsafe { Tensor<f32, [1, 32], Memory::SMEM>::uninit() };
+          for s in 0..1 across subgroups {
+            for l in 0..32 across lanes(32) {
+              let mut parts = 32;
+              if 2 * parts * 32 < start + t + 1 {
+                parts = parts * 2;
+              }
+              let mut m : f32 = -3.0e38;
+              let mut c = l;
+              while c < parts {
+                m = m.max(part[t][h][c][256]);
+                c = c + 32;
+              }
+              top[s][l] = m;
+            }
+            let big = lanes::max(&top[s], 32);
+            for l in 0..32 across lanes(32) {
+              let mut parts = 32;
+              if 2 * parts * 32 < start + t + 1 {
+                parts = parts * 2;
+              }
+              let d = dq * 32 + l;
+              let mut total : f32 = 0.0;
+              let mut acc : f32 = 0.0;
+              for c in 0..parts {
+                let w = (part[t][h][c][256] - big).fast_exp();
+                total = total + w * part[t][h][c][257];
+                acc = acc + w * part[t][h][c][d];
+              }
+              let gate = qkvg[t][gate_at + h * 256 + d];
+              y[t][h * 256 + d] = acc / total / (1.0 + (0.0 - gate).fast_exp());
+            }
+          }
+        }
+      }
+    }
+  }
+  return;
+}

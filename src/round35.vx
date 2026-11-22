@@ -17,16 +17,18 @@
 // update of the state again for the positions that the CPU keeps, and writes it. That costs one
 // more read of S for each round, about 2 MB for each layer.
 //
-// The full attention layers run the kernels of one token for each position, in order, so each
-// position sees the rows of the KV cache that the positions before it wrote. The KV cache keeps
-// the rows of all n positions; the next round or step writes over the rows that the CPU does not
-// keep, before any token reads them.
+// The full attention layers first store the k and v rows of all n positions, then run the
+// attention of all n positions at once. Position t reads the rows up to its own position, as the
+// kernels of one token do, and gets their bits. The KV cache keeps the rows of all n positions;
+// the next round or step writes over the rows that the CPU does not keep, before any token reads
+// them.
 import core::num;
 import std::nn;
 import std::vec;
 import qwen::deltanet;
 import qwen::gated_attention;
 import qwen::model;
+import qwen::prefill35;
 import qwen::products;
 import qwen::q6;
 import qwen::qwen35;
@@ -44,6 +46,8 @@ struct Round35 {
   x : Tensor<f32, [?, ?], Memory::HBM>,
   xn : Tensor<f32, [?, ?], Memory::HBM>,
   y : Tensor<f32, [?, ?], Memory::HBM>,
+  q : Tensor<f32, [?, ?, ?], Memory::HBM>,
+  parts : Tensor<f32, [?, ?, ?, ?], Memory::HBM>,
   add : Tensor<f32, [?, ?], Memory::HBM>,
   o : Tensor<f32, [?, ?, ?], Memory::HBM>,
   router : Tensor<f32, [?, ?], Memory::HBM>,
@@ -131,6 +135,8 @@ fn new_round35(c : &Config) -> Round35 {
     x: transfer(Tensor<f32>([n, c.hidden_size]), Memory::HBM),
     xn: transfer(Tensor<f32>([n, c.hidden_size]), Memory::HBM),
     y: transfer(Tensor<f32>([n, i32::max(c.num_q_heads * 256, vh * 128)]), Memory::HBM),
+    q: transfer(Tensor<f32>([n, c.num_q_heads, 256]), Memory::HBM),
+    parts: transfer(gated_attention_rows_scratch(n, c.num_q_heads), Memory::HBM),
     add: transfer(Tensor<f32>([n, c.hidden_size]), Memory::HBM),
     o: transfer(Tensor<f32>([n, vh, 128]), Memory::HBM),
     router: transfer(Tensor<f32>([n, c.num_experts + 1]), Memory::HBM),
@@ -189,21 +195,6 @@ fn add_rows(x : &mut Tensor<f32, [?, ?], Memory::HBM>, a : &Tensor<f32, [?, ?], 
           if i < dim {
             x[t][i] = x[t][i] + a[t][i];
           }
-        }
-      }
-    }
-  }
-  return;
-}
-
-/// x[t][i] = y[i], for i below dim.
-fn put_row(x : &mut Tensor<f32, [?, ?], Memory::HBM>, y : &Tensor<f32, [?], Memory::HBM>, t : i32, dim : i32) -> void {
-  spawn on(Topology::Device) {
-    for b in 0..(dim + 255) / 256 across blocks {
-      for l in 0..256 across lanes {
-        let i = b * 256 + l;
-        if i < dim {
-          x[t][i] = y[i];
         }
       }
     }
@@ -675,12 +666,8 @@ fn run_round35(w : &Qwen35Weights, s : &mut Qwen35State, r : &mut Round35, token
     rms_norm_f32_rows(&mut r.xn, &r.x, &layer.attn_norm, n, c.hidden_size, eps);
     if layer.full_attention {
       nn_matvec_q4_rows(&mut kept.proj, &layer.qkv.codes, &layer.qkv.group_scales, &r.xn, n, qkv_rows, c.hidden_size);
-      for t in 0..n {
-        take_row(&mut s.proj, &kept.proj, t, qkv_rows);
-        gated_norm_rope_and_store(&mut s.q, &mut ls.k, &mut ls.v, &s.proj, &layer.q_norm, &layer.k_norm, &s.cos, &s.sin, start + t, c.num_q_heads, c.num_kv_heads, c.rotary_dim, eps);
-        gated_attention(&mut s.y, &mut s.parts, &s.q, &ls.k, &ls.v, &s.proj, start + t, c.num_q_heads, c.num_kv_heads);
-        put_row(&mut r.y, &s.y, t, c.num_q_heads * 256);
-      }
+      pf_gated_norm_rope_and_store(&mut r.q, &mut ls.k, &mut ls.v, &kept.proj, &layer.q_norm, &layer.k_norm, &s.cos, &s.sin, start, n, c.num_q_heads, c.num_kv_heads, c.rotary_dim, eps);
+      gated_attention_rows(&mut r.y, &mut r.parts, &r.q, &ls.k, &ls.v, &kept.proj, start, n, c.num_q_heads, c.num_kv_heads);
       nn_matvec_q4_rows(&mut r.add, &layer.attn_out.codes, &layer.attn_out.group_scales, &r.y, n, c.hidden_size, c.num_q_heads * 256);
     } else {
       nn_matvec_q4_rows(&mut kept.proj, &layer.linear_in.codes, &layer.linear_in.group_scales, &r.xn, n, a_at + vh, c.hidden_size);
