@@ -57,23 +57,12 @@ def convert_qwen3_5(config, hf):
     tensors = {"embed": hf[src + "embed_tokens.weight"], "final_norm": one_plus(hf[src + "norm.weight"])}
     if not config["tied_embeddings"]:
         tensors["lm_head"] = hf["lm_head.weight"]
-    heads, head_dim, hidden = config["num_q_heads"], config["head_dim"], config["hidden_size"]
-    experts, moe_inter = config["num_experts"], config["moe_intermediate_size"]
     for layer in range(config["num_layers"]):
         source = f"{src}layers.{layer}."
         target = f"layers.{layer}."
         tensors[target + "attn_norm"] = one_plus(hf[source + "input_layernorm.weight"])
         if qwen_weights.has_full_attention(config, layer):
-            attn = source + "self_attn."
-            dtype, q_and_gate = hf[attn + "q_proj.weight"]
-            # q_proj gives each head its query rows and then its gate rows.
-            q_and_gate = q_and_gate.reshape(heads, 2, head_dim, hidden)
-            parts = [(dtype, q_and_gate[:, 0].reshape(heads * head_dim, hidden)), hf[attn + "k_proj.weight"],
-                     hf[attn + "v_proj.weight"], (dtype, q_and_gate[:, 1].reshape(heads * head_dim, hidden))]
-            tensors[target + "qkv"] = lambda parts=parts: joined(parts)
-            tensors[target + "q_norm"] = one_plus(hf[attn + "q_norm.weight"])
-            tensors[target + "k_norm"] = one_plus(hf[attn + "k_norm.weight"])
-            tensors[target + "attn_out"] = hf[attn + "o_proj.weight"]
+            full_attention(config, hf, source, target, tensors)
         else:
             linear = source + "linear_attn."
             parts = [hf[linear + f"in_proj_{p}.weight"] for p in ("qkv", "z", "b", "a")]
@@ -84,20 +73,51 @@ def convert_qwen3_5(config, hf):
             tensors[target + "dt_bias"] = f32(hf[linear + "dt_bias"])
             tensors[target + "linear_norm"] = f32(hf[linear + "norm.weight"])
             tensors[target + "linear_out"] = hf[linear + "out_proj.weight"]
-        mlp = source + "mlp."
-        tensors[target + "mlp_norm"] = one_plus(hf[source + "post_attention_layernorm.weight"])
-        tensors[target + "router"] = joined([hf[mlp + "gate.weight"], hf[mlp + "shared_expert_gate.weight"]])
-        # The experts come as one tensor [experts, 2 * inter, hidden], each expert's gate rows and
-        # then its up rows, and one [experts, hidden, inter]. Reshapes of a memory map copy nothing.
-        dtype, gate_up = hf[mlp + "experts.gate_up_proj"]
-        tensors[target + "experts_gate_up"] = (dtype, gate_up.reshape(experts * 2 * moe_inter, hidden))
-        dtype, down = hf[mlp + "experts.down_proj"]
-        tensors[target + "experts_down"] = (dtype, down.reshape(experts * hidden, moe_inter))
-        shared = mlp + "shared_expert."
-        parts = [hf[shared + p + "_proj.weight"] for p in ("gate", "up")]
-        tensors[target + "shared_gate_up"] = lambda parts=parts: joined(parts)
-        tensors[target + "shared_down"] = hf[shared + "down_proj.weight"]
+        experts_mlp(config, hf, source, target, tensors)
+    if config.get("mtp_layers", 0):
+        tensors["mtp.embed_norm"] = one_plus(hf["mtp.pre_fc_norm_embedding.weight"])
+        tensors["mtp.hidden_norm"] = one_plus(hf["mtp.pre_fc_norm_hidden.weight"])
+        tensors["mtp.fc"] = hf["mtp.fc.weight"]
+        tensors["mtp.final_norm"] = one_plus(hf["mtp.norm.weight"])
+        source, target = "mtp.layers.0.", "mtp.layers.0."
+        tensors[target + "attn_norm"] = one_plus(hf[source + "input_layernorm.weight"])
+        full_attention(config, hf, source, target, tensors)
+        experts_mlp(config, hf, source, target, tensors)
     return config, tensors
+
+
+def full_attention(config, hf, source, target, tensors):
+    """Adds the tensors of the attention of a layer with full attention: Hugging Face names from
+    `source`, names of the weight file from `target`."""
+    heads, head_dim, hidden = config["num_q_heads"], config["head_dim"], config["hidden_size"]
+    attn = source + "self_attn."
+    dtype, q_and_gate = hf[attn + "q_proj.weight"]
+    # q_proj gives each head its query rows and then its gate rows.
+    q_and_gate = q_and_gate.reshape(heads, 2, head_dim, hidden)
+    parts = [(dtype, q_and_gate[:, 0].reshape(heads * head_dim, hidden)), hf[attn + "k_proj.weight"],
+             hf[attn + "v_proj.weight"], (dtype, q_and_gate[:, 1].reshape(heads * head_dim, hidden))]
+    tensors[target + "qkv"] = lambda parts=parts: joined(parts)
+    tensors[target + "q_norm"] = one_plus(hf[attn + "q_norm.weight"])
+    tensors[target + "k_norm"] = one_plus(hf[attn + "k_norm.weight"])
+    tensors[target + "attn_out"] = hf[attn + "o_proj.weight"]
+
+
+def experts_mlp(config, hf, source, target, tensors):
+    """Adds the tensors of the experts and the shared expert of a layer, as `full_attention`."""
+    hidden, experts, moe_inter = config["hidden_size"], config["num_experts"], config["moe_intermediate_size"]
+    mlp = source + "mlp."
+    tensors[target + "mlp_norm"] = one_plus(hf[source + "post_attention_layernorm.weight"])
+    tensors[target + "router"] = joined([hf[mlp + "gate.weight"], hf[mlp + "shared_expert_gate.weight"]])
+    # The experts come as one tensor [experts, 2 * inter, hidden], each expert's gate rows and
+    # then its up rows, and one [experts, hidden, inter]. Reshapes of a memory map copy nothing.
+    dtype, gate_up = hf[mlp + "experts.gate_up_proj"]
+    tensors[target + "experts_gate_up"] = (dtype, gate_up.reshape(experts * 2 * moe_inter, hidden))
+    dtype, down = hf[mlp + "experts.down_proj"]
+    tensors[target + "experts_down"] = (dtype, down.reshape(experts * hidden, moe_inter))
+    shared = mlp + "shared_expert."
+    parts = [hf[shared + p + "_proj.weight"] for p in ("gate", "up")]
+    tensors[target + "shared_gate_up"] = lambda parts=parts: joined(parts)
+    tensors[target + "shared_down"] = hf[shared + "down_proj.weight"]
 
 
 def convert_tensors(config, hf):

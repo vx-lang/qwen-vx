@@ -83,6 +83,8 @@ struct Config {
   shared_expert_inter : i32,
   // RoPE turns the first rotary_dim values of each head: head_dim in a version 1 file.
   rotary_dim : i32,
+  // The MTP layers of an arch 1 model: 0 or 1, and 0 in a file without them.
+  mtp_layers : i32,
   rope_theta : f64,
   rms_norm_eps : f64,
 }
@@ -166,13 +168,27 @@ struct Qwen35Layer {
   shared_down : WeightMatrix,
 }
 
-/// All the weights of an arch 1 model, in GPU memory.
+/// The multi-token prediction (MTP) layer of an arch 1 model, which predicts the token after the
+/// next one. Its input is the embedding of a token and the hidden state h of the position before
+/// it, after final_norm. `fc` takes the two norms, the embedding first, and `layer` has full
+/// attention. The norms hold 1 + w, as those of a layer.
+struct Mtp35 {
+  embed_norm : Tensor<f32, [?], Memory::HBM>,
+  hidden_norm : Tensor<f32, [?], Memory::HBM>,
+  fc : WeightMatrix,
+  layer : Qwen35Layer,
+  final_norm : Tensor<f32, [?], Memory::HBM>,
+}
+
+/// All the weights of an arch 1 model, in GPU memory. `mtp` has the MTP layer of a file with
+/// mtp_layers = 1, and is empty otherwise.
 struct Qwen35Weights {
   config : Config,
   embed : Tensor<bf16, [?], Memory::HBM>,
   layers : Vec<Qwen35Layer>,
   final_norm : Tensor<f32, [?], Memory::HBM>,
   lm_head : WeightMatrix,
+  mtp : Vec<Mtp35>,
 }
 
 /// A weight file mapped into memory, and the position of the next tensor to load.
@@ -422,12 +438,14 @@ fn read_config(r : &Reader) -> Config {
     conv_width: v2_int(r, 22, 0),
     shared_expert_inter: v2_int(r, 24, 0),
     rotary_dim: v2_int(r, 23, head_dim),
+    mtp_layers: v2_int(r, 25, 0),
     rope_theta: unsafe { floats[floats_at] },
     rms_norm_eps: unsafe { floats[floats_at + 1] },
   };
   assert(config.weight_format >= FORMAT_BF16 && config.weight_format <= FORMAT_Q4_0_Q6, "the weight file has an unknown weight format");
   assert(config.num_experts == 0 || (config.experts_per_token > 0 && config.experts_per_token <= config.num_experts), "a model must use between 1 and all of its experts for each token");
   assert((r.version == VERSION_2) == (config.arch == ARCH_QWEN35), "an arch 1 model needs a version 2 file, and only it");
+  assert(config.mtp_layers == 0 || config.mtp_layers == 1, "a model can have at most one MTP layer");
   return config;
 }
 
@@ -456,6 +474,39 @@ fn load_qwen35_weights(path : *const i8) -> Qwen35Weights {
   assert(config.linear_k_heads > 0 && config.linear_v_heads % config.linear_k_heads == 0, "each key head of a Gated DeltaNet must serve the same number of value heads");
   assert(!config.tied_embeddings, "a Qwen3.5 MoE weight file has its own lm_head");
   let hidden = config.hidden_size;
+  let dtype = matrix_dtype(config.weight_format, false);
+  let embed = load_next(&mut r, "embed", config.vocab_size, hidden);
+  let mut layers = Vec<Qwen35Layer>::new();
+  for l in 0..config.num_layers {
+    layers.push(load_qwen35_layer(&mut r, &config, dtype, (l + 1) % config.full_attention_interval == 0));
+  }
+  let final_norm = load_scales(&mut r, "final_norm", hidden, 0);
+  let lm_head = load_matrix(&mut r, matrix_dtype(config.weight_format, true), "lm_head", "lm_head.scale", config.vocab_size, hidden);
+  let mut mtp = Vec<Mtp35>::new();
+  if config.mtp_layers == 1 {
+    let embed_norm = load_scales(&mut r, "mtp.embed_norm", hidden, 0);
+    let hidden_norm = load_scales(&mut r, "mtp.hidden_norm", hidden, 0);
+    let fc = load_matrix(&mut r, dtype, "mtp.fc", "mtp.fc.scale", hidden, 2 * hidden);
+    let layer = load_qwen35_layer(&mut r, &config, dtype, true);
+    mtp.push(Mtp35 {
+      embed_norm: embed_norm,
+      hidden_norm: hidden_norm,
+      fc: fc,
+      layer: layer,
+      final_norm: load_scales(&mut r, "mtp.final_norm", hidden, 0),
+    });
+  }
+  assert(r.next == r.count, "the weight file has more tensors than the config needs");
+  close_weight_file(&r);
+  return Qwen35Weights {
+    config: config, embed: embed, layers: layers, final_norm: final_norm, lm_head: lm_head, mtp: mtp
+  };
+}
+
+/// Loads the next layer of an arch 1 model, with full attention or a Gated DeltaNet. The tensors
+/// come in file order: those of the attention or the Gated DeltaNet, then those of the experts.
+fn load_qwen35_layer(r : &mut Reader, config : &Config, dtype : i64, full : bool) -> Qwen35Layer {
+  let hidden = config.hidden_size;
   let head_dim = config.head_dim;
   let heads = config.num_q_heads;
   let k_total = config.linear_k_heads * config.linear_k_dim;
@@ -464,97 +515,82 @@ fn load_qwen35_weights(path : *const i8) -> Qwen35Weights {
   let experts = config.num_experts;
   let moe_inter = config.moe_intermediate_size;
   let shared = config.shared_expert_inter;
-  let dtype = matrix_dtype(config.weight_format, false);
-  let embed = load_next(&mut r, "embed", config.vocab_size, hidden);
-  let mut layers = Vec<Qwen35Layer>::new();
-  for l in 0..config.num_layers {
-    // The tensors come in file order: those of the attention or the Gated DeltaNet, then those
-    // of the experts.
-    let full = (l + 1) % config.full_attention_interval == 0;
-    let attn_norm = load_scales(&mut r, ".attn_norm", hidden, 0);
-    let qkv = if full {
-      load_matrix(&mut r, dtype, ".qkv", ".qkv.scale", 2 * heads * head_dim + 2 * config.num_kv_heads * head_dim, hidden)
-    } else {
-      empty_matrix()
-    };
-    let q_norm = if full {
-      load_scales(&mut r, ".q_norm", head_dim, 0)
-    } else {
-      zero_scales(8)
-    };
-    let k_norm = if full {
-      load_scales(&mut r, ".k_norm", head_dim, 0)
-    } else {
-      zero_scales(8)
-    };
-    let attn_out = if full {
-      load_matrix(&mut r, dtype, ".attn_out", ".attn_out.scale", hidden, heads * head_dim)
-    } else {
-      empty_matrix()
-    };
-    let linear_in = if full {
-      empty_matrix()
-    } else {
-      load_matrix(&mut r, dtype, ".linear_in", ".linear_in.scale", 2 * k_total + 2 * v_total + 2 * v_heads, hidden)
-    };
-    let conv = if full {
-      zero_scales(8)
-    } else {
-      load_scales(&mut r, ".conv", 2 * k_total + v_total, config.conv_width)
-    };
-    let neg_a = if full {
-      zero_scales(8)
-    } else {
-      load_scales(&mut r, ".neg_A", v_heads, 0)
-    };
-    let dt_bias = if full {
-      zero_scales(8)
-    } else {
-      load_scales(&mut r, ".dt_bias", v_heads, 0)
-    };
-    let linear_norm = if full {
-      zero_scales(8)
-    } else {
-      load_scales(&mut r, ".linear_norm", config.linear_v_dim, 0)
-    };
-    let linear_out = if full {
-      empty_matrix()
-    } else {
-      load_matrix(&mut r, dtype, ".linear_out", ".linear_out.scale", hidden, v_total)
-    };
-    let mlp_norm = load_scales(&mut r, ".mlp_norm", hidden, 0);
-    let router = load_next(&mut r, ".router", experts + 1, hidden);
-    let gate_up = load_matrix(&mut r, dtype, ".experts_gate_up", ".experts_gate_up.scale", experts * 2 * moe_inter, hidden);
-    let down = load_matrix(&mut r, dtype, ".experts_down", ".experts_down.scale", experts * hidden, moe_inter);
-    let shared_gate_up = load_matrix(&mut r, dtype, ".shared_gate_up", ".shared_gate_up.scale", 2 * shared, hidden);
-    let shared_down = load_matrix(&mut r, dtype, ".shared_down", ".shared_down.scale", hidden, shared);
-    layers.push(Qwen35Layer {
-      full_attention: full,
-      attn_norm: attn_norm,
-      qkv: qkv,
-      q_norm: q_norm,
-      k_norm: k_norm,
-      attn_out: attn_out,
-      linear_in: linear_in,
-      conv: conv,
-      neg_a: neg_a,
-      dt_bias: dt_bias,
-      linear_norm: linear_norm,
-      linear_out: linear_out,
-      mlp_norm: mlp_norm,
-      router: router,
-      gate_up: gate_up,
-      down: down,
-      shared_gate_up: shared_gate_up,
-      shared_down: shared_down,
-    });
-  }
-  let final_norm = load_scales(&mut r, "final_norm", hidden, 0);
-  let lm_head = load_matrix(&mut r, matrix_dtype(config.weight_format, true), "lm_head", "lm_head.scale", config.vocab_size, hidden);
-  assert(r.next == r.count, "the weight file has more tensors than the config needs");
-  close_weight_file(&r);
-  return Qwen35Weights {
-    config: config, embed: embed, layers: layers, final_norm: final_norm, lm_head: lm_head
+  let attn_norm = load_scales(r, ".attn_norm", hidden, 0);
+  let qkv = if full {
+    load_matrix(r, dtype, ".qkv", ".qkv.scale", 2 * heads * head_dim + 2 * config.num_kv_heads * head_dim, hidden)
+  } else {
+    empty_matrix()
+  };
+  let q_norm = if full {
+    load_scales(r, ".q_norm", head_dim, 0)
+  } else {
+    zero_scales(8)
+  };
+  let k_norm = if full {
+    load_scales(r, ".k_norm", head_dim, 0)
+  } else {
+    zero_scales(8)
+  };
+  let attn_out = if full {
+    load_matrix(r, dtype, ".attn_out", ".attn_out.scale", hidden, heads * head_dim)
+  } else {
+    empty_matrix()
+  };
+  let linear_in = if full {
+    empty_matrix()
+  } else {
+    load_matrix(r, dtype, ".linear_in", ".linear_in.scale", 2 * k_total + 2 * v_total + 2 * v_heads, hidden)
+  };
+  let conv = if full {
+    zero_scales(8)
+  } else {
+    load_scales(r, ".conv", 2 * k_total + v_total, config.conv_width)
+  };
+  let neg_a = if full {
+    zero_scales(8)
+  } else {
+    load_scales(r, ".neg_A", v_heads, 0)
+  };
+  let dt_bias = if full {
+    zero_scales(8)
+  } else {
+    load_scales(r, ".dt_bias", v_heads, 0)
+  };
+  let linear_norm = if full {
+    zero_scales(8)
+  } else {
+    load_scales(r, ".linear_norm", config.linear_v_dim, 0)
+  };
+  let linear_out = if full {
+    empty_matrix()
+  } else {
+    load_matrix(r, dtype, ".linear_out", ".linear_out.scale", hidden, v_total)
+  };
+  let mlp_norm = load_scales(r, ".mlp_norm", hidden, 0);
+  let router = load_next(r, ".router", experts + 1, hidden);
+  let gate_up = load_matrix(r, dtype, ".experts_gate_up", ".experts_gate_up.scale", experts * 2 * moe_inter, hidden);
+  let down = load_matrix(r, dtype, ".experts_down", ".experts_down.scale", experts * hidden, moe_inter);
+  let shared_gate_up = load_matrix(r, dtype, ".shared_gate_up", ".shared_gate_up.scale", 2 * shared, hidden);
+  let shared_down = load_matrix(r, dtype, ".shared_down", ".shared_down.scale", hidden, shared);
+  return Qwen35Layer {
+    full_attention: full,
+    attn_norm: attn_norm,
+    qkv: qkv,
+    q_norm: q_norm,
+    k_norm: k_norm,
+    attn_out: attn_out,
+    linear_in: linear_in,
+    conv: conv,
+    neg_a: neg_a,
+    dt_bias: dt_bias,
+    linear_norm: linear_norm,
+    linear_out: linear_out,
+    mlp_norm: mlp_norm,
+    router: router,
+    gate_up: gate_up,
+    down: down,
+    shared_gate_up: shared_gate_up,
+    shared_down: shared_down,
   };
 }
 

@@ -21,7 +21,8 @@ With --qwen35, the model has the layers of Qwen3.6-35B-A3B, and its head sizes, 
 same kernels: hidden size 256, 4 layers of which the last has full attention and the others a Gated
 DeltaNet, 4 query heads and 2 key-value heads of 256, 2 key heads and 4 value heads of 128 in a
 DeltaNet, and 8 experts of which each token uses 2, and a shared expert. Its weights come from
-splitmix64 too, and --hugging-face works as for --moe.
+splitmix64 too, and --hugging-face works as for --moe. With --mtp, it also has the MTP layer of
+Qwen3.6-35B-A3B, whose weights come after all the others, so that the other weights do not change.
 
 Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
 See LICENSE for license information.
@@ -125,6 +126,9 @@ QWEN35_CONFIG = {
     "tie_word_embeddings": False,
     "text_config": QWEN35_TEXT_CONFIG,
 }
+# The same, with the MTP layer.
+QWEN35_MTP_CONFIG = dict(QWEN35_CONFIG, text_config=dict(QWEN35_TEXT_CONFIG, mtp_num_hidden_layers=1,
+                                                         mtp_use_dedicated_embeddings=False))
 SEED = 0x2545F4914F6CDD1D
 
 
@@ -236,8 +240,9 @@ def tiny_moe_model():
     return tensors
 
 
-def tiny_qwen35_model():
-    """The tensors of the tiny Qwen3.5 MoE model, as bf16 bits with their Hugging Face names."""
+def tiny_qwen35_model(mtp=False):
+    """The tensors of the tiny Qwen3.5 MoE model, as bf16 bits with their Hugging Face names. `mtp`
+    adds the MTP layer after all the other tensors."""
     c = QWEN35_TEXT_CONFIG
     hidden, head_dim, inter = c["hidden_size"], c["head_dim"], c["moe_intermediate_size"]
     heads, kv_heads, experts = c["num_attention_heads"], c["num_key_value_heads"], c["num_experts"]
@@ -247,8 +252,15 @@ def tiny_qwen35_model():
     shared = c["shared_expert_intermediate_size"]
     src = "model.language_model."
     shapes = {src + "embed_tokens.weight": (c["vocab_size"], hidden)}
-    for layer, kind in enumerate(c["layer_types"]):
-        p = f"{src}layers.{layer}."
+    layers = [(f"{src}layers.{layer}.", kind) for layer, kind in enumerate(c["layer_types"])]
+    for p, kind in layers + ([("mtp.layers.0.", "full_attention")] if mtp else []):
+        if p.startswith("mtp."):
+            # The MTP layer comes after lm_head.
+            shapes[src + "norm.weight"] = (hidden,)
+            shapes["lm_head.weight"] = (c["vocab_size"], hidden)
+            shapes["mtp.pre_fc_norm_embedding.weight"] = (hidden,)
+            shapes["mtp.pre_fc_norm_hidden.weight"] = (hidden,)
+            shapes["mtp.fc.weight"] = (hidden, 2 * hidden)
         shapes[p + "input_layernorm.weight"] = (hidden,)
         if kind == "full_attention":
             shapes[p + "self_attn.q_proj.weight"] = (heads * head_dim * 2, hidden)
@@ -277,6 +289,8 @@ def tiny_qwen35_model():
         shapes[p + "mlp.shared_expert_gate.weight"] = (1, hidden)
     shapes[src + "norm.weight"] = (hidden,)
     shapes["lm_head.weight"] = (c["vocab_size"], hidden)
+    if mtp:
+        shapes["mtp.norm.weight"] = (hidden,)
     # The ranges of the weights whose kind needs another one than (-0.1, 0.1).
     ranges = {"conv1d.weight": (-0.5, 0.5), "A_log": (-1.0, 1.0), "dt_bias": (-1.0, 1.0), "linear_attn.norm.weight": (0.9, 1.1)}
     tensors, start = {}, 0
@@ -324,6 +338,7 @@ def main():
     parser.add_argument("--q6-lm-head", action="store_true", help="with --q4, store lm_head as 6-bit codes, not f8e4m3")
     parser.add_argument("--moe", action="store_true", help="write the tiny mixture-of-experts model")
     parser.add_argument("--qwen35", action="store_true", help="write the tiny model with the layers of Qwen3.6-35B-A3B")
+    parser.add_argument("--mtp", action="store_true", help="with --qwen35, add the MTP layer of Qwen3.6-35B-A3B")
     parser.add_argument("--hugging-face", metavar="DIR", help="also write the MoE or Qwen3.5 model as a Hugging Face folder")
     parser.add_argument("--max-positions", type=int, help="the positions of the model, 64 if not given; the weights do not change")
     parser.add_argument("--vocab-size", type=int, help="the tokens of the dense model, 256 if not given, for a bigger tokenizer; other weights come out")
@@ -331,8 +346,12 @@ def main():
     assert not (args.moe and args.qwen35), "give --moe or --qwen35, not both"
     assert not ((args.moe or args.qwen35) and args.vocab_size), "--vocab-size is for the dense model"
     assert not args.q6_lm_head or args.q4, "--q6-lm-head needs --q4"
+    assert not args.mtp or args.qwen35, "--mtp needs --qwen35"
     if args.moe or args.qwen35:
-        hf_config, hf = (MOE_CONFIG, tiny_moe_model()) if args.moe else (QWEN35_CONFIG, tiny_qwen35_model())
+        if args.moe:
+            hf_config, hf = MOE_CONFIG, tiny_moe_model()
+        else:
+            hf_config, hf = (QWEN35_MTP_CONFIG if args.mtp else QWEN35_CONFIG), tiny_qwen35_model(args.mtp)
         if args.hugging_face:
             write_hugging_face_folder(args.hugging_face, hf_config, hf)
         config, tensors = convert.convert_tensors(qwen_weights.config_from_json(hf_config), hf)
