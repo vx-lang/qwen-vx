@@ -158,6 +158,26 @@ fn draft_length(length : i32) -> i32 {
   return 7;
 }
 
+/// `draft_length` for Qwen3.5 and Qwen3.6 (arch 1): none below 2, 1 for 2 to 11, 4 for 12 to 15,
+/// and 11 for MATCH_MAX. A round of these models costs about 25 ms for 1 position and 30 ms for 2,
+/// and then about 16 ms more for each 2 positions, so a draft of 1 token pays at short matches.
+/// A simulation of the draft loop on the greedy outputs of the 12 tuning prompts of
+/// docs/benchmarks/2026-11-20-qwen36-m4 (prompts/twelve) found this rule best. With each kind of
+/// prompt left out of the search, the search found the same rule, and it beat `draft_length` on
+/// the kind left out.
+fn draft_length35(length : i32) -> i32 {
+  if length < 2 {
+    return 0;
+  }
+  if length < 12 {
+    return 1;
+  }
+  if length < MATCH_MAX {
+    return 4;
+  }
+  return 11;
+}
+
 /// Up to `k` tokens of the context after position `end`.
 fn tokens_after(context : &Vec<i32>, end : i32, k : i32) -> Vec<i32> {
   let mut draft = Vec<i32>::new();
