@@ -317,6 +317,22 @@ more than plain steps; with them, nothing (write prompts, two runs of each in tu
 
 The text is the same as without drafts in all 24 pairs of these runs.
 
+### 15. Expert launches in an order that overlaps (#34)
+
+**Problem.** A GPU trace of a generated token (Metal System Trace with the GPU counters, 512
+positions) shows the GPU idle for about 3.4 ms of a 22.8 ms token, mostly between a kernel and the
+kernel that reads its output. The concurrent encoder of Vx puts a barrier only where a launch
+reads what an earlier launch wrote, so launches that do not depend on each other can run at the
+same time. But in a layer of experts, each launch read the output of the one just before it.
+
+**Change.** `add_experts_shared` now starts the SwiGLU of the shared expert first, which needs only
+`xn`. So it runs with the router; the gate of the shared expert runs with top-k; and the down
+product of the shared expert runs with the SwiGLU of the chosen experts. The shared expert is now
+added to `x` before the chosen experts. The rounds of `--draft` use the same order, so they still
+give the same bits as one position.
+
+**Result.** 22.36 to 22.22 ms a token at 512 positions, faster in 4 of 4 interleaved runs.
+
 ### 17. The attention and the lm_head of a round, for all positions at once (#110)
 
 **Problem.** With the MTP drafts of entry 16, a round of Qwen3.6 has 2 to 4 positions. Two parts
@@ -365,6 +381,12 @@ Each position keeps the bits of a plain step (`tests/round35.vx`, `tests/round.v
     round kernels of Vx main and drafts only when they pay, edits are 1.84 times as fast (entry
     14). A draft model may still pay on a Mac with matrix units, or for a model where a token
     costs more.
+- **The norm before the experts merged into the router and the SwiGLUs** (#34). Each block found
+  the scale of the norm from all of `x`, then read `x` times the scale. This removed 40 launches
+  from a token, but only 6 of its 417 barriers: the router and the SwiGLUs must still wait for the
+  product that writes `x`. With each block reading all of `x` again, the token was about 0.55 ms
+  slower (4 of 4 interleaved runs). So the idle gaps between small kernels are waits for data,
+  not the cost of a launch. Only work that does not depend on the kernel before it fills a gap.
 - **Weights decoded once into registers for several tokens.** In Vx v0.0.4 these kernels were
   slower than the kernels that decode each weight with masks for each token. Their 64 to 128
   floats a lane likely leave the registers.
@@ -379,9 +401,10 @@ Each position keeps the bits of a plain step (`tests/round35.vx`, `tests/round.v
 - **The start of a session** (#27): the load of the weights takes about 10.5 s since entry 11. The
   compile of the program at -O0 is the next part to measure.
 - **Small kernels** (#34): the 336 kernels of a token other than the products (7 in each layer)
-  take about 2.5 ms for about 0.7 ms of bytes. Each one reads what the kernel before it wrote, so
-  running kernels at the same time does not help; fewer kernels do. Merge the norms into the
-  products after them, and the router into top-k.
+  take about 2.5 ms for about 0.7 ms of bytes. Each one reads what the kernel before it wrote.
+  Fewer launches alone do not help (see "What did not help"); work that runs at the same time
+  does (entry 15). A next step: the product that writes `x` also writes the sum of squares of each
+  block, so the kernels after it need not read all of `x` for the norm.
 - **Fewer bytes for a token** (#33): lm_head in Q4_0 (#9) would save about 1.3 ms, after a check of
   the perplexity.
 - **Attention at a long context** (#38): about 4 ms of a token at 8,000 positions, above the

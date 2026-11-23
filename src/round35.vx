@@ -679,13 +679,15 @@ fn run_round35(w : &Qwen35Weights, s : &mut Qwen35State, r : &mut Round35, token
     }
     add_rows(&mut r.x, &r.add, n, c.hidden_size);
     rms_norm_f32_rows(&mut r.xn, &r.x, &layer.mlp_norm, n, c.hidden_size, eps);
+    // The order of `add_experts_shared`: the shared expert is added to x before the chosen
+    // experts, so that the bits are the same as those of one position.
+    moe_swiglu_q4_blocks_rows(&mut r.shared_mlp, &layer.shared_gate_up.codes, &layer.shared_gate_up.group_scales, &r.shared_ids, &r.xn, n, 1, c.shared_expert_inter, c.hidden_size, 1);
     nn_matvec_rows(&mut r.router, &layer.router, &r.xn, n, c.num_experts + 1, c.hidden_size);
     nn_top_k_rows(&mut r.ids, &mut r.weights, &r.router, n, c.num_experts, k);
     shared_gate_rows(&mut r.shared_weight, &r.router, n, c.num_experts);
     moe_swiglu_q4_blocks_rows(&mut r.mlp, &layer.gate_up.codes, &layer.gate_up.group_scales, &r.ids, &r.xn, n, k, c.moe_intermediate_size, c.hidden_size, c.num_experts);
-    moe_down_q4_add_blocks_rows(&mut r.x, &layer.down.codes, &layer.down.group_scales, &r.ids, &r.weights, &r.mlp, n, k, c.hidden_size, c.moe_intermediate_size, c.num_experts);
-    moe_swiglu_q4_blocks_rows(&mut r.shared_mlp, &layer.shared_gate_up.codes, &layer.shared_gate_up.group_scales, &r.shared_ids, &r.xn, n, 1, c.shared_expert_inter, c.hidden_size, 1);
     moe_down_q4_add_blocks_rows(&mut r.x, &layer.shared_down.codes, &layer.shared_down.group_scales, &r.shared_ids, &r.shared_weight, &r.shared_mlp, n, 1, c.hidden_size, c.shared_expert_inter, 1);
+    moe_down_q4_add_blocks_rows(&mut r.x, &layer.down.codes, &layer.down.group_scales, &r.ids, &r.weights, &r.mlp, n, k, c.hidden_size, c.moe_intermediate_size, c.num_experts);
     l = l + 1;
   }
   rms_norm_f32_rows(&mut r.xn, &r.x, &w.final_norm, n, c.hidden_size, eps);
