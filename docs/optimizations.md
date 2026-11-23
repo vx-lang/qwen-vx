@@ -353,7 +353,12 @@ logits for position p + 2. llama.cpp uses this layer for its drafts.
   `lm_head`.
 - A round drafts K tokens while a running mean of the kept drafts is at least 0.85, and 1 token
   otherwise.
-- After a round, the rows of the kept tokens run again with the true h of the model.
+- After a round, the rows of the kept tokens run again with the true h of the model. These rows,
+  and the row of the first draft of the next round, have all their inputs after the round, so
+  `mtp35_rows` runs them in one pass with the kernels of the round.
+- With `--mtp K,L`, a round drafts L tokens while the running mean of the kept drafts is at least
+  0.95, and K tokens while it is at least 0.85. Long drafts pay in edits, where almost all drafts
+  are kept.
 
 **Result.** The numbers come after a run that follows the benchmarking policy.
 
