@@ -317,6 +317,30 @@ more than plain steps; with them, nothing (write prompts, two runs of each in tu
 
 The text is the same as without drafts in all 24 pairs of these runs.
 
+### 16. Drafts from the MTP layer of Qwen3.6 (#109)
+
+**Problem.** Drafts from the context (entry 14) help only when the output repeats text of the
+prompt. Qwen3.6-35B-A3B has one more layer for drafts, the MTP layer (multi-token prediction). It
+takes h of the model at position p (after `final_norm`) and the token at position p + 1, and gives
+logits for position p + 2. llama.cpp uses this layer for its drafts.
+
+**Change.**
+
+- `convert.py` writes the MTP layer at the end of the weight file. The other tensors keep their
+  order and bytes. The config integer `mtp_layers` takes slot 25 of the version 2 header, so an
+  older file reads 0 and loads as before.
+- `src/mtp35.vx` runs the MTP layer: a layer with full attention and its own KV cache. The prompt
+  fills the rows of the MTP layer one chunk at a time, after each chunk of the model.
+- `--mtp K` drafts with this layer, one MTP row for each draft token, and checks the drafts with
+  the rounds of entry 14. So the text is the same as without drafts.
+- A draft scores only the tokens with ids below 65,536 (`--mtp-vocab N`), a quarter of the rows of
+  `lm_head`.
+- A round drafts K tokens while a running mean of the kept drafts is at least 0.85, and 1 token
+  otherwise.
+- After a round, the rows of the kept tokens run again with the true h of the model.
+
+**Result.** The numbers come after a run that follows the benchmarking policy.
+
 ## What did not help
 
 - **Other tile shapes for the Q4_0 products of a chunk, in Vx v0.0.4** (#19). Tiles of 32 tokens,
