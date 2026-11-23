@@ -469,20 +469,14 @@ fn generate_with_drafts35(w : &Qwen35Weights, s : &mut Qwen35State, t : &Tokeniz
   let mut rounds = 0;
   let mut drafted = 0;
   let mut accepted = 0;
-  let mut misses = 0;
-  let mut missed_length = 0;
   while going && step + 1 < steps {
     let room = steps - step - 1;
     let m = longest_match(&context);
-    if misses >= 2 && m.length > missed_length {
-      misses = 0;
-    }
-    let mut k = i32::min(i32::min(draft_length(m.length), max), room - 1);
-    if misses >= 2 {
-      k = 0;
-    }
-    let draft = tokens_after(&context, m.end, k);
-    k = draft.len();
+    // No backoff after misses, unlike `generate_with_drafts`: a round of 2 positions costs little
+    // more than a step, so the simulation of `draft_length35` found drafts after misses best.
+    let k_max = i32::min(i32::min(draft_length35(m.length), max), room - 1);
+    let draft = tokens_after(&context, m.end, k_max);
+    let k = draft.len();
     if k == 0 {
       let mut n = 1;
       if text_mode {
@@ -543,12 +537,6 @@ fn generate_with_drafts35(w : &Qwen35Weights, s : &mut Qwen35State, t : &Tokeniz
       // before the first miss.
       commit_round35(w, s, &r, j + 1);
       pos = pos + j + 1;
-      if j == 0 {
-        misses = misses + 1;
-        missed_length = m.length;
-      } else {
-        misses = 0;
-      }
     }
   }
   println!("rounds={} drafted={} accepted={};", rounds, drafted, accepted);

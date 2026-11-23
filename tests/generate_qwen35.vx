@@ -8,7 +8,8 @@
 //   past position 2,048, where its blocks take 64 SIMD groups for each head in place of 32.
 // - the Q4_0 file with --draft 7, against the same file without it: the lines of the steps must be
 //   the same, logits too. The prompt repeats its first 10 tokens at its end, and the model gives
-//   109 and 99 after it, as it did after their first copy, so a round of 7 draft tokens runs.
+//   109 and 99 after it, as it did after their first copy. So the last 12 tokens match, and a round
+//   of 4 draft tokens runs (`draft_length35`).
 // - the Q4_0 file with --prompt-runs 3: a time for each run of the prompt, and the lines of the
 //   steps of the file without it.
 // - the Q4_0 file with the MTP layer (`--mtp`) with --mtp 3, against the file without the MTP
@@ -65,7 +66,7 @@
 // LONG-BF16: 8 steps, same tokens, logits within 0.001
 // LONG: 8 steps, same tokens, logits within 0.003
 // STEPS: {{^}}32{{$}}
-// DRAFT: rounds=1 drafted=7 accepted=0;
+// DRAFT: rounds=1 drafted=4 accepted=0;
 // RUNS: {{^}}3{{$}}
 // MTP-STEPS: {{^}}24{{$}}
 // MTP: rounds={{[0-9]+}} drafted={{[0-9]+}} accepted={{[0-9]+}};
