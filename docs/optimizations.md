@@ -387,6 +387,33 @@ Each position keeps the bits of a plain step (`tests/round35.vx`, `tests/round.v
 
 **Result.** The numbers come after a run that follows the benchmarking policy.
 
+### 18. The lm_head of a round: only the rows that can be the greedy token (#111)
+
+**Problem.** A round needs only the greedy token of each position and its logit. But it computed
+all 248,320 logits of each position exactly, and the arithmetic of the 6-bit weights grows with
+the number of positions. A profile by subtraction of a round cannot show the `lm_head`, because
+without it nothing waits for the round. A separate bench showed the arithmetic, not the bytes, as
+the limit of `matvec_q6_rows4` at 4 positions and more.
+
+**Change.** For 2 or more positions, `run_round35` runs three kernels (`src/q6.vx`):
+
+- `lm_rough_q6` computes rough logits a for up to 8 positions at once, with f16 weights and inputs
+  on the simdgroup matrices.
+- `lm_pick_threshold` finds, for each position, M = the largest a - B over the rows. B is a bound
+  of |a - e|, where e is the exact logit. It comes from the norms of x and of the rows of
+  `lm_head`, and `src/q6.vx` gives each of its terms. `lm_q6_norms` computes the norms of the rows
+  in the first round.
+- `matvec_q6_rows4_pick` computes the exact logit of each row that does not have a + B < M, bit for
+  bit as `matvec_q6` does. The other rows get the lowest f32, and cannot be the greedy token. A
+  block with no such row reads no weights.
+
+The true error is about 3% of B. In the rounds of a bench on the real model, at most 3 of the
+248,320 rows of a position needed the exact logit. The greedy tokens and their logits are those
+of the plain steps (`tests/round35.vx`). Only the other logits of a round change, and the app does
+not read them.
+
+**Result.** The numbers come after a run that follows the benchmarking policy.
+
 ## What did not help
 
 - **Other tile shapes for the Q4_0 products of a chunk, in Vx v0.0.4** (#19). Tiles of 32 tokens,
