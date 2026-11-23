@@ -10,9 +10,11 @@
 // `r` runs rounds of 6, 4, 2 and 5 tokens after a prompt, and keeps 3, 1, 2 and 5 of them with
 // `commit_round35`. State `b` decodes the kept tokens one at a time, and state `a`, a copy of `b`
 // before each round, decodes all the tokens of the round. The logits of each position of a round
-// must be those of `a`, and the DeltaNet states after the commit those of `b`.
+// must be those of `a`, and the DeltaNet states after the commit those of `b`. Then a round of 8
+// tokens after a prompt of 2,044 tokens: its positions go past 2,048, where the attention of one
+// position takes 64 SIMD groups for each head in place of 32.
 //
-// RUN: python3 %S/../scripts/make_tiny_model.py --qwen35 --q4 --q6-lm-head %t.vxw > /dev/null
+// RUN: python3 %S/../scripts/make_tiny_model.py --qwen35 --q4 --q6-lm-head --max-positions 2200 %t.vxw > /dev/null
 // RUN: vxc %s --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t.vxw | FileCheck %s
 //
 // CHECK: {{^}}round of 6: logits 0 differ, tokens 0 differ{{$}}
@@ -23,6 +25,7 @@
 // CHECK: {{^}}keep 2: states 0 differ{{$}}
 // CHECK: {{^}}round of 5: logits 0 differ, tokens 0 differ{{$}}
 // CHECK: {{^}}keep 5: states 0 differ{{$}}
+// CHECK: {{^}}round of 8: logits 0 differ, tokens 0 differ{{$}}
 import core::convert;
 import core::num;
 import std::nn;
@@ -172,5 +175,14 @@ fn main(argc : i32, argv : *mut *mut i8) -> i32 {
     println!("keep {}: states {} differ", keeps[i], states_differ(&w, &r, &b));
     pos = pos + keeps[i];
   }
+  let long_seq = 2100;
+  let mut la = new_qwen35_state(&w.config, long_seq);
+  let mut lb = new_qwen35_state(&w.config, long_seq);
+  let mut lr = new_qwen35_state(&w.config, long_seq);
+  let long = some_tokens(3, 2044, vocab);
+  prefill_qwen35(&w, &mut lb, &long);
+  prefill_qwen35(&w, &mut lr, &long);
+  copy_states(&mut la, &lb);
+  check_round(&w, &mut lr, &mut round, &mut la, &some_tokens(29, 8, vocab), long.len());
   return 0;
 }

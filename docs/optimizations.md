@@ -357,6 +357,31 @@ logits for position p + 2. llama.cpp uses this layer for its drafts.
 
 **Result.** The numbers come after a run that follows the benchmarking policy.
 
+### 17. The attention and the lm_head of a round, for all positions at once (#110)
+
+**Problem.** With the MTP drafts of entry 16, a round of Qwen3.6 has 2 to 4 positions. Two parts
+of a round did more work for each position than they must:
+
+- Each full attention layer ran 5 kernels for each position of the round.
+- `matvec_q6_rows` does 2 vectors in each block, so the 6-bit `lm_head` of 3 or 4 positions read
+  each weight twice.
+
+**Change.**
+
+- The full attention layers of a round run 3 kernels for all n positions:
+  `pf_gated_norm_rope_and_store` (the kernel of the prompt chunks) stores the k and v rows of all
+  positions, and `gated_attention_parts_rows` and `gated_attention_merge_rows` do the attention of
+  each position over the rows up to its own position. Each position computes its own number of
+  parts, as `gated_attention` does, so a round can cross position 2048.
+- `matvec_q6_rows4` does 4 vectors in each block, and runs for rounds of 3 or more positions. To
+  keep 16 values of x for each vector, and not 32, a lane keeps only x scaled for the low bits, and
+  multiplies the high bits of weight t by 16 * 4^-t over that scale. Both factors are powers of 2,
+  so each product and each step of each sum is that of `matvec_q6`.
+
+Each position keeps the bits of a plain step (`tests/round35.vx`, `tests/round.vx`).
+
+**Result.** The numbers come after a run that follows the benchmarking policy.
+
 ## What did not help
 
 - **Other tile shapes for the Q4_0 products of a chunk, in Vx v0.0.4** (#19). Tiles of 32 tokens,
@@ -389,6 +414,9 @@ logits for position p + 2. llama.cpp uses this layer for its drafts.
 - **Weights decoded once into registers for several tokens.** In Vx v0.0.4 these kernels were
   slower than the kernels that decode each weight with masks for each token. Their 64 to 128
   floats a lane likely leave the registers.
+- **The router of a round with 4 positions in each block.** A bf16 kernel for the router of 4
+  positions, as `matvec_q6_rows4` does for `lm_head`, was no faster than the router of each
+  position in turn. The router of a round is not limited by the reads of its weights.
 
 ## Open work
 

@@ -10,7 +10,8 @@
 // value of a round must equal the value of the kernel of one token bit for bit. The rounds start
 // at position 0, in the first 32 positions, after 1,000 positions, and across position 2,048,
 // where `vec_attention` goes from 32 to 64 SIMD groups. Rounds of more than 8 positions run their
-// attention in pieces of at most 4. Then `matvec_q6_rows` against `matvec_q6`.
+// attention in pieces of at most 4. Then `matvec_q6_rows` and
+// `matvec_q6_rows4` against `matvec_q6`.
 //
 // RUN: vxc %s --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx | FileCheck %s
 //
@@ -29,10 +30,15 @@
 // CHECK: {{^}}rope start 2035 n 16: 0 differ{{$}}
 // CHECK: {{^}}attention start 2035 n 16: 0 differ{{$}}
 // CHECK: {{^}}q6 n 1: 0 differ{{$}}
+// CHECK: {{^}}q6 rows4 n 1: 0 differ{{$}}
 // CHECK: {{^}}q6 n 5: 0 differ{{$}}
+// CHECK: {{^}}q6 rows4 n 5: 0 differ{{$}}
 // CHECK: {{^}}q6 n 8: 0 differ{{$}}
+// CHECK: {{^}}q6 rows4 n 8: 0 differ{{$}}
 // CHECK: {{^}}q6 n 13: 0 differ{{$}}
+// CHECK: {{^}}q6 rows4 n 13: 0 differ{{$}}
 // CHECK: {{^}}q6 n 16: 0 differ{{$}}
+// CHECK: {{^}}q6 rows4 n 16: 0 differ{{$}}
 import core::convert;
 import std::nn;
 import std::vec;
@@ -264,6 +270,17 @@ fn check_q6(s : &mut i64, n : i32) -> void {
     }
   }
   println!("q6 n {}: {} differ", n, count);
+  matvec_q6_rows4(&mut yn, &dc, &dh, &ds, &x, n, rows, cols);
+  let h4 = transfer(&yn, Memory::CPU_DRAM);
+  let mut count4 = 0;
+  for p in 0..n {
+    for r in 0..rows {
+      if h4[p][r].to_bits() != one[p * rows + r].to_bits() {
+        count4 = count4 + 1;
+      }
+    }
+  }
+  println!("q6 rows4 n {}: {} differ", n, count4);
   return;
 }
 
