@@ -1,0 +1,267 @@
+//===- mtp35.vx - Qwen app --------------------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// The multi-token prediction (MTP) layer of Qwen3.6-35B-A3B, for drafts. Row p of the MTP layer
+// takes the hidden state h_p of position p (after final_norm) and the token of position p + 1,
+// and predicts the token of position p + 2. Its attention has its own KV cache, with row p at
+// position p. (llama.cpp puts the row at position p + 1. RoPE gives the same scores for both,
+// because it depends only on the distance of two positions.)
+//
+// The prompt fills rows 0 to count - 2 of the KV cache, a chunk at a time, after each chunk of
+// the model (`prefill_qwen35_mtp`). A draft then runs one row with `mtp35_step`: the first draft
+// after token t at position p takes h_{p - 1} of the model, and each later draft the h of the
+// MTP layer itself. When a round keeps tokens, rows of the true h of the model go over the rows
+// of the drafts. The drafts only choose what a round checks, so they do not change the text.
+import core::convert;
+import core::num;
+import std::nn;
+import std::vec;
+import qwen::gated_attention;
+import qwen::model;
+import qwen::prefill;
+import qwen::prefill35;
+import qwen::products;
+import qwen::qwen35;
+import qwen::weights;
+
+/// The state of the MTP layer: its KV cache, and `token` and `h`, the inputs of the next row.
+/// `cat` holds the two norms of a row, the embedding first, for `fc`.
+struct Mtp35State {
+  k : Tensor<f16, [?, ?, ?], Memory::HBM>,
+  v : Tensor<f16, [?, ?, ?], Memory::HBM>,
+  token : Tensor<i32, [?], Memory::HBM>,
+  h : Tensor<f32, [?], Memory::HBM>,
+  cat : Tensor<f32, [?], Memory::HBM>,
+}
+
+/// The MTP state for the `max_seq` positions of `s`.
+fn new_mtp35_state(c : &Config, max_seq : i32) -> Mtp35State {
+  assert(c.mtp_layers == 1, "new_mtp35_state: the weight file has no MTP layer");
+  let rows = (max_seq + 63) / 64 * 64;
+  return Mtp35State {
+    k: transfer(Tensor<f16>([rows, c.num_kv_heads, 256]), Memory::HBM),
+    v: transfer(Tensor<f16>([rows, c.num_kv_heads, 256]), Memory::HBM),
+    token: transfer(Tensor<i32>([1]), Memory::HBM),
+    h: transfer(Tensor<f32>([c.hidden_size]), Memory::HBM),
+    cat: transfer(Tensor<f32>([2 * c.hidden_size]), Memory::HBM),
+  };
+}
+
+/// A state of one value in each tensor, for a program without --mtp.
+fn new_mtp35_state_none() -> Mtp35State {
+  return Mtp35State {
+    k: transfer(Tensor<f16>([1, 1, 1]), Memory::HBM),
+    v: transfer(Tensor<f16>([1, 1, 1]), Memory::HBM),
+    token: transfer(Tensor<i32>([1]), Memory::HBM),
+    h: transfer(Tensor<f32>([1]), Memory::HBM),
+    cat: transfer(Tensor<f32>([1]), Memory::HBM),
+  };
+}
+
+/// y[0] = x[0]: a copy of a token in GPU memory.
+fn copy_token(y : &mut Tensor<i32, [?], Memory::HBM>, x : &Tensor<i32, [?], Memory::HBM>) -> void {
+  spawn on(Topology::Device) {
+    for b in 0..1 across blocks {
+      for l in 0..32 across lanes {
+        if l == 0 {
+          y[0] = x[0];
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// y[i] = x[i], for i below n.
+fn copy_f32(y : &mut Tensor<f32, [?], Memory::HBM>, x : &Tensor<f32, [?], Memory::HBM>, n : i32) -> void {
+  assert(y.len() >= n && x.len() >= n, "copy_f32: a tensor has fewer than n values");
+  spawn on(Topology::Device) {
+    for b in 0..(n + 255) / 256 across blocks {
+      for l in 0..256 across lanes {
+        let i = b * 256 + l;
+        if i < n {
+          y[i] = x[i];
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// y[at + i] = the RMSNorm of x times w, for i below n: `rms_norm_f32` into a part of y.
+fn rms_norm_f32_at(y : &mut Tensor<f32, [?], Memory::HBM>, at : i32, x : &Tensor<f32, [?], Memory::HBM>, w : &Tensor<f32, [?], Memory::HBM>, n : i32, eps : f32) -> void {
+  assert(n > 0 && at >= 0 && y.len() >= at + n && x.len() >= n && w.len() >= n, "rms_norm_f32_at: a tensor has too few values");
+  spawn on(Topology::Device) {
+    for b in 0..1 across blocks {
+      let mut part = unsafe { Tensor<f32, [1024], Memory::SMEM>::uninit() };
+      for l in 0..1024 across lanes {
+        let mut s : f32 = 0.0;
+        let mut i = l;
+        while i < n {
+          s = s + x[i] * x[i];
+          i = i + 1024;
+        }
+        part[l] = s;
+      }
+      let ss = lanes::sum(&part, 1024);
+      let inv = 1.0 / (ss / (n as f32) + eps).sqrt();
+      for l in 0..1024 across lanes {
+        for j in 0..(n + 1023) / 1024 {
+          let i = j * 1024 + l;
+          if i < n {
+            y[at + i] = x[i] * inv * w[i];
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// y[t][at + i] = the RMSNorm of x[t] times w, for t below n and i below dim: `pf35_rms_norm` into
+/// a part of each row of y.
+fn pf35_rms_norm_at(y : &mut Tensor<f32, [?, ?], Memory::HBM>, at : i32, x : &Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<f32, [?], Memory::HBM>, n : i32, dim : i32, eps : f32) -> void {
+  assert(n > 0 && at >= 0 && y.extent(0) >= n && y.extent(1) >= at + dim && x.extent(0) >= n && x.extent(1) >= dim, "pf35_rms_norm_at: a tensor has too few values");
+  spawn on(Topology::Device) {
+    for t in 0..n across blocks {
+      let mut part = unsafe { Tensor<f32, [1024], Memory::SMEM>::uninit() };
+      for l in 0..1024 across lanes {
+        let mut s : f32 = 0.0;
+        let mut i = l;
+        while i < dim {
+          s = s + x[t][i] * x[t][i];
+          i = i + 1024;
+        }
+        part[l] = s;
+      }
+      let ss = lanes::sum(&part, 1024);
+      let inv = 1.0 / (ss / (dim as f32) + eps).sqrt();
+      for l in 0..1024 across lanes {
+        for j in 0..(dim + 1023) / 1024 {
+          let i = j * 1024 + l;
+          if i < dim {
+            y[t][at + i] = x[t][i] * inv * w[i];
+          }
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// Row `pos` of the MTP layer: the token in `m.token` and the h in `m.h`. The row goes to the KV
+/// cache of the MTP layer, and its output h to `m.h`. With `predict`, `m.token` gets the token
+/// that the row predicts, for position pos + 2, so m.token and m.h are then the inputs of the next
+/// draft. The prediction is among tokens 0 to vocab - 1 only: the first rows of lm_head, which a
+/// BPE vocabulary gives to its most frequent tokens. The row uses the scratch tensors of `s` (x, xn, proj, y, q, parts, the experts and
+/// logits), but not its KV caches or states.
+fn mtp35_step(w : &Qwen35Weights, s : &mut Qwen35State, m : &mut Mtp35State, pos : i32, predict : bool, vocab : i32) -> void {
+  let c = &w.config;
+  let eps = c.rms_norm_eps as f32;
+  let hidden = c.hidden_size;
+  let qkv_rows = (2 * c.num_q_heads + 2 * c.num_kv_heads) * 256;
+  assert(w.mtp.len() == 1 && pos >= 0 && pos < s.max_seq, "mtp35_step: the model needs an MTP layer, and the row must fit in the KV cache");
+  assert(vocab >= 8 && vocab % 8 == 0 && vocab <= c.vocab_size, "mtp35_step: vocab must be a multiple of 8, up to the vocabulary of the model");
+  let mtp = &w.mtp[0];
+  let layer = &mtp.layer;
+  nn_embed(&mut s.x, &w.embed, &m.token, hidden);
+  rms_norm_f32_at(&mut m.cat, 0, &s.x, &mtp.embed_norm, hidden, eps);
+  rms_norm_f32_at(&mut m.cat, hidden, &m.h, &mtp.hidden_norm, hidden, eps);
+  matvec(&mut s.x, &mtp.fc, &m.cat, hidden, 2 * hidden);
+  rms_norm_f32(&mut s.xn, &s.x, &layer.attn_norm, hidden, eps);
+  matvec(&mut s.proj, &layer.qkv, &s.xn, qkv_rows, hidden);
+  gated_norm_rope_and_store(&mut s.q, &mut m.k, &mut m.v, &s.proj, &layer.q_norm, &layer.k_norm, &s.cos, &s.sin, pos, c.num_q_heads, c.num_kv_heads, c.rotary_dim, eps);
+  gated_attention(&mut s.y, &mut s.parts, &s.q, &m.k, &m.v, &s.proj, pos, c.num_q_heads, c.num_kv_heads);
+  matvec_add(&mut s.x, &layer.attn_out, &s.y, hidden, c.num_q_heads * 256);
+  rms_norm_f32(&mut s.xn, &s.x, &layer.mlp_norm, hidden, eps);
+  add_experts_shared(&mut s.experts, &mut s.x, &s.xn, &mut s.shared_weight, &mut s.shared_mlp, &s.shared_id, layer, c);
+  rms_norm_f32(&mut m.h, &s.x, &mtp.final_norm, hidden, eps);
+  if predict {
+    matvec(&mut s.logits, &w.lm_head, &m.h, vocab, hidden);
+    nn_argmax(&mut m.token, &s.logits, vocab);
+  }
+  return;
+}
+
+/// Rows start to start + n - 1 of the MTP layer, after `pf35_chunk` ran positions start to
+/// start + n - 1 of the prompt: the hidden states of the model are in p.x, and `next_tokens` has
+/// the token after each, prompt[start + 1] to prompt[start + n]. `cat` is [rows of p.x, 2 *
+/// hidden]. The rows go to the KV cache of the MTP layer; p.x, p.xn and the other tensors of the
+/// chunk get other values.
+fn pf35_mtp_chunk(w : &Qwen35Weights, s : &Qwen35State, m : &mut Mtp35State, p : &mut Prefill35, cat : &mut Tensor<f32, [?, ?], Memory::HBM>, next_tokens : &Tensor<i32, [?], Memory::HBM>, start : i32, n : i32) -> void {
+  let c = &w.config;
+  let eps = c.rms_norm_eps as f32;
+  let hidden = c.hidden_size;
+  let tiles = (n + 15) / 16;
+  let qkv_rows = (2 * c.num_q_heads + 2 * c.num_kv_heads) * 256;
+  let mtp = &w.mtp[0];
+  let layer = &mtp.layer;
+  pf35_rms_norm(&mut p.xn, &p.x, &w.final_norm, n, hidden, eps);
+  pf35_rms_norm_at(cat, hidden, &p.xn, &mtp.hidden_norm, n, hidden, eps);
+  pf_embed(&mut p.x, &w.embed, next_tokens, n, hidden);
+  pf35_rms_norm_at(cat, 0, &p.x, &mtp.embed_norm, n, hidden, eps);
+  pf35_mm(&mut p.x, &mtp.fc, cat, &p.rows, &p.zeros, &p.no_bias, hidden, 2 * hidden, tiles);
+  pf35_rms_norm(&mut p.xn, &p.x, &layer.attn_norm, n, hidden, eps);
+  pf35_mm(&mut p.proj, &layer.qkv, &p.xn, &p.rows, &p.zeros, &p.no_bias, qkv_rows, hidden, tiles);
+  pf_gated_norm_rope_and_store(&mut p.q, &mut m.k, &mut m.v, &p.proj, &layer.q_norm, &layer.k_norm, &s.cos, &s.sin, start, n, c.num_q_heads, c.num_kv_heads, c.rotary_dim, eps);
+  pf_gated_flash_attention(&mut p.y, &p.q, &m.k, &m.v, &p.proj, start, n, c.num_q_heads, c.num_q_heads / c.num_kv_heads, qkv_rows - c.num_q_heads * 256, 0.0625);
+  pf35_mm(&mut p.xn, &layer.attn_out, &p.y, &p.rows, &p.zeros, &p.no_bias, hidden, c.num_q_heads * 256, tiles);
+  pf35_add_rms_norm(&mut p.x, &mut p.xn, &layer.mlp_norm, n, hidden, eps);
+  pf35_experts(p, layer, c, n, tiles);
+  return;
+}
+
+/// `prefill_qwen35_with`, and rows 0 to count - 2 of the MTP layer. After it, `s.xn` holds no
+/// value that a later step reads; `predict_qwen35` gives h of the last position in s.xn.
+fn prefill_qwen35_mtp(w : &Qwen35Weights, s : &mut Qwen35State, m : &mut Mtp35State, p : &mut Prefill35, prompt : &Vec<i32>) -> void {
+  let c = &w.config;
+  let count = prompt.len();
+  assert(count > 0 && count <= s.max_seq, "prefill_qwen35_mtp: the prompt must have tokens and fit in the state");
+  let chunk = p.tokens.len();
+  let mut cat = transfer(Tensor<f32>([p.x.extent(0), 2 * c.hidden_size]), Memory::HBM);
+  let mut start = 0;
+  while start < count {
+    let n = i32::min(chunk, count - start);
+    let mut ids = Tensor<i32>([chunk]);
+    let mut after = Tensor<i32>([chunk]);
+    let mut rows = Tensor<i32>([p.rows.len()]);
+    for t in 0..p.rows.len() {
+      rows[t] = -1;
+      if t < n {
+        rows[t] = t;
+      }
+    }
+    for t in 0..chunk {
+      ids[t] = 0;
+      after[t] = 0;
+      if t < n {
+        ids[t] = prompt[start + t];
+      }
+      if start + t + 1 < count && t < n {
+        after[t] = prompt[start + t + 1];
+      }
+    }
+    p.tokens = transfer(ids, Memory::HBM);
+    p.rows = transfer(rows, Memory::HBM);
+    pf35_chunk(w, s, p, start, n);
+    if start + n == count {
+      pf_take_row(&mut s.x, &p.x, n - 1, c.hidden_size);
+    }
+    // The last position of the prompt has no token after it yet: its row is the first draft.
+    let mtp_rows = if start + n == count {
+      n - 1
+    } else {
+      n
+    };
+    if mtp_rows > 0 {
+      let next_tokens = transfer(after, Memory::HBM);
+      pf35_mtp_chunk(w, s, m, p, &mut cat, &next_tokens, start, mtp_rows);
+    }
+    start = start + n;
+  }
+  return;
+}

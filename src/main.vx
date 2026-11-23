@@ -30,6 +30,7 @@ import std::time;
 import std::vec;
 import qwen::weights;
 import qwen::model;
+import qwen::mtp35;
 import qwen::qwen35;
 import qwen::prefill35;
 import qwen::prefill;
@@ -63,6 +64,10 @@ struct Options {
   lines : bool,
   draft : *const i8,
   has_draft : bool,
+  mtp : *const i8,
+  has_mtp : bool,
+  mtp_vocab : *const i8,
+  has_mtp_vocab : bool,
   think : bool,
   ignore_eos : bool,
   prompt_runs : *const i8,
@@ -76,7 +81,7 @@ fn parse_options(argc : i32, argv : *mut *mut i8) -> Options {
   let mut o = Options {
     weights: unsafe { argv[1] }, tokens: empty, tokenizer: empty, prompt: empty, prompt_file: empty,
     steps: empty, has_tokens: false, has_tokenizer: false, has_prompt: false, has_prompt_file: false,
-    has_steps: false, context: empty, has_context: false, requests: empty, has_requests: false, replies: empty, has_replies: false, session: false, chat: false, lines: false, draft: empty, has_draft: false, think: false, ignore_eos: false, prompt_runs: empty, has_prompt_runs: false,
+    has_steps: false, context: empty, has_context: false, requests: empty, has_requests: false, replies: empty, has_replies: false, session: false, chat: false, lines: false, draft: empty, has_draft: false, mtp: empty, has_mtp: false, mtp_vocab: empty, has_mtp_vocab: false, think: false, ignore_eos: false, prompt_runs: empty, has_prompt_runs: false,
   };
   let mut i = 2;
   while i < argc {
@@ -123,6 +128,12 @@ fn parse_options(argc : i32, argv : *mut *mut i8) -> Options {
       } else if same(name, "--draft") {
         o.draft = value;
         o.has_draft = true;
+      } else if same(name, "--mtp") {
+        o.mtp = value;
+        o.has_mtp = true;
+      } else if same(name, "--mtp-vocab") {
+        o.mtp_vocab = value;
+        o.has_mtp_vocab = true;
       } else if same(name, "--prompt-runs") {
         o.prompt_runs = value;
         o.has_prompt_runs = true;
@@ -532,11 +543,165 @@ fn generate_with_drafts35(w : &Qwen35Weights, s : &mut Qwen35State, t : &Tokeniz
   return step - first_step;
 }
 
+/// The share of kept drafts from which a round of MTP drafts takes its longest drafts
+/// (`generate_with_mtp35`).
+const MTP_LONG_SHARE : f64 = 0.85;
+
+/// The tokens that an MTP draft comes from without --mtp-vocab: ids 0 to MTP_VOCAB - 1. On the
+/// tuning prompts, the drafts of Qwen3.6-35B-A3B from these tokens are kept as often as those from
+/// all 248,320, and the rows of lm_head that they read are a quarter.
+const MTP_VOCAB : i32 = 65536;
+
+/// Puts `token` into a tensor of one value in GPU memory.
+fn upload_token(token : i32) -> Tensor<i32, [?], Memory::HBM> {
+  let mut h = Tensor<i32>([1]);
+  h[0] = token;
+  return transfer(h, Memory::HBM);
+}
+
+/// Drafts from the MTP layer of the model (src/mtp35.vx), checked by rounds as in
+/// `generate_with_drafts35`. Each round drafts up to `max` tokens, one row of the MTP layer each,
+/// from the last token and h of the position before it; then `run_round35` checks them. The rows of
+/// the tokens that the round keeps then run again with the true h of the model, from `r.xn`. The
+/// prompt must have filled the MTP rows before its last position (`prefill_qwen35_mtp`), and s.xn
+/// must hold h of its last position (`predict_qwen35`). The first step is a plain step that
+/// compiles the kernels of a token, so the clock starts after it and the count of tokens leaves
+/// it out. The drafts come from tokens 0 to vocab - 1 (`mtp35_step`).
+///
+/// A round of 1 draft (2 positions) costs little more than a plain step, but 2 or 3 drafts (3 or 4
+/// positions) cost a second pass of the round kernels, which take 2 positions at a time. So a round
+/// drafts `max` tokens while the drafts are likely to be kept, and 1 token otherwise: `kept` is a
+/// running mean of the share of drafts that the rounds keep, of each draft up to the first miss.
+/// With the cost of a round at 4 positions about 1.7 times that at 2, `max` drafts pay from a
+/// share of about MTP_LONG_SHARE.
+fn generate_with_mtp35(w : &Qwen35Weights, s : &mut Qwen35State, m : &mut Mtp35State, t : &Tokenizer, eos : i32, text_mode : bool, prompt : &Vec<i32>, first : i32, steps : i32, max : i32, vocab : i32, start : &mut Instant) -> i32 {
+  assert(can_round35(w), "--mtp needs a model of Q4_0 layers and experts and a 6-bit lm_head");
+  assert(w.mtp.len() == 1, "--mtp needs a weight file with the MTP layer");
+  assert(max >= 1 && max < ROUND_MAX, "--mtp must be 1 to ROUND_MAX - 1");
+  let c = &w.config;
+  let mut r = new_round35(c);
+  let mut slots = Vec<Slot>::new();
+  for j in 0..ROUND_MAX + 1 {
+    slots.push(Slot {
+      next: transfer(Tensor<i32>([1]), Memory::HBM),
+    });
+  }
+  let mut token = first;
+  // The position of `token`, which is not in the KV cache yet. m.h holds h of the position before.
+  let mut pos = prompt.len();
+  copy_f32(&mut m.h, &s.xn, c.hidden_size);
+  let mut step = 0;
+  let mut going = show(t, eos, text_mode, 0, token, read_logit(&s.logits, token));
+  if going {
+    // A plain step, and the MTP row of its token, which also compile their kernels.
+    m.token = upload_token(token);
+    mtp35_step(w, s, m, pos - 1, true, vocab);
+    let input = upload_token(token);
+    run_qwen35_layers(w, s, &input, pos);
+    predict_qwen35(w, s, &mut slots[2].next);
+    copy_f32(&mut m.h, &s.xn, c.hidden_size);
+    token = read_token(&slots[2].next);
+    step = 1;
+    pos = pos + 1;
+    going = show(t, eos, text_mode, step, token, read_logit(&s.logits, token));
+  }
+  // One run of the round kernels for each n to max + 1, so that their compile time is not in the
+  // time of a token. They write rows of the KV cache that later tokens write again before they
+  // read them, and no DeltaNet state.
+  let mut warm = Vec<i32>::new();
+  for n in 1..max + 2 {
+    warm.push(token);
+    run_round35(w, s, &mut r, &warm, pos, n);
+  }
+  let _ready = transfer(&r.next, Memory::CPU_DRAM);
+  *start = Instant::now();
+  let first_step = step;
+  let mut rounds = 0;
+  let mut drafted = 0;
+  let mut accepted = 0;
+  let mut kept : f64 = MTP_LONG_SHARE;
+  while going && step + 1 < steps {
+    let room = steps - step - 1;
+    let want = if kept >= MTP_LONG_SHARE {
+      max
+    } else {
+      1
+    };
+    let k = i32::min(want, room - 1);
+    if k == 0 {
+      // The last token: a plain step.
+      let input = upload_token(token);
+      run_qwen35_layers(w, s, &input, pos);
+      predict_qwen35(w, s, &mut slots[1].next);
+      token = read_token(&slots[1].next);
+      step = step + 1;
+      pos = pos + 1;
+      let mut logit : f32 = 0.0;
+      if !text_mode {
+        logit = read_logit(&s.logits, token);
+      }
+      going = show(t, eos, text_mode, step, token, logit);
+    } else {
+      // Draft j + 1, from row pos - 1 + j of the MTP layer, goes to slots[j].
+      m.token = upload_token(token);
+      for j in 0..k {
+        mtp35_step(w, s, m, pos - 1 + j, true, vocab);
+        copy_token(&mut slots[j].next, &m.token);
+      }
+      let mut draft = Vec<i32>::new();
+      for j in 0..k {
+        draft.push(read_token(&slots[j].next));
+      }
+      let mut inputs = Vec<i32>::new();
+      inputs.push(token);
+      for i in 0..k {
+        inputs.push(draft[i]);
+      }
+      run_round35(w, s, &mut r, &inputs, pos, k + 1);
+      let choice = transfer(&r.next, Memory::CPU_DRAM);
+      rounds = rounds + 1;
+      drafted = drafted + k;
+      let mut j = 0;
+      let mut more = true;
+      while more && going {
+        token = choice[j];
+        step = step + 1;
+        let mut logit : f32 = 0.0;
+        if !text_mode {
+          logit = round_logit(&r.logits, j, token);
+        }
+        going = show(t, eos, text_mode, step, token, logit);
+        more = j < k && draft[j] == token;
+        if more {
+          accepted = accepted + 1;
+          j = j + 1;
+          kept = kept * 0.9 + 0.1;
+        } else if j < k {
+          kept = kept * 0.9;
+        }
+      }
+      // Inputs 0 to j of the round are kept: the last token and the j drafts before the first
+      // miss. MTP rows pos to pos + j - 1 then run with the true h of positions pos to pos + j - 1
+      // and the kept drafts; h of position pos + j is the input of the next round.
+      commit_round35(w, s, &r, j + 1);
+      for i in 0..j {
+        take_row(&mut m.h, &r.xn, i, c.hidden_size);
+        m.token = upload_token(draft[i]);
+        mtp35_step(w, s, m, pos + i, false, vocab);
+      }
+      take_row(&mut m.h, &r.xn, j, c.hidden_size);
+      pos = pos + j + 1;
+    }
+  }
+  println!("rounds={} drafted={} accepted={};", rounds, drafted, accepted);
+  return step - first_step;
+}
+
 
 /// `main` for a Qwen3.5 or Qwen3.6 model (weight file v2, arch 1). The prompt runs in chunks
 /// (src/prefill35.vx). With --draft, the tokens come from `generate_with_drafts35`. Prints the
 /// same lines as `main`.
-fn run_qwen35(path : *const i8, t : &Tokenizer, text_mode : bool, chat : bool, ignore_eos : bool, prompt : &Vec<i32>, steps : i32, draft : i32, runs : i32) -> i32 {
+fn run_qwen35(path : *const i8, t : &Tokenizer, text_mode : bool, chat : bool, ignore_eos : bool, prompt : &Vec<i32>, steps : i32, draft : i32, mtp : i32, mtp_vocab : i32, runs : i32) -> i32 {
   let w = load_qwen35_weights(path);
   let eos = if ignore_eos {
     -1
@@ -588,7 +753,18 @@ fn run_qwen35(path : *const i8, t : &Tokenizer, text_mode : bool, chat : bool, i
     warm_prompt.push(prompt[i]);
   }
   let mut warm = new_qwen35_state(&w.config, warm_prompt.len());
-  prefill_qwen35_with(&w, &mut warm, &mut p, &warm_prompt);
+  // With --mtp, the prompt also fills the rows of the MTP layer.
+  let mut m = if mtp > 0 {
+    new_mtp35_state(&w.config, count + steps)
+  } else {
+    new_mtp35_state_none()
+  };
+  if mtp > 0 {
+    let mut warm_m = new_mtp35_state(&w.config, warm_prompt.len());
+    prefill_qwen35_mtp(&w, &mut warm, &mut warm_m, &mut p, &warm_prompt);
+  } else {
+    prefill_qwen35_with(&w, &mut warm, &mut p, &warm_prompt);
+  }
   predict_qwen35(&w, &mut warm, &mut slots[0].next);
   read_token(&slots[0].next);
   let mut tokens = Vec<i32>::new();
@@ -598,7 +774,14 @@ fn run_qwen35(path : *const i8, t : &Tokenizer, text_mode : bool, chat : bool, i
       s = new_qwen35_state(&w.config, count + steps);
     }
     let prompt_start = Instant::now();
-    prefill_qwen35_with(&w, &mut s, &mut p, prompt);
+    if mtp > 0 {
+      if run > 0 {
+        m = new_mtp35_state(&w.config, count + steps);
+      }
+      prefill_qwen35_mtp(&w, &mut s, &mut m, &mut p, prompt);
+    } else {
+      prefill_qwen35_with(&w, &mut s, &mut p, prompt);
+    }
     predict_qwen35(&w, &mut s, &mut slots[0].next);
     tokens = Vec<i32>::new();
     tokens.push(read_token(&slots[0].next));
@@ -609,11 +792,20 @@ fn run_qwen35(path : *const i8, t : &Tokenizer, text_mode : bool, chat : bool, i
   }
   let mut start = Instant::now();
   let mut decoded = 0;
+  assert(draft == 0 || mtp == 0, "give --draft or --mtp, not both");
   if draft > 0 {
     decoded = generate_with_drafts35(&w, &mut s, t, eos, text_mode, prompt, tokens[0], steps, draft, &mut start);
   }
+  if mtp > 0 {
+    let vocab = if mtp_vocab > 0 {
+      mtp_vocab
+    } else {
+      i32::min(MTP_VOCAB, w.config.vocab_size)
+    };
+    decoded = generate_with_mtp35(&w, &mut s, &mut m, t, eos, text_mode, prompt, tokens[0], steps, mtp, vocab, &mut start);
+  }
   for step in 0..steps {
-    if draft > 0 {
+    if draft > 0 || mtp > 0 {
       break;
     }
     let token = tokens[step];
@@ -691,7 +883,17 @@ fn main(argc : i32, argv : *mut *mut i8) -> i32 {
       1
     };
     assert(runs >= 1, "--prompt-runs must be at least 1");
-    return run_qwen35(o.weights, &t, text_mode, o.chat, o.ignore_eos, &prompt, steps, draft, runs);
+    let mtp = if o.has_mtp {
+      parse_numbers(o.mtp)[0]
+    } else {
+      0
+    };
+    let mtp_vocab = if o.has_mtp_vocab {
+      parse_numbers(o.mtp_vocab)[0]
+    } else {
+      0
+    };
+    return run_qwen35(o.weights, &t, text_mode, o.chat, o.ignore_eos, &prompt, steps, draft, mtp, mtp_vocab, runs);
   }
   assert(!o.has_prompt_runs, "--prompt-runs needs a Qwen3.5 or Qwen3.6 file");
   let w = load_weights(o.weights);
