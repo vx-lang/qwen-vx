@@ -60,6 +60,15 @@ struct Round35 {
   logits : Tensor<f32, [?, ?], Memory::HBM>,
   next : Tensor<i32, [?], Memory::HBM>,
   kept : Vec<RoundLayer35>,
+  // The lm_head of 2 or more positions (src/q6.vx): the rough logits, the norms of the rows of
+  // lm_head (from the first round that uses them), and the threshold of each position. With `pick`
+  // false, each round computes all the logits exactly, as for 1 position.
+  rough : Tensor<f32, [?, ?], Memory::HBM>,
+  wn : Tensor<f32, [?], Memory::HBM>,
+  an : Tensor<f32, [?], Memory::HBM>,
+  thr : Tensor<f32, [?, ?], Memory::HBM>,
+  norms_ready : bool,
+  pick : bool,
 }
 
 /// What a round keeps of one layer for `commit_round35`. A full attention layer keeps only `proj`,
@@ -149,6 +158,12 @@ fn new_round35(c : &Config) -> Round35 {
     logits: transfer(Tensor<f32>([n, c.vocab_size]), Memory::HBM),
     next: transfer(Tensor<i32>([n]), Memory::HBM),
     kept: kept,
+    rough: transfer(Tensor<f32>([((n + 7) / 8) * 8, c.vocab_size]), Memory::HBM),
+    wn: transfer(Tensor<f32>([c.vocab_size]), Memory::HBM),
+    an: transfer(Tensor<f32>([c.vocab_size]), Memory::HBM),
+    thr: transfer(Tensor<f32>([n, 4]), Memory::HBM),
+    norms_ready: false,
+    pick: true,
   };
 }
 
@@ -689,7 +704,18 @@ fn run_round35(w : &Qwen35Weights, s : &mut Qwen35State, r : &mut Round35, token
     l = l + 1;
   }
   rms_norm_f32_rows(&mut r.xn, &r.x, &w.final_norm, n, c.hidden_size, eps);
-  if n >= 3 {
+  let lm = &w.lm_head;
+  if r.pick && n >= 2 && c.vocab_size % 64 == 0 {
+    // Only the rows that can be the greedy token get their exact logits; the others get the lowest
+    // f32, so the greedy tokens, and their logits, are those of all the rows.
+    if !r.norms_ready {
+      lm_q6_norms(&mut r.wn, &mut r.an, &lm.codes, &lm.high, &lm.group_scales, c.vocab_size, c.hidden_size);
+      r.norms_ready = true;
+    }
+    lm_rough_q6(&mut r.rough, &lm.codes, &lm.high, &lm.group_scales, &r.xn, n, c.vocab_size, c.hidden_size);
+    lm_pick_threshold(&mut r.thr, &r.rough, &r.wn, &r.an, &r.xn, n, c.vocab_size, c.hidden_size);
+    matvec_q6_rows4_pick(&mut r.logits, &lm.codes, &lm.high, &lm.group_scales, &r.xn, &r.rough, &r.wn, &r.an, &r.thr, n, c.vocab_size, c.hidden_size);
+  } else if n >= 3 {
     matvec_q6_rows4(&mut r.logits, &w.lm_head.codes, &w.lm_head.high, &w.lm_head.group_scales, &r.xn, n, c.vocab_size, c.hidden_size);
   } else {
     matvec_q6_rows(&mut r.logits, &w.lm_head.codes, &w.lm_head.high, &w.lm_head.group_scales, &r.xn, n, c.vocab_size, c.hidden_size);

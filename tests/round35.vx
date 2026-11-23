@@ -10,22 +10,24 @@
 // `r` runs rounds of 6, 4, 2 and 5 tokens after a prompt, and keeps 3, 1, 2 and 5 of them with
 // `commit_round35`. State `b` decodes the kept tokens one at a time, and state `a`, a copy of `b`
 // before each round, decodes all the tokens of the round. The logits of each position of a round
-// must be those of `a`, and the DeltaNet states after the commit those of `b`. Then a round of 8
-// tokens after a prompt of 2,044 tokens: its positions go past 2,048, where the attention of one
-// position takes 64 SIMD groups for each head in place of 32.
+// must be those of `a`, and the DeltaNet states after the commit those of `b`. Each round runs
+// twice: with all the logits exact, and with the pick of the rows of lm_head (src/q6.vx), where
+// the greedy tokens and their logits must be those of `a`. Then a round of 8 tokens after a
+// prompt of 2,044 tokens: its positions go past 2,048, where the attention of one position takes
+// 64 SIMD groups for each head in place of 32.
 //
 // RUN: python3 %S/../scripts/make_tiny_model.py --qwen35 --q4 --q6-lm-head --max-positions 2200 %t.vxw > /dev/null
 // RUN: vxc %s --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t.vxw | FileCheck %s
 //
-// CHECK: {{^}}round of 6: logits 0 differ, tokens 0 differ{{$}}
+// CHECK: {{^}}round of 6: logits 0 differ, tokens 0 differ, picked 0 differ{{$}}
 // CHECK: {{^}}keep 3: states 0 differ{{$}}
-// CHECK: {{^}}round of 4: logits 0 differ, tokens 0 differ{{$}}
+// CHECK: {{^}}round of 4: logits 0 differ, tokens 0 differ, picked 0 differ{{$}}
 // CHECK: {{^}}keep 1: states 0 differ{{$}}
-// CHECK: {{^}}round of 2: logits 0 differ, tokens 0 differ{{$}}
+// CHECK: {{^}}round of 2: logits 0 differ, tokens 0 differ, picked 0 differ{{$}}
 // CHECK: {{^}}keep 2: states 0 differ{{$}}
-// CHECK: {{^}}round of 5: logits 0 differ, tokens 0 differ{{$}}
+// CHECK: {{^}}round of 5: logits 0 differ, tokens 0 differ, picked 0 differ{{$}}
 // CHECK: {{^}}keep 5: states 0 differ{{$}}
-// CHECK: {{^}}round of 8: logits 0 differ, tokens 0 differ{{$}}
+// CHECK: {{^}}round of 8: logits 0 differ, tokens 0 differ, picked 0 differ{{$}}
 import core::convert;
 import core::num;
 import std::nn;
@@ -94,6 +96,7 @@ fn states_differ(w : &Qwen35Weights, a : &Qwen35State, b : &Qwen35State) -> i32 
 fn check_round(w : &Qwen35Weights, rs : &mut Qwen35State, round : &mut Round35, a : &mut Qwen35State, tokens : &Vec<i32>, pos : i32) -> void {
   let n = tokens.len();
   let want = decode(w, a, tokens, pos);
+  round.pick = false;
   run_round35(w, rs, round, tokens, pos, n);
   let got = transfer(&round.logits, Memory::CPU_DRAM);
   let next = transfer(&round.next, Memory::CPU_DRAM);
@@ -114,7 +117,24 @@ fn check_round(w : &Qwen35Weights, rs : &mut Qwen35State, round : &mut Round35, 
       tokens_differ = tokens_differ + 1;
     }
   }
-  println!("round of {}: logits {} differ, tokens {} differ", n, differ, tokens_differ);
+  // The same round with the pick of the rows of lm_head: the greedy tokens and their logits.
+  round.pick = true;
+  run_round35(w, rs, round, tokens, pos, n);
+  let got2 = transfer(&round.logits, Memory::CPU_DRAM);
+  let next2 = transfer(&round.next, Memory::CPU_DRAM);
+  let mut picked_differ = 0;
+  for t in 0..n {
+    let mut best = 0;
+    for i in 0..vocab {
+      if want[t * vocab + i] > want[t * vocab + best] {
+        best = i;
+      }
+    }
+    if next2[t] != best || got2[t][best].to_bits() != want[t * vocab + best].to_bits() {
+      picked_differ = picked_differ + 1;
+    }
+  }
+  println!("round of {}: logits {} differ, tokens {} differ, picked {} differ", n, differ, tokens_differ, picked_differ);
   return;
 }
 

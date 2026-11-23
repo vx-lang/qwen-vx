@@ -576,3 +576,605 @@ fn matvec_q6_rows4(y : &mut Tensor<f32, [?, ?], Memory::HBM>, codes : &Tensor<u3
   }
   return;
 }
+
+// --------------------------------------------------------------- the lm_head of a round ---
+//
+// A round needs only the greedy token of each position, and its logit. `matvec_q6_rows4_pick`
+// computes the exact logits (those of `matvec_q6`, bit for bit) only of the rows that can be the
+// greedy token, and gives the others the lowest f32. It knows them from the rough logits a of
+// `lm_rough_q6`, f16 weights and inputs on the simdgroup matrices, and a bound B of |a - e|, where
+// e is the exact logit:
+//
+//   B = 1.25 * (|w_r| * (0.001 * |x| + 1.01 * |x - f16(x)|) + 0.00001 * A_r * |x| + 0.000002 * |x|)
+//
+// with |w_r| the norm of row r of the weights, A_r the norm of row r with (q + 32) * scale in place
+// of (q - 32) * scale, and |x| the norm of x. The terms:
+//
+// - f16 weights: each (q - 32) * scale rounds once, by at most 2^-11 of itself, so the products
+//   move by at most 2^-11 |w_r| |f16(x)|, with |f16(x)| <= |x| + |x - f16(x)|.
+// - f16 inputs: the products move by at most |w_r| |x - f16(x)|, and 1.01 covers the f16 weights.
+// - the sums of the simdgroup matrices: each product of two f16 values is exact in f32, and a
+//   path through the sums has at most 2,304 roundings of f32 for 2,048 columns: at most
+//   1.4e-4 of the sum of the |products|, which is at most |w_r| |x| (1 + 2^-11).
+//   2^-11 + 1.4e-4 < 0.001.
+// - the exact logit: each term of `matvec_q6` passes at most about 45 roundings, and its terms
+//   are (q + 32) times |x| times the scale at most, so e moves by at most 64 * 2^-24 A_r |x|
+//   from the true sum.
+// - f16 weights below the normal range: at most 2^-25 for each, 2^-25 * sqrt(2048) |x| in all.
+// - 1.25 covers the roundings of the norms and of B itself.
+//
+// A row r with a_r + B_r below M = max over s of (a_s - B_s) has e_r < e_s for that s, so it is
+// not the greedy token. A NaN gives no such row, and then every row is exact. Each |x| of 60,000
+// or more makes M the lowest f32, so that the f16 inputs cannot overflow.
+
+/// wn[r] = |row r| and an[r] = |row r with (q + 32) * scale| for the 6-bit matrix, the norms of B
+/// above.
+fn lm_q6_norms(wn : &mut Tensor<f32, [?], Memory::HBM>, an : &mut Tensor<f32, [?], Memory::HBM>, codes : &Tensor<u32, [?], Memory::HBM>, high : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, rows : i32, cols : i32) -> void {
+  assert(cols % 32 == 0 && wn.len() >= rows && an.len() >= rows, "lm_q6_norms: cols must be a multiple of 32, and wn and an need rows values");
+  let words = cols / 8;
+  let hwords = cols / 16;
+  let groups = cols / 32;
+  spawn on(Topology::Device) {
+    for r in 0..rows across blocks {
+      let mut pw = unsafe { Tensor<f32, [32], Memory::SMEM>::uninit() };
+      let mut pa = unsafe { Tensor<f32, [32], Memory::SMEM>::uninit() };
+      for l in 0..32 across lanes(32) {
+        let mut sw : f32 = 0.0;
+        let mut sa : f32 = 0.0;
+        let mut i = l * 2;
+        while i < words {
+          let w0 = codes[r * words + i];
+          let w1 = codes[r * words + i + 1];
+          let h = high[r * hwords + i / 2];
+          let sc = scales[r * groups + i / 4] as f32;
+          for t in 0..16 {
+            let mut lo = (w0 >> ((t * 4) as u32)) & 15u32;
+            if t >= 8 {
+              lo = (w1 >> (((t - 8) * 4) as u32)) & 15u32;
+            }
+            let q = (lo + 16u32 * ((h >> ((t * 2) as u32)) & 3u32)) as f32;
+            let v = (q - 32.0) * sc;
+            let u = (q + 32.0) * sc;
+            sw = sw + v * v;
+            sa = sa + u * u;
+          }
+          i = i + 64;
+        }
+        pw[l] = sw;
+        pa[l] = sa;
+      }
+      let s = lanes::sum(&pw, 32);
+      let s2 = lanes::sum(&pa, 32);
+      wn[r] = s.sqrt();
+      an[r] = s2.sqrt();
+    }
+  }
+  return;
+}
+
+/// The rough logits a of the bound above, for x[0] to x[n - 1]: a[p][r] is about (row r) . x[p].
+/// A block takes 64 rows and 8 vectors (rows p of a past n - 1 get the products of zeros), and
+/// subgroup sg makes rows sg * 16 to + 15. For each 32 columns, each lane writes 16 weights
+/// (q - 32) * scale as f16 to shared memory, and the sums stay in the simdgroup matrices.
+fn lm_rough_q6(a : &mut Tensor<f32, [?, ?], Memory::HBM>, codes : &Tensor<u32, [?], Memory::HBM>, high : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, n : i32, rows : i32, cols : i32) -> void {
+  assert(cols % 32 == 0 && rows % 64 == 0 && n >= 1 && a.extent(0) >= ((n + 7) / 8) * 8 && a.extent(1) >= rows && x.extent(0) >= n && x.extent(1) >= cols, "lm_rough_q6: cols must be a multiple of 32 and rows of 64, a needs n rows rounded up to 8, and x n rows");
+  let words = cols / 8;
+  let hwords = cols / 16;
+  let groups = cols / 32;
+  spawn on(Topology::Device) {
+    for rb in 0..rows / 64 across blocks {
+      for pt in 0..(n + 7) / 8 across blocks {
+        let mut sw = unsafe { Tensor<f16, [4, 32, 16], Memory::SMEM>::uninit() };
+        let mut sx = unsafe { Tensor<f16, [1, 8, 32], Memory::SMEM>::uninit() };
+        let mut acc = unsafe { Tensor<f32, [4, 8, 16], Memory::SMEM>::uninit() };
+        for sg in 0..4 across subgroups {
+          lanes::fill(&mut acc[sg], 0.0);
+        }
+        for g in 0..groups {
+          for sg in 0..4 across subgroups {
+            for l in 0..32 across lanes(32) {
+              let rl = l % 16;
+              let half = l / 16;
+              let row = rb * 64 + sg * 16 + rl;
+              let at = row * words + g * 4 + half * 2;
+              let w0 = codes[at];
+              let w1 = codes[at + 1];
+              let h = high[row * hwords + g * 2 + half];
+              let sc = scales[row * groups + g];
+              sw[sg][half * 16 + 0][rl] = ((((w0 & 15u32) + ((h << 4u32) & 48u32)) as i32 - 32) as f16) * sc;
+              sw[sg][half * 16 + 1][rl] = (((((w0 >> 4u32) & 15u32) + ((h << 2u32) & 48u32)) as i32 - 32) as f16) * sc;
+              sw[sg][half * 16 + 2][rl] = (((((w0 >> 8u32) & 15u32) + ((h >> 0u32) & 48u32)) as i32 - 32) as f16) * sc;
+              sw[sg][half * 16 + 3][rl] = (((((w0 >> 12u32) & 15u32) + ((h >> 2u32) & 48u32)) as i32 - 32) as f16) * sc;
+              sw[sg][half * 16 + 4][rl] = (((((w0 >> 16u32) & 15u32) + ((h >> 4u32) & 48u32)) as i32 - 32) as f16) * sc;
+              sw[sg][half * 16 + 5][rl] = (((((w0 >> 20u32) & 15u32) + ((h >> 6u32) & 48u32)) as i32 - 32) as f16) * sc;
+              sw[sg][half * 16 + 6][rl] = (((((w0 >> 24u32) & 15u32) + ((h >> 8u32) & 48u32)) as i32 - 32) as f16) * sc;
+              sw[sg][half * 16 + 7][rl] = (((((w0 >> 28u32) & 15u32) + ((h >> 10u32) & 48u32)) as i32 - 32) as f16) * sc;
+              sw[sg][half * 16 + 8][rl] = ((((w1 & 15u32) + ((h >> 12u32) & 48u32)) as i32 - 32) as f16) * sc;
+              sw[sg][half * 16 + 9][rl] = (((((w1 >> 4u32) & 15u32) + ((h >> 14u32) & 48u32)) as i32 - 32) as f16) * sc;
+              sw[sg][half * 16 + 10][rl] = (((((w1 >> 8u32) & 15u32) + ((h >> 16u32) & 48u32)) as i32 - 32) as f16) * sc;
+              sw[sg][half * 16 + 11][rl] = (((((w1 >> 12u32) & 15u32) + ((h >> 18u32) & 48u32)) as i32 - 32) as f16) * sc;
+              sw[sg][half * 16 + 12][rl] = (((((w1 >> 16u32) & 15u32) + ((h >> 20u32) & 48u32)) as i32 - 32) as f16) * sc;
+              sw[sg][half * 16 + 13][rl] = (((((w1 >> 20u32) & 15u32) + ((h >> 22u32) & 48u32)) as i32 - 32) as f16) * sc;
+              sw[sg][half * 16 + 14][rl] = (((((w1 >> 24u32) & 15u32) + ((h >> 24u32) & 48u32)) as i32 - 32) as f16) * sc;
+              sw[sg][half * 16 + 15][rl] = (((((w1 >> 28u32) & 15u32) + ((h >> 26u32) & 48u32)) as i32 - 32) as f16) * sc;
+              let p = pt * 8 + sg * 2 + l / 16;
+              let k = g * 32 + (l % 16) * 2;
+              let mut v0 : f32 = 0.0;
+              let mut v1 : f32 = 0.0;
+              if p < n {
+                v0 = x[p][k];
+                v1 = x[p][k + 1];
+              }
+              sx[0][sg * 2 + l / 16][(l % 16) * 2] = v0 as f16;
+              sx[0][sg * 2 + l / 16][(l % 16) * 2 + 1] = v1 as f16;
+            }
+          }
+          for sg in 0..4 across subgroups {
+            acc[sg] = acc[sg] + (sx[0] as f32) @ (sw[sg] as f32);
+          }
+        }
+        for sg in 0..4 across subgroups {
+          lanes::copy(a, &acc[sg], [pt * 8, rb * 64 + sg * 16]);
+        }
+      }
+    }
+  }
+  return;
+}
+
+/// thr[p] = (M, |x[p]|, |x[p] - f16(x[p])|) for p below n, with M of the bound above.
+fn lm_pick_threshold(thr : &mut Tensor<f32, [?, ?], Memory::HBM>, a : &Tensor<f32, [?, ?], Memory::HBM>, wn : &Tensor<f32, [?], Memory::HBM>, an : &Tensor<f32, [?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, n : i32, rows : i32, cols : i32) -> void {
+  assert(n >= 1 && thr.extent(0) >= n && thr.extent(1) >= 3 && a.extent(0) >= n && a.extent(1) >= rows && x.extent(0) >= n && x.extent(1) >= cols && wn.len() >= rows && an.len() >= rows, "lm_pick_threshold: thr needs n rows of 3 values, a and x n rows, and wn and an rows values");
+  spawn on(Topology::Device) {
+    for p in 0..n across blocks {
+      let mut px = unsafe { Tensor<f32, [1024], Memory::SMEM>::uninit() };
+      let mut pd = unsafe { Tensor<f32, [1024], Memory::SMEM>::uninit() };
+      let mut pm = unsafe { Tensor<f32, [1024], Memory::SMEM>::uninit() };
+      for l in 0..1024 across lanes {
+        let mut sx : f32 = 0.0;
+        let mut sd : f32 = 0.0;
+        let mut i = l;
+        while i < cols {
+          let v = x[p][i];
+          let d = v - ((v as f16) as f32);
+          sx = sx + v * v;
+          sd = sd + d * d;
+          i = i + 1024;
+        }
+        px[l] = sx;
+        pd[l] = sd;
+      }
+      let s = lanes::sum(&px, 1024);
+      let s2 = lanes::sum(&pd, 1024);
+      let xs = s.sqrt();
+      let ds = s2.sqrt();
+      for l in 0..1024 across lanes {
+        let mut m : f32 = -340000000000000000000000000000000000000.0;
+        let mut r = l;
+        while r < rows {
+          let v = a[p][r] - (1.25 * (wn[r] * (0.001 * xs + 1.01 * ds) + 0.00001 * an[r] * xs + 0.000002 * xs));
+          if v > m {
+            m = v;
+          }
+          r = r + 1024;
+        }
+        pm[l] = m;
+      }
+      let mut m = lanes::max(&pm, 1024);
+      if !(xs < 60000.0) {
+        m = -340000000000000000000000000000000000000.0;
+      }
+      thr[p][0] = m;
+      thr[p][1] = xs;
+      thr[p][2] = ds;
+    }
+  }
+  return;
+}
+
+/// `matvec_q6_rows4` for the rows that can be the greedy token of each vector, after
+/// `lm_rough_q6` (a) and `lm_pick_threshold` (thr): y[p][r] is the y of `matvec_q6` for x[p] bit for
+/// bit when !(a[p][r] + B < M), and the lowest f32 otherwise.
+fn matvec_q6_rows4_pick(y : &mut Tensor<f32, [?, ?], Memory::HBM>, codes : &Tensor<u32, [?], Memory::HBM>, high : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, a : &Tensor<f32, [?, ?], Memory::HBM>, wn : &Tensor<f32, [?], Memory::HBM>, an : &Tensor<f32, [?], Memory::HBM>, thr : &Tensor<f32, [?, ?], Memory::HBM>, n : i32, rows : i32, cols : i32) -> void {
+  assert(a.extent(0) >= n && a.extent(1) >= rows && thr.extent(0) >= n && wn.len() >= rows && an.len() >= rows, "matvec_q6_rows4_pick: a and thr need n rows, and wn and an rows values");
+  assert(cols % 32 == 0 && rows % 8 == 0 && n >= 1 && y.extent(0) >= n && x.extent(0) >= n && y.extent(1) >= rows && x.extent(1) >= cols, "matvec_q6_rows4_pick: cols must be a multiple of 32 and rows of 8, and y and x need n rows of rows and cols values");
+  assert(codes.len() / rows >= cols / 8 && high.len() / rows >= cols / 16 && scales.len() / rows >= cols / 32, "matvec_q6_rows4_pick: the matrix has too few words or scales for rows x cols");
+  let words = cols / 8;
+  let hwords = cols / 16;
+  let groups = cols / 32;
+  spawn on(Topology::Device) {
+    for rb in 0..rows / 8 across blocks {
+      for pq in 0..(n + 3) / 4 across blocks {
+        let mut part = unsafe {
+          Tensor<f32, [4, 8, 32], Memory::SMEM>::uninit()
+        };
+        let mut flag = unsafe { Tensor<f32, [32], Memory::SMEM>::uninit() };
+        for s in 0..1 across subgroups {
+          // Lane l: row rb * 8 + l / 4 for vector pq * 4 + l % 4 (the last vector again past n - 1).
+          for l in 0..32 across lanes(32) {
+            let mut p = pq * 4 + l % 4;
+            if p >= n {
+              p = n - 1;
+            }
+            let row = rb * 8 + l / 4;
+            let xs = thr[p][1];
+            let ds = thr[p][2];
+            let mut f : f32 = 0.0;
+            if !(a[p][row] + 1.25 * (wn[row] * (0.001 * xs + 1.01 * ds) + 0.00001 * an[row] * xs + 0.000002 * xs) < thr[p][0]) {
+              f = 1.0;
+            }
+            flag[l] = f;
+          }
+          // A block with no row to pick reads no weights.
+          let live = lanes::max(&flag, 32);
+          let mut end = 0;
+          if live > 0.5 {
+            end = words;
+          }
+          for l in 0..32 across lanes(32) {
+            let mut p0 = pq * 4;
+            if p0 >= n {
+              p0 = n - 1;
+            }
+            let mut p1 = pq * 4 + 1;
+            if p1 >= n {
+              p1 = n - 1;
+            }
+            let mut p2 = pq * 4 + 2;
+            if p2 >= n {
+              p2 = n - 1;
+            }
+            let mut p3 = pq * 4 + 3;
+            if p3 >= n {
+              p3 = n - 1;
+            }
+            let mut acc = unsafe { Tensor<f32, [32]>::uninit() };
+            for j in 0..32 {
+              acc[j] = 0.0;
+            }
+            let mut i = l * 2;
+            while i < end {
+              let c = i * 8;
+              let mut xa = unsafe { Tensor<f32, [16]>::uninit() };
+              for t in 0..16 {
+                xa[t] = x[p0][c + t];
+              }
+              let suma = 32.0 * (xa[0] + xa[1] + xa[2] + xa[3] + xa[4] + xa[5] + xa[6] + xa[7] + xa[8] + xa[9] + xa[10] + xa[11] + xa[12] + xa[13] + xa[14] + xa[15]);
+              xa[1] = xa[1] * 0.0625;
+              xa[2] = xa[2] * 0.00390625;
+              xa[3] = xa[3] * 0.000244140625;
+              xa[4] = xa[4] * 0.0000152587890625;
+              xa[5] = xa[5] * 0.00000095367431640625;
+              xa[6] = xa[6] * 0.000000059604644775390625;
+              xa[7] = xa[7] * 0.0000000037252902984619140625;
+              xa[9] = xa[9] * 0.0625;
+              xa[10] = xa[10] * 0.00390625;
+              xa[11] = xa[11] * 0.000244140625;
+              xa[12] = xa[12] * 0.0000152587890625;
+              xa[13] = xa[13] * 0.00000095367431640625;
+              xa[14] = xa[14] * 0.000000059604644775390625;
+              xa[15] = xa[15] * 0.0000000037252902984619140625;
+              let mut xb = unsafe { Tensor<f32, [16]>::uninit() };
+              for t in 0..16 {
+                xb[t] = x[p1][c + t];
+              }
+              let sumb = 32.0 * (xb[0] + xb[1] + xb[2] + xb[3] + xb[4] + xb[5] + xb[6] + xb[7] + xb[8] + xb[9] + xb[10] + xb[11] + xb[12] + xb[13] + xb[14] + xb[15]);
+              xb[1] = xb[1] * 0.0625;
+              xb[2] = xb[2] * 0.00390625;
+              xb[3] = xb[3] * 0.000244140625;
+              xb[4] = xb[4] * 0.0000152587890625;
+              xb[5] = xb[5] * 0.00000095367431640625;
+              xb[6] = xb[6] * 0.000000059604644775390625;
+              xb[7] = xb[7] * 0.0000000037252902984619140625;
+              xb[9] = xb[9] * 0.0625;
+              xb[10] = xb[10] * 0.00390625;
+              xb[11] = xb[11] * 0.000244140625;
+              xb[12] = xb[12] * 0.0000152587890625;
+              xb[13] = xb[13] * 0.00000095367431640625;
+              xb[14] = xb[14] * 0.000000059604644775390625;
+              xb[15] = xb[15] * 0.0000000037252902984619140625;
+              let mut xc = unsafe { Tensor<f32, [16]>::uninit() };
+              for t in 0..16 {
+                xc[t] = x[p2][c + t];
+              }
+              let sumc = 32.0 * (xc[0] + xc[1] + xc[2] + xc[3] + xc[4] + xc[5] + xc[6] + xc[7] + xc[8] + xc[9] + xc[10] + xc[11] + xc[12] + xc[13] + xc[14] + xc[15]);
+              xc[1] = xc[1] * 0.0625;
+              xc[2] = xc[2] * 0.00390625;
+              xc[3] = xc[3] * 0.000244140625;
+              xc[4] = xc[4] * 0.0000152587890625;
+              xc[5] = xc[5] * 0.00000095367431640625;
+              xc[6] = xc[6] * 0.000000059604644775390625;
+              xc[7] = xc[7] * 0.0000000037252902984619140625;
+              xc[9] = xc[9] * 0.0625;
+              xc[10] = xc[10] * 0.00390625;
+              xc[11] = xc[11] * 0.000244140625;
+              xc[12] = xc[12] * 0.0000152587890625;
+              xc[13] = xc[13] * 0.00000095367431640625;
+              xc[14] = xc[14] * 0.000000059604644775390625;
+              xc[15] = xc[15] * 0.0000000037252902984619140625;
+              let mut xd = unsafe { Tensor<f32, [16]>::uninit() };
+              for t in 0..16 {
+                xd[t] = x[p3][c + t];
+              }
+              let sumd = 32.0 * (xd[0] + xd[1] + xd[2] + xd[3] + xd[4] + xd[5] + xd[6] + xd[7] + xd[8] + xd[9] + xd[10] + xd[11] + xd[12] + xd[13] + xd[14] + xd[15]);
+              xd[1] = xd[1] * 0.0625;
+              xd[2] = xd[2] * 0.00390625;
+              xd[3] = xd[3] * 0.000244140625;
+              xd[4] = xd[4] * 0.0000152587890625;
+              xd[5] = xd[5] * 0.00000095367431640625;
+              xd[6] = xd[6] * 0.000000059604644775390625;
+              xd[7] = xd[7] * 0.0000000037252902984619140625;
+              xd[9] = xd[9] * 0.0625;
+              xd[10] = xd[10] * 0.00390625;
+              xd[11] = xd[11] * 0.000244140625;
+              xd[12] = xd[12] * 0.0000152587890625;
+              xd[13] = xd[13] * 0.00000095367431640625;
+              xd[14] = xd[14] * 0.000000059604644775390625;
+              xd[15] = xd[15] * 0.0000000037252902984619140625;
+              for j in 0..8 {
+                let row = rb * 8 + j;
+                let at = row * words + i;
+                let w0 = codes[at];
+                let w1 = codes[at + 1];
+                let h = high[row * hwords + i / 2];
+                let sc = scales[row * groups + i / 4] as f32;
+                let f0 = (w0 & 15u32) as f32;
+                let f1 = (w0 & 240u32) as f32;
+                let f2 = (w0 & 3840u32) as f32;
+                let f3 = (w0 & 61440u32) as f32;
+                let f4 = (w0 & 983040u32) as f32;
+                let f5 = (w0 & 15728640u32) as f32;
+                let f6 = (w0 & 251658240u32) as f32;
+                let f7 = (w0 & 4026531840u32) as f32;
+                let f8 = (w1 & 15u32) as f32;
+                let f9 = (w1 & 240u32) as f32;
+                let f10 = (w1 & 3840u32) as f32;
+                let f11 = (w1 & 61440u32) as f32;
+                let f12 = (w1 & 983040u32) as f32;
+                let f13 = (w1 & 15728640u32) as f32;
+                let f14 = (w1 & 251658240u32) as f32;
+                let f15 = (w1 & 4026531840u32) as f32;
+                let g0 = ((h & 3u32) as f32) * 16.0;
+                let g1 = ((h & 12u32) as f32) * 64.0;
+                let g2 = ((h & 48u32) as f32) * 256.0;
+                let g3 = ((h & 192u32) as f32) * 1024.0;
+                let g4 = ((h & 768u32) as f32) * 4096.0;
+                let g5 = ((h & 3072u32) as f32) * 16384.0;
+                let g6 = ((h & 12288u32) as f32) * 65536.0;
+                let g7 = ((h & 49152u32) as f32) * 262144.0;
+                let g8 = ((h & 196608u32) as f32) * 0.000244140625;
+                let g9 = ((h & 786432u32) as f32) * 0.0009765625;
+                let g10 = ((h & 3145728u32) as f32) * 0.00390625;
+                let g11 = ((h & 12582912u32) as f32) * 0.015625;
+                let g12 = ((h & 50331648u32) as f32) * 0.0625;
+                let g13 = ((h & 201326592u32) as f32) * 0.25;
+                let g14 = ((h & 805306368u32) as f32) * 1.0;
+                let g15 = ((h & 3221225472u32) as f32) * 4.0;
+                let lowa = f0 * xa[0] + f1 * xa[1] + f2 * xa[2] + f3 * xa[3] + f4 * xa[4] + f5 * xa[5] + f6 * xa[6] + f7 * xa[7] + f8 * xa[8] + f9 * xa[9] + f10 * xa[10] + f11 * xa[11] + f12 * xa[12] + f13 * xa[13] + f14 * xa[14] + f15 * xa[15];
+                let topa = g0 * xa[0] + g1 * xa[1] + g2 * xa[2] + g3 * xa[3] + g4 * xa[4] + g5 * xa[5] + g6 * xa[6] + g7 * xa[7] + g8 * xa[8] + g9 * xa[9] + g10 * xa[10] + g11 * xa[11] + g12 * xa[12] + g13 * xa[13] + g14 * xa[14] + g15 * xa[15];
+                acc[0 + j] = acc[0 + j] + (lowa + topa - suma) * sc;
+                let lowb = f0 * xb[0] + f1 * xb[1] + f2 * xb[2] + f3 * xb[3] + f4 * xb[4] + f5 * xb[5] + f6 * xb[6] + f7 * xb[7] + f8 * xb[8] + f9 * xb[9] + f10 * xb[10] + f11 * xb[11] + f12 * xb[12] + f13 * xb[13] + f14 * xb[14] + f15 * xb[15];
+                let topb = g0 * xb[0] + g1 * xb[1] + g2 * xb[2] + g3 * xb[3] + g4 * xb[4] + g5 * xb[5] + g6 * xb[6] + g7 * xb[7] + g8 * xb[8] + g9 * xb[9] + g10 * xb[10] + g11 * xb[11] + g12 * xb[12] + g13 * xb[13] + g14 * xb[14] + g15 * xb[15];
+                acc[8 + j] = acc[8 + j] + (lowb + topb - sumb) * sc;
+                let lowc = f0 * xc[0] + f1 * xc[1] + f2 * xc[2] + f3 * xc[3] + f4 * xc[4] + f5 * xc[5] + f6 * xc[6] + f7 * xc[7] + f8 * xc[8] + f9 * xc[9] + f10 * xc[10] + f11 * xc[11] + f12 * xc[12] + f13 * xc[13] + f14 * xc[14] + f15 * xc[15];
+                let topc = g0 * xc[0] + g1 * xc[1] + g2 * xc[2] + g3 * xc[3] + g4 * xc[4] + g5 * xc[5] + g6 * xc[6] + g7 * xc[7] + g8 * xc[8] + g9 * xc[9] + g10 * xc[10] + g11 * xc[11] + g12 * xc[12] + g13 * xc[13] + g14 * xc[14] + g15 * xc[15];
+                acc[16 + j] = acc[16 + j] + (lowc + topc - sumc) * sc;
+                let lowd = f0 * xd[0] + f1 * xd[1] + f2 * xd[2] + f3 * xd[3] + f4 * xd[4] + f5 * xd[5] + f6 * xd[6] + f7 * xd[7] + f8 * xd[8] + f9 * xd[9] + f10 * xd[10] + f11 * xd[11] + f12 * xd[12] + f13 * xd[13] + f14 * xd[14] + f15 * xd[15];
+                let topd = g0 * xd[0] + g1 * xd[1] + g2 * xd[2] + g3 * xd[3] + g4 * xd[4] + g5 * xd[5] + g6 * xd[6] + g7 * xd[7] + g8 * xd[8] + g9 * xd[9] + g10 * xd[10] + g11 * xd[11] + g12 * xd[12] + g13 * xd[13] + g14 * xd[14] + g15 * xd[15];
+                acc[24 + j] = acc[24 + j] + (lowd + topd - sumd) * sc;
+              }
+              i = i + 64;
+            }
+            for j in 0..8 {
+              part[0][j][l] = acc[0 + j];
+              part[1][j][l] = acc[8 + j];
+              part[2][j][l] = acc[16 + j];
+              part[3][j][l] = acc[24 + j];
+            }
+          }
+          let u0_0 = lanes::sum(&part[0][0], 32);
+          let u0_1 = lanes::sum(&part[0][1], 32);
+          let u0_2 = lanes::sum(&part[0][2], 32);
+          let u0_3 = lanes::sum(&part[0][3], 32);
+          let u0_4 = lanes::sum(&part[0][4], 32);
+          let u0_5 = lanes::sum(&part[0][5], 32);
+          let u0_6 = lanes::sum(&part[0][6], 32);
+          let u0_7 = lanes::sum(&part[0][7], 32);
+          let u1_0 = lanes::sum(&part[1][0], 32);
+          let u1_1 = lanes::sum(&part[1][1], 32);
+          let u1_2 = lanes::sum(&part[1][2], 32);
+          let u1_3 = lanes::sum(&part[1][3], 32);
+          let u1_4 = lanes::sum(&part[1][4], 32);
+          let u1_5 = lanes::sum(&part[1][5], 32);
+          let u1_6 = lanes::sum(&part[1][6], 32);
+          let u1_7 = lanes::sum(&part[1][7], 32);
+          let u2_0 = lanes::sum(&part[2][0], 32);
+          let u2_1 = lanes::sum(&part[2][1], 32);
+          let u2_2 = lanes::sum(&part[2][2], 32);
+          let u2_3 = lanes::sum(&part[2][3], 32);
+          let u2_4 = lanes::sum(&part[2][4], 32);
+          let u2_5 = lanes::sum(&part[2][5], 32);
+          let u2_6 = lanes::sum(&part[2][6], 32);
+          let u2_7 = lanes::sum(&part[2][7], 32);
+          let u3_0 = lanes::sum(&part[3][0], 32);
+          let u3_1 = lanes::sum(&part[3][1], 32);
+          let u3_2 = lanes::sum(&part[3][2], 32);
+          let u3_3 = lanes::sum(&part[3][3], 32);
+          let u3_4 = lanes::sum(&part[3][4], 32);
+          let u3_5 = lanes::sum(&part[3][5], 32);
+          let u3_6 = lanes::sum(&part[3][6], 32);
+          let u3_7 = lanes::sum(&part[3][7], 32);
+          if pq * 4 + 0 < n {
+            let mut v0_0 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[0] > 0.5 {
+              v0_0 = u0_0;
+            }
+            y[pq * 4 + 0][rb * 8 + 0] = v0_0;
+            let mut v0_1 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[4] > 0.5 {
+              v0_1 = u0_1;
+            }
+            y[pq * 4 + 0][rb * 8 + 1] = v0_1;
+            let mut v0_2 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[8] > 0.5 {
+              v0_2 = u0_2;
+            }
+            y[pq * 4 + 0][rb * 8 + 2] = v0_2;
+            let mut v0_3 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[12] > 0.5 {
+              v0_3 = u0_3;
+            }
+            y[pq * 4 + 0][rb * 8 + 3] = v0_3;
+            let mut v0_4 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[16] > 0.5 {
+              v0_4 = u0_4;
+            }
+            y[pq * 4 + 0][rb * 8 + 4] = v0_4;
+            let mut v0_5 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[20] > 0.5 {
+              v0_5 = u0_5;
+            }
+            y[pq * 4 + 0][rb * 8 + 5] = v0_5;
+            let mut v0_6 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[24] > 0.5 {
+              v0_6 = u0_6;
+            }
+            y[pq * 4 + 0][rb * 8 + 6] = v0_6;
+            let mut v0_7 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[28] > 0.5 {
+              v0_7 = u0_7;
+            }
+            y[pq * 4 + 0][rb * 8 + 7] = v0_7;
+          }
+          if pq * 4 + 1 < n {
+            let mut v1_0 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[1] > 0.5 {
+              v1_0 = u1_0;
+            }
+            y[pq * 4 + 1][rb * 8 + 0] = v1_0;
+            let mut v1_1 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[5] > 0.5 {
+              v1_1 = u1_1;
+            }
+            y[pq * 4 + 1][rb * 8 + 1] = v1_1;
+            let mut v1_2 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[9] > 0.5 {
+              v1_2 = u1_2;
+            }
+            y[pq * 4 + 1][rb * 8 + 2] = v1_2;
+            let mut v1_3 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[13] > 0.5 {
+              v1_3 = u1_3;
+            }
+            y[pq * 4 + 1][rb * 8 + 3] = v1_3;
+            let mut v1_4 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[17] > 0.5 {
+              v1_4 = u1_4;
+            }
+            y[pq * 4 + 1][rb * 8 + 4] = v1_4;
+            let mut v1_5 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[21] > 0.5 {
+              v1_5 = u1_5;
+            }
+            y[pq * 4 + 1][rb * 8 + 5] = v1_5;
+            let mut v1_6 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[25] > 0.5 {
+              v1_6 = u1_6;
+            }
+            y[pq * 4 + 1][rb * 8 + 6] = v1_6;
+            let mut v1_7 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[29] > 0.5 {
+              v1_7 = u1_7;
+            }
+            y[pq * 4 + 1][rb * 8 + 7] = v1_7;
+          }
+          if pq * 4 + 2 < n {
+            let mut v2_0 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[2] > 0.5 {
+              v2_0 = u2_0;
+            }
+            y[pq * 4 + 2][rb * 8 + 0] = v2_0;
+            let mut v2_1 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[6] > 0.5 {
+              v2_1 = u2_1;
+            }
+            y[pq * 4 + 2][rb * 8 + 1] = v2_1;
+            let mut v2_2 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[10] > 0.5 {
+              v2_2 = u2_2;
+            }
+            y[pq * 4 + 2][rb * 8 + 2] = v2_2;
+            let mut v2_3 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[14] > 0.5 {
+              v2_3 = u2_3;
+            }
+            y[pq * 4 + 2][rb * 8 + 3] = v2_3;
+            let mut v2_4 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[18] > 0.5 {
+              v2_4 = u2_4;
+            }
+            y[pq * 4 + 2][rb * 8 + 4] = v2_4;
+            let mut v2_5 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[22] > 0.5 {
+              v2_5 = u2_5;
+            }
+            y[pq * 4 + 2][rb * 8 + 5] = v2_5;
+            let mut v2_6 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[26] > 0.5 {
+              v2_6 = u2_6;
+            }
+            y[pq * 4 + 2][rb * 8 + 6] = v2_6;
+            let mut v2_7 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[30] > 0.5 {
+              v2_7 = u2_7;
+            }
+            y[pq * 4 + 2][rb * 8 + 7] = v2_7;
+          }
+          if pq * 4 + 3 < n {
+            let mut v3_0 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[3] > 0.5 {
+              v3_0 = u3_0;
+            }
+            y[pq * 4 + 3][rb * 8 + 0] = v3_0;
+            let mut v3_1 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[7] > 0.5 {
+              v3_1 = u3_1;
+            }
+            y[pq * 4 + 3][rb * 8 + 1] = v3_1;
+            let mut v3_2 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[11] > 0.5 {
+              v3_2 = u3_2;
+            }
+            y[pq * 4 + 3][rb * 8 + 2] = v3_2;
+            let mut v3_3 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[15] > 0.5 {
+              v3_3 = u3_3;
+            }
+            y[pq * 4 + 3][rb * 8 + 3] = v3_3;
+            let mut v3_4 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[19] > 0.5 {
+              v3_4 = u3_4;
+            }
+            y[pq * 4 + 3][rb * 8 + 4] = v3_4;
+            let mut v3_5 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[23] > 0.5 {
+              v3_5 = u3_5;
+            }
+            y[pq * 4 + 3][rb * 8 + 5] = v3_5;
+            let mut v3_6 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[27] > 0.5 {
+              v3_6 = u3_6;
+            }
+            y[pq * 4 + 3][rb * 8 + 6] = v3_6;
+            let mut v3_7 : f32 = -340000000000000000000000000000000000000.0;
+            if flag[31] > 0.5 {
+              v3_7 = u3_7;
+            }
+            y[pq * 4 + 3][rb * 8 + 7] = v3_7;
+          }
+        }
+      }
+    }
+  }
+  return;
+}
