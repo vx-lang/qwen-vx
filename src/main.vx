@@ -547,6 +547,9 @@ fn generate_with_drafts35(w : &Qwen35Weights, s : &mut Qwen35State, t : &Tokeniz
 /// (`generate_with_mtp35`).
 const MTP_LONG_SHARE : f64 = 0.85;
 
+/// The share of kept drafts from which a round takes the second number of `--mtp K,L` drafts.
+const MTP_LONGER_SHARE : f64 = 0.95;
+
 /// The tokens that an MTP draft comes from without --mtp-vocab: ids 0 to MTP_VOCAB - 1. On the
 /// tuning prompts, the drafts of Qwen3.6-35B-A3B from these tokens are kept as often as those from
 /// all 248,320, and the rows of lm_head that they read are a quarter.
@@ -574,10 +577,12 @@ fn upload_token(token : i32) -> Tensor<i32, [?], Memory::HBM> {
 /// running mean of the share of drafts that the rounds keep, of each draft up to the first miss.
 /// With the cost of a round at 4 positions about 1.7 times that at 2, `max` drafts pay from a
 /// share of about MTP_LONG_SHARE.
-fn generate_with_mtp35(w : &Qwen35Weights, s : &mut Qwen35State, m : &mut Mtp35State, t : &Tokenizer, eos : i32, text_mode : bool, prompt : &Vec<i32>, first : i32, steps : i32, max : i32, vocab : i32, start : &mut Instant) -> i32 {
+fn generate_with_mtp35(w : &Qwen35Weights, s : &mut Qwen35State, m : &mut Mtp35State, t : &Tokenizer, eos : i32, text_mode : bool, prompt : &Vec<i32>, first : i32, steps : i32, max : i32, long : i32, long_share : f64, vocab : i32, start : &mut Instant) -> i32 {
   assert(can_round35(w), "--mtp needs a model of Q4_0 layers and experts and a 6-bit lm_head");
   assert(w.mtp.len() == 1, "--mtp needs a weight file with the MTP layer");
   assert(max >= 1 && max < ROUND_MAX, "--mtp must be 1 to ROUND_MAX - 1");
+  assert(long < ROUND_MAX, "the second number of --mtp must be below ROUND_MAX");
+  let most = i32::max(max, long);
   let c = &w.config;
   let mut r = new_round35(c);
   let mut slots = Vec<Slot>::new();
@@ -611,7 +616,7 @@ fn generate_with_mtp35(w : &Qwen35Weights, s : &mut Qwen35State, m : &mut Mtp35S
   // The same for the MTP rows after a round, which write MTP rows that later drafts write again
   // before they read them, and m.token and m.h, which the first round sets again.
   let mut warm = Vec<i32>::new();
-  for n in 1..max + 2 {
+  for n in 1..most + 2 {
     warm.push(token);
     run_round35(w, s, &mut r, &warm, pos, n);
     mtp35_rows(w, s, &mut r, m, pos, n, vocab);
@@ -628,7 +633,9 @@ fn generate_with_mtp35(w : &Qwen35Weights, s : &mut Qwen35State, m : &mut Mtp35S
   let mut kept : f64 = MTP_LONG_SHARE;
   while going && step + 1 < steps {
     let room = steps - step - 1;
-    let want = if kept >= MTP_LONG_SHARE {
+    let want = if long > max && kept >= long_share {
+      long
+    } else if kept >= MTP_LONG_SHARE {
       max
     } else {
       1
@@ -708,7 +715,7 @@ fn generate_with_mtp35(w : &Qwen35Weights, s : &mut Qwen35State, m : &mut Mtp35S
 /// `main` for a Qwen3.5 or Qwen3.6 model (weight file v2, arch 1). The prompt runs in chunks
 /// (src/prefill35.vx). With --draft, the tokens come from `generate_with_drafts35`. Prints the
 /// same lines as `main`.
-fn run_qwen35(path : *const i8, t : &Tokenizer, text_mode : bool, chat : bool, ignore_eos : bool, prompt : &Vec<i32>, steps : i32, draft : i32, mtp : i32, mtp_vocab : i32, runs : i32) -> i32 {
+fn run_qwen35(path : *const i8, t : &Tokenizer, text_mode : bool, chat : bool, ignore_eos : bool, prompt : &Vec<i32>, steps : i32, draft : i32, mtp : i32, mtp_long : i32, mtp_share : f64, mtp_vocab : i32, runs : i32) -> i32 {
   let w = load_qwen35_weights(path);
   let eos = if ignore_eos {
     -1
@@ -809,7 +816,7 @@ fn run_qwen35(path : *const i8, t : &Tokenizer, text_mode : bool, chat : bool, i
     } else {
       i32::min(MTP_VOCAB, w.config.vocab_size)
     };
-    decoded = generate_with_mtp35(&w, &mut s, &mut m, t, eos, text_mode, prompt, tokens[0], steps, mtp, vocab, &mut start);
+    decoded = generate_with_mtp35(&w, &mut s, &mut m, t, eos, text_mode, prompt, tokens[0], steps, mtp, mtp_long, mtp_share, vocab, &mut start);
   }
   for step in 0..steps {
     if draft > 0 || mtp > 0 {
@@ -890,17 +897,26 @@ fn main(argc : i32, argv : *mut *mut i8) -> i32 {
       1
     };
     assert(runs >= 1, "--prompt-runs must be at least 1");
-    let mtp = if o.has_mtp {
-      parse_numbers(o.mtp)[0]
-    } else {
-      0
-    };
+    let mut mtp = 0;
+    let mut mtp_long = 0;
+    let mut mtp_share : f64 = 1.0;
+    if o.has_mtp {
+      let k = parse_numbers(o.mtp);
+      mtp = k[0];
+      if k.len() > 1 {
+        mtp_long = k[1];
+        mtp_share = MTP_LONGER_SHARE;
+      }
+      if k.len() > 2 {
+        mtp_share = f64::from(k[2]) / 100.0;
+      }
+    }
     let mtp_vocab = if o.has_mtp_vocab {
       parse_numbers(o.mtp_vocab)[0]
     } else {
       0
     };
-    return run_qwen35(o.weights, &t, text_mode, o.chat, o.ignore_eos, &prompt, steps, draft, mtp, mtp_vocab, runs);
+    return run_qwen35(o.weights, &t, text_mode, o.chat, o.ignore_eos, &prompt, steps, draft, mtp, mtp_long, mtp_share, mtp_vocab, runs);
   }
   assert(!o.has_prompt_runs, "--prompt-runs needs a Qwen3.5 or Qwen3.6 file");
   let w = load_weights(o.weights);

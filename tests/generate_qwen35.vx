@@ -16,6 +16,8 @@
 //   layer and without --mtp: the lines of the steps must be the same, logits too. The prompt has
 //   2,100 tokens, so the rows of the MTP layer for the prompt run in 2 chunks. The MTP layer of
 //   the tiny model has random weights, so its drafts are not those of the model.
+// - the same with --mtp 3,5,0: the second length of drafts (5) from a kept share of 0%, so each
+//   round drafts 5 tokens and checks 6 positions.
 //
 // The products of a chunk round each Q4_0 weight, (code - 8) times its scale, to f16, as for the
 // Qwen3 models. So the Q4_0 files get 0.003, as in tests/prefill.vx, and the bf16 files 0.001.
@@ -60,6 +62,10 @@
 // RUN: diff %t-long24.steps %t-mtp.steps
 // RUN: grep -c step= %t-mtp.steps | FileCheck %s --check-prefix=MTP-STEPS
 // RUN: grep rounds= %t-mtp.vx | FileCheck %s --check-prefix=MTP
+// RUN: vxc %S/../src/main.vx --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t-mtp.vxw --tokens $(cat %t-long.ids) --steps 24 --mtp 3,5,0 > %t-mtp5.vx
+// RUN: grep step= %t-mtp5.vx > %t-mtp5.steps
+// RUN: diff %t-long24.steps %t-mtp5.steps
+// RUN: grep rounds= %t-mtp5.vx | FileCheck %s --check-prefix=MTP
 //
 // CHECK: 16 steps, same tokens, logits within 0.001
 // Q4: 16 steps, same tokens, logits within 0.003
