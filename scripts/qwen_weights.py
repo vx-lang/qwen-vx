@@ -72,6 +72,23 @@ shared expert, and `shared_gate_up` and `shared_down` hold the shared expert as 
 `experts_gate_up` and `experts_down`, with shared_expert_intermediate_size in place of
 moe_intermediate_size.
 
+A model of arch 1 can also have mtp_layers = 1: the multi-token prediction (MTP) layer of the model,
+which predicts the token after the next one. Its tensors come after all the other tensors, so the
+other tensors of a file with them have the same order and bytes as in a file without them, and the
+same offsets unless the longer tensor table moves the data to the next 16 KiB page. The
+MTP layer uses the `embed` and `lm_head` of the model. At position p + 1, its input is token p + 1
+and the hidden state h of position p, after final_norm (or, for a draft after a draft, the h of
+the MTP layer itself). It has:
+
+    mtp.embed_norm   f32 [hidden_size], the RMSNorm (1 + w) of the embedding of the token.
+    mtp.hidden_norm  f32 [hidden_size], the RMSNorm (1 + w) of h.
+    mtp.fc           [hidden_size, 2 * hidden_size], a weight matrix. Its input is the normed
+                     embedding, then the normed h.
+    mtp.layers.0.*   the tensors of a layer with full attention, as below. The layer has its own
+                     KV cache.
+    mtp.final_norm   f32 [hidden_size], the RMSNorm (1 + w) after the layer. Its output is the h of
+                     the MTP layer, and lm_head of it gives the logits of position p + 2.
+
 Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
 See LICENSE for license information.
 SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
@@ -118,6 +135,7 @@ CONFIG_INTS = [
     "conv_width",
     "rotary_dim",
     "shared_expert_intermediate_size",
+    "mtp_layers",
 ]
 # The integers that the header of each version has room for.
 CONFIG_INT_SLOTS = {1: 16, 2: 32}
@@ -135,7 +153,7 @@ STORAGE = {"f32": np.float32, "bf16": np.uint16, "f8e4m3": np.uint8, "f16": np.f
 
 # The weight matrices that an fp8 or q4_0 file quantizes. The kinds of a layer end the name.
 MATRICES = ("qkv", "attn_out", "gate_up", "down", "experts_gate_up", "experts_down", "lm_head",
-            "linear_in", "linear_out", "shared_gate_up", "shared_down")
+            "linear_in", "linear_out", "shared_gate_up", "shared_down", "fc")
 BLOCK = 128
 Q4_GROUP = 32
 # A 6-bit matrix has one f16 scale for each Q6_GROUP weights of a row.
@@ -188,10 +206,12 @@ def has_full_attention(config, layer):
     return not config.get("arch", 0) or (layer + 1) % config["full_attention_interval"] == 0
 
 
-def layer_names(config, layer):
-    """The names of the tensors of one layer of an arch 1 model, in file order."""
-    prefix = f"layers.{layer}."
-    if has_full_attention(config, layer):
+def layer_names(config, layer, prefix=None):
+    """The names of the tensors of one layer of an arch 1 model, in file order. `prefix` names the
+    MTP layer, which has full attention."""
+    full = prefix is not None or has_full_attention(config, layer)
+    prefix = prefix or f"layers.{layer}."
+    if full:
         kinds = ["attn_norm", "qkv", "q_norm", "k_norm", "attn_out"]
     else:
         kinds = ["attn_norm", "linear_in", "conv", "neg_A", "dt_bias", "linear_norm", "linear_out"]
@@ -224,6 +244,7 @@ def tensor_names(config):
     names.append("final_norm")
     if not config["tied_embeddings"]:
         names.append("lm_head")
+    names += mtp_names(config)
     if config["weight_format"]:
         def parts(name):
             if is_six_bit(config, name):
@@ -232,6 +253,14 @@ def tensor_names(config):
 
         names = [n for name in names for n in parts(name)]
     return names
+
+
+def mtp_names(config):
+    """The names of the tensors of the MTP layer, in file order: none when mtp_layers is 0."""
+    if not config.get("mtp_layers", 0):
+        return []
+    assert config.get("arch", 0) and config["mtp_layers"] == 1, "only a model of arch 1 can have one MTP layer"
+    return ["mtp.embed_norm", "mtp.hidden_norm", "mtp.fc"] + layer_names(config, 0, "mtp.layers.0.") + ["mtp.final_norm"]
 
 
 def tensor_shapes(config):
@@ -266,6 +295,10 @@ def tensor_shapes(config):
         else:
             shapes[prefix + "gate_up"] = (2 * inter, hidden)
             shapes[prefix + "down"] = (hidden, inter)
+    if config.get("mtp_layers", 0):
+        shapes.update({"mtp.embed_norm": (hidden,), "mtp.hidden_norm": (hidden,), "mtp.fc": (hidden, 2 * hidden),
+                       "mtp.final_norm": (hidden,)})
+        shapes.update(arch1_layer_shapes(config, 0, "mtp.layers.0."))
     if config["weight_format"]:
         for name in [n for n in shapes if is_matrix(n)]:
             rows, cols = shapes[name]
@@ -281,9 +314,11 @@ def tensor_shapes(config):
     return shapes
 
 
-def arch1_layer_shapes(config, layer):
-    """The shape of each tensor of one layer of an arch 1 model, by name."""
-    prefix = f"layers.{layer}."
+def arch1_layer_shapes(config, layer, prefix=None):
+    """The shape of each tensor of one layer of an arch 1 model, by name. `prefix` names the MTP
+    layer, which has full attention."""
+    full = prefix is not None or has_full_attention(config, layer)
+    prefix = prefix or f"layers.{layer}."
     hidden, head_dim, q_heads = config["hidden_size"], config["head_dim"], config["num_q_heads"]
     k_total = config["linear_k_heads"] * config["linear_k_dim"]
     v_heads = config["linear_v_heads"]
@@ -298,7 +333,7 @@ def arch1_layer_shapes(config, layer):
     }
     if shared:
         shapes.update(shared_gate_up=(2 * shared, hidden), shared_down=(hidden, shared))
-    if has_full_attention(config, layer):
+    if full:
         shapes.update(
             qkv=(2 * q_heads * head_dim + 2 * config["num_kv_heads"] * head_dim, hidden),
             q_norm=(head_dim,),
@@ -680,8 +715,9 @@ def quantize(config, tensors, weight_format, importance=None):
             tensors[name + ".scale"] = lambda part=parts[2]: ("f16", part())
             continue
         if dtype == "u4":
-            assert importance is None or name in importance, f"the importance file has no {name}"
-            weights = None if importance is None else importance[name]
+            # An importance file need not have the MTP layer, which importance.py does not run.
+            assert importance is None or name in importance or name.startswith("mtp."), f"the importance file has no {name}"
+            weights = None if importance is None else importance.get(name)
             quantizer, scale_dtype = (lambda matrix, weights=weights: quantize_q4_0(matrix, weights)), "f16"
         else:
             quantizer, scale_dtype = quantize_fp8, "f32"
@@ -760,7 +796,7 @@ def config_from_json(hf):
 
 def config_from_qwen3_5(hf):
     """The config of the weight file, from the `config.json` of a Qwen3.5 MoE model, such as
-    Qwen3.6-35B-A3B. The file keeps only the text model: no vision tower and no MTP layer."""
+    Qwen3.6-35B-A3B. The file keeps only the text model and its MTP layer: no vision tower."""
     text = hf["text_config"]
     assert text["model_type"] == "qwen3_5_moe_text", f"text model_type {text['model_type']}"
     interval = text["full_attention_interval"]
@@ -802,6 +838,7 @@ def config_from_qwen3_5(hf):
         # it is plain RoPE on the first rotary_dim values of each head.
         "rotary_dim": int(head_dim * rope.get("partial_rotary_factor", 1.0)),
         "shared_expert_intermediate_size": text["shared_expert_intermediate_size"],
+        "mtp_layers": text.get("mtp_num_hidden_layers", 0),
         "rope_theta": float(rope["rope_theta"]),
         "rms_norm_eps": float(text["rms_norm_eps"]),
     }
