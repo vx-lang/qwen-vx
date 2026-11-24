@@ -551,8 +551,10 @@ const MTP_LONG_SHARE : f64 = 0.85;
 const MTP_LONGER_SHARE : f64 = 0.95;
 
 /// With --draft D and --mtp, the shortest match in the context from which a round drafts up to D
-/// tokens of the context and not from the MTP layer. `--draft D,M` sets it to M.
-const MTP_CONTEXT_MATCH : i32 = 12;
+/// tokens of the context and not from the MTP layer. `--draft D,M` sets it to M. A match of 16 is
+/// the longest that `longest_match` finds. Shorter matches often give drafts that the round does not
+/// keep, and such a round costs more than the MTP round that it replaces.
+const MTP_CONTEXT_MATCH : i32 = MATCH_MAX;
 
 /// The tokens that an MTP draft comes from without --mtp-vocab: ids 0 to MTP_VOCAB - 1. On the
 /// tuning prompts, the drafts of Qwen3.6-35B-A3B from these tokens are kept as often as those from
