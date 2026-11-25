@@ -44,7 +44,7 @@ struct Mtp35State {
 }
 
 /// The MTP state for the `max_seq` positions of `s`.
-fn new_mtp35_state(c : &Config, max_seq : i32) -> Mtp35State {
+pub fn new_mtp35_state(c : &Config, max_seq : i32) -> Mtp35State {
   assert(c.mtp_layers == 1, "new_mtp35_state: the weight file has no MTP layer");
   let rows = (max_seq + 63) / 64 * 64;
   return Mtp35State {
@@ -59,7 +59,7 @@ fn new_mtp35_state(c : &Config, max_seq : i32) -> Mtp35State {
 }
 
 /// A state of one value in each tensor, for a program without --mtp.
-fn new_mtp35_state_none() -> Mtp35State {
+pub fn new_mtp35_state_none() -> Mtp35State {
   return Mtp35State {
     k: transfer(Tensor<f16>([1, 1, 1]), Memory::HBM),
     v: transfer(Tensor<f16>([1, 1, 1]), Memory::HBM),
@@ -72,7 +72,7 @@ fn new_mtp35_state_none() -> Mtp35State {
 }
 
 /// y[0] = x[0]: a copy of a token in GPU memory.
-fn copy_token(y : &mut Tensor<i32, [?], Memory::HBM>, x : &Tensor<i32, [?], Memory::HBM>) -> void {
+pub fn copy_token(y : &mut Tensor<i32, [?], Memory::HBM>, x : &Tensor<i32, [?], Memory::HBM>) -> void {
   spawn on(Topology::Device) {
     for b in 0..1 across blocks {
       for l in 0..32 across lanes {
@@ -86,7 +86,7 @@ fn copy_token(y : &mut Tensor<i32, [?], Memory::HBM>, x : &Tensor<i32, [?], Memo
 }
 
 /// y[i] = x[i], for i below n.
-fn copy_f32(y : &mut Tensor<f32, [?], Memory::HBM>, x : &Tensor<f32, [?], Memory::HBM>, n : i32) -> void {
+pub fn copy_f32(y : &mut Tensor<f32, [?], Memory::HBM>, x : &Tensor<f32, [?], Memory::HBM>, n : i32) -> void {
   assert(y.len() >= n && x.len() >= n, "copy_f32: a tensor has fewer than n values");
   spawn on(Topology::Device) {
     for b in 0..(n + 255) / 256 across blocks {
@@ -168,7 +168,7 @@ fn pf35_rms_norm_at(y : &mut Tensor<f32, [?, ?], Memory::HBM>, at : i32, x : &Te
 /// draft. The prediction is among tokens 0 to vocab - 1 only: the first rows of lm_head, which a
 /// BPE vocabulary gives to its most frequent tokens. The row uses the scratch tensors of `s` (x, xn, proj, y, q, parts, the experts and
 /// logits), but not its KV caches or states.
-fn mtp35_step(w : &Qwen35Weights, s : &mut Qwen35State, m : &mut Mtp35State, pos : i32, predict : bool, vocab : i32) -> void {
+pub fn mtp35_step(w : &Qwen35Weights, s : &mut Qwen35State, m : &mut Mtp35State, pos : i32, predict : bool, vocab : i32) -> void {
   let c = &w.config;
   let eps = c.rms_norm_eps as f32;
   let hidden = c.hidden_size;
@@ -201,7 +201,7 @@ fn mtp35_step(w : &Qwen35Weights, s : &mut Qwen35State, m : &mut Mtp35State, pos
 /// of position start + i, r.xn[i], and r.next[i], the token that the round gives after it. The
 /// rows use the kernels and the tensors of the round, so they come after `commit_round35`. After
 /// them, m.token and m.h are the inputs of the next draft.
-fn mtp35_rows(w : &Qwen35Weights, s : &mut Qwen35State, r : &mut Round35, m : &mut Mtp35State, start : i32, n : i32, vocab : i32) -> void {
+pub fn mtp35_rows(w : &Qwen35Weights, s : &mut Qwen35State, r : &mut Round35, m : &mut Mtp35State, start : i32, n : i32, vocab : i32) -> void {
   let c = &w.config;
   let eps = c.rms_norm_eps as f32;
   let hidden = c.hidden_size;
@@ -267,7 +267,7 @@ fn pf35_mtp_chunk(w : &Qwen35Weights, s : &Qwen35State, m : &mut Mtp35State, p :
 
 /// `prefill_qwen35_with`, and rows 0 to count - 2 of the MTP layer. After it, `s.xn` holds no
 /// value that a later step reads; `predict_qwen35` gives h of the last position in s.xn.
-fn prefill_qwen35_mtp(w : &Qwen35Weights, s : &mut Qwen35State, m : &mut Mtp35State, p : &mut Prefill35, prompt : &Vec<i32>) -> void {
+pub fn prefill_qwen35_mtp(w : &Qwen35Weights, s : &mut Qwen35State, m : &mut Mtp35State, p : &mut Prefill35, prompt : &Vec<i32>) -> void {
   let c = &w.config;
   let count = prompt.len();
   assert(count > 0 && count <= s.max_seq, "prefill_qwen35_mtp: the prompt must have tokens and fit in the state");

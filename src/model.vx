@@ -58,7 +58,7 @@ struct State {
 
 /// The state for up to `max_seq` positions. The angles of RoPE are computed in f64, as in
 /// `reference.py`, and rounded to f32 once.
-fn new_state(c : &Config, max_seq : i32) -> State {
+pub fn new_state(c : &Config, max_seq : i32) -> State {
   assert(max_seq > 0 && max_seq <= c.max_positions, "max_seq must be between 1 and the max_positions of the model");
   let half = c.head_dim / 2;
   let mut hcos = Tensor<f32>([max_seq, half]);
@@ -109,7 +109,7 @@ fn new_state(c : &Config, max_seq : i32) -> State {
 }
 
 /// y = m x, with the kernel for the dtype of `m`, which has `rows` x `cols` weights.
-fn matvec(y : &mut Tensor<f32, [?], Memory::HBM>, m : &WeightMatrix, x : &Tensor<f32, [?], Memory::HBM>, rows : i32, cols : i32) -> void {
+pub fn matvec(y : &mut Tensor<f32, [?], Memory::HBM>, m : &WeightMatrix, x : &Tensor<f32, [?], Memory::HBM>, rows : i32, cols : i32) -> void {
   if m.dtype == U6 {
     matvec_q6(y, &m.codes, &m.high, &m.group_scales, x, rows, cols);
   } else if m.dtype == U4 {
@@ -123,7 +123,7 @@ fn matvec(y : &mut Tensor<f32, [?], Memory::HBM>, m : &WeightMatrix, x : &Tensor
 }
 
 /// y += m x.
-fn matvec_add(y : &mut Tensor<f32, [?], Memory::HBM>, m : &WeightMatrix, x : &Tensor<f32, [?], Memory::HBM>, rows : i32, cols : i32) -> void {
+pkg fn matvec_add(y : &mut Tensor<f32, [?], Memory::HBM>, m : &WeightMatrix, x : &Tensor<f32, [?], Memory::HBM>, rows : i32, cols : i32) -> void {
   if m.dtype == U4 {
     nn_matvec_q4_add(y, &m.codes, &m.group_scales, x, rows, cols);
   } else if m.dtype == F8E4M3 {
@@ -135,7 +135,7 @@ fn matvec_add(y : &mut Tensor<f32, [?], Memory::HBM>, m : &WeightMatrix, x : &Te
 }
 
 /// y += m x, for x of [heads, head_dim].
-fn matvec_heads_add(y : &mut Tensor<f32, [?], Memory::HBM>, m : &WeightMatrix, x : &Tensor<f32, [?, ?], Memory::HBM>, rows : i32, heads : i32, head_dim : i32) -> void {
+pub fn matvec_heads_add(y : &mut Tensor<f32, [?], Memory::HBM>, m : &WeightMatrix, x : &Tensor<f32, [?, ?], Memory::HBM>, rows : i32, heads : i32, head_dim : i32) -> void {
   if m.dtype == U4 {
     matvec_q4_heads_add_blocks(y, &m.codes, &m.group_scales, x, rows, heads, head_dim);
   } else if m.dtype == F8E4M3 {
@@ -147,7 +147,7 @@ fn matvec_heads_add(y : &mut Tensor<f32, [?], Memory::HBM>, m : &WeightMatrix, x
 }
 
 /// The Q, K and V of x: m x + b, split by heads.
-fn qkv(q : &mut Tensor<f32, [?, ?], Memory::HBM>, k : &mut Tensor<f32, [?, ?], Memory::HBM>, v : &mut Tensor<f32, [?, ?], Memory::HBM>, m : &WeightMatrix, b : &Tensor<bf16, [?], Memory::HBM>, x : &Tensor<f32, [?], Memory::HBM>, c : &Config) -> void {
+pub fn qkv(q : &mut Tensor<f32, [?, ?], Memory::HBM>, k : &mut Tensor<f32, [?, ?], Memory::HBM>, v : &mut Tensor<f32, [?, ?], Memory::HBM>, m : &WeightMatrix, b : &Tensor<bf16, [?], Memory::HBM>, x : &Tensor<f32, [?], Memory::HBM>, c : &Config) -> void {
   if m.dtype == U4 {
     qkv_q4_blocks(q, k, v, &m.codes, &m.group_scales, b, x, c.num_q_heads, c.num_kv_heads, c.head_dim, c.hidden_size);
   } else if m.dtype == F8E4M3 {
@@ -192,7 +192,7 @@ fn add_experts(e : &mut Experts, x : &mut Tensor<f32, [?], Memory::HBM>, xn : &T
 
 /// Runs the token in `token` at position `pos` through every layer. The hidden state of the
 /// token is then in `s.x`, and its keys and values are in the caches.
-fn run_layers(w : &Weights, s : &mut State, token : &Tensor<i32, [?], Memory::HBM>, pos : i32) -> void {
+pub fn run_layers(w : &Weights, s : &mut State, token : &Tensor<i32, [?], Memory::HBM>, pos : i32) -> void {
   let c = &w.config;
   let eps = c.rms_norm_eps as f32;
   assert(pos >= 0 && pos < s.max_seq, "the position is past the end of the KV cache");
@@ -227,7 +227,7 @@ fn run_layers(w : &Weights, s : &mut State, token : &Tensor<i32, [?], Memory::HB
 
 /// The logits of the token whose hidden state is in `s.x`, and in `next` the index of the largest
 /// one. Both stay in GPU memory.
-fn predict(w : &Weights, s : &mut State, next : &mut Tensor<i32, [?], Memory::HBM>) -> void {
+pub fn predict(w : &Weights, s : &mut State, next : &mut Tensor<i32, [?], Memory::HBM>) -> void {
   let c = &w.config;
   nn_rms_norm(&mut s.xn, &s.x, &w.final_norm, c.hidden_size, c.rms_norm_eps as f32);
   if c.tied_embeddings {

@@ -15,8 +15,8 @@ import std::mmap;
 import std::vec;
 
 extern {
-  fn strlen(s : *const i8) -> i64;
-  fn write(fd : i32, buf : *const i8, n : i64) -> i64;
+  pkg fn strlen(s : *const i8) -> i64;
+  pkg fn write(fd : i32, buf : *const i8, n : i64) -> i64;
 }
 
 /// The bytes "VXQTOK01" at the start of the file, read as one little-endian i64.
@@ -85,7 +85,7 @@ fn table(base : *mut i8, size : i64, index : i64) -> *mut i8 {
 }
 
 /// Maps the tokenizer file at `path` into memory.
-fn load_tokenizer(path : *const i8) -> Tokenizer {
+pub fn load_tokenizer(path : *const i8) -> Tokenizer {
   let fd : i32 = unsafe { open(path, 0) };
   assert(fd >= 0, "cannot open the tokenizer file");
   let size : i64 = unsafe { lseek(fd, 0, 2) };
@@ -129,7 +129,7 @@ fn load_tokenizer(path : *const i8) -> Tokenizer {
 }
 
 /// A tokenizer with no tokens, for a program that does not load one.
-fn no_tokenizer() -> Tokenizer {
+pub fn no_tokenizer() -> Tokenizer {
   let none : *mut i8 = unsafe { 0 as *mut i8 };
   return Tokenizer {
     base: none, size: 0, n_tokens: 0, n_merges: 0, n_added: 0, n_letters: 0, n_numbers: 0,
@@ -595,7 +595,7 @@ fn encode_ordinary(t : &Tokenizer, text : *const i8, start : i64, end : i64, out
 }
 
 /// The number of bytes of token `id`.
-fn token_length(t : &Tokenizer, id : i32) -> i64 {
+pkg fn token_length(t : &Tokenizer, id : i32) -> i64 {
   let first = unsafe { t.token_starts[id] };
   let last = unsafe { t.token_starts[id + 1] };
   return (last - first) as i64;
@@ -626,7 +626,7 @@ fn added_at(t : &Tokenizer, text : *const i8, at : i64, length : i64) -> i32 {
 }
 
 /// The token ids of the `length` bytes of UTF-8 text at `text`.
-fn encode(t : &Tokenizer, text : *const i8, length : i64) -> Vec<i32> {
+pub fn encode(t : &Tokenizer, text : *const i8, length : i64) -> Vec<i32> {
   let mut out = Vec<i32>::new();
   let mut segment : i64 = 0;
   let mut i : i64 = 0;
@@ -653,7 +653,7 @@ fn encode_c_str(t : &Tokenizer, text : *const i8) -> Vec<i32> {
 // ------------------------------------------------------------ decode ---
 
 /// Whether `id` is a special added token, such as <|im_end|>.
-fn is_special(t : &Tokenizer, id : i32) -> bool {
+pub fn is_special(t : &Tokenizer, id : i32) -> bool {
   for k in 0..t.n_added {
     if unsafe { t.added_tokens[k] } == id {
       return unsafe { t.added_special[k] } != 0;
@@ -674,7 +674,7 @@ fn added_token(t : &Tokenizer, name : *const i8) -> i32 {
 
 /// Writes the bytes of token `id` to standard output. A token can hold part of a UTF-8
 /// character, so the bytes of the next tokens complete it.
-fn write_token(t : &Tokenizer, id : i32) -> void {
+pub fn write_token(t : &Tokenizer, id : i32) -> void {
   assert(id >= 0 && id < t.n_tokens, "the token is not in the vocabulary");
   let first = unsafe { t.token_starts[id] } as i64;
   let size = token_length(t, id);
@@ -685,7 +685,7 @@ fn write_token(t : &Tokenizer, id : i32) -> void {
 }
 
 /// Writes the `length` bytes at `text` to standard output.
-fn write_bytes(text : *const i8, length : i64) -> void {
+pub fn print_bytes(text : *const i8, length : i64) -> void {
   if length > 0 {
     unsafe { write(1, text, length); }
   }
@@ -701,7 +701,7 @@ struct Text {
 }
 
 /// The bytes of the file at `path`, mapped into memory. An empty file has no bytes.
-fn read_text_file(path : *const i8) -> Text {
+pub fn read_text_file(path : *const i8) -> Text {
   let fd : i32 = unsafe { open(path, 0) };
   assert(fd >= 0, "cannot open the text file");
   let size : i64 = unsafe { lseek(fd, 0, 2) };
@@ -721,14 +721,14 @@ fn read_text_file(path : *const i8) -> Text {
 }
 
 /// The NUL-terminated text at `text`.
-fn c_text(text : *const i8) -> Text {
+pub fn c_text(text : *const i8) -> Text {
   return Text {
     bytes: text as *mut i8, length: unsafe { strlen(text) }
   };
 }
 
 /// Copies `length` bytes from `from` to `to`.
-fn copy_bytes(to : *mut i8, from : *const i8, length : i64) -> void {
+pub fn copy_bytes(to : *mut i8, from : *const i8, length : i64) -> void {
   let mut i : i64 = 0;
   while i < length {
     unsafe { to[i] = from[i]; }
@@ -740,7 +740,7 @@ fn copy_bytes(to : *mut i8, from : *const i8, length : i64) -> void {
 /// The request `text` in the chat format of the Qwen Instruct models, with no system message:
 /// <|im_start|>user, a new line, the text, <|im_end|>, a new line, <|im_start|>assistant and a new
 /// line. The tokens of the whole are not always the tokens of the parts, so this makes one text.
-fn chat_text(text : &Text) -> Text {
+pub fn chat_text(text : &Text) -> Text {
   let before = c_text("<|im_start|>user
 ");
   let after = c_text("<|im_end|>

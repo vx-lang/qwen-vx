@@ -93,7 +93,7 @@ fn round35_zeros(a : i32, b : i32) -> Tensor<f32, [?, ?], Memory::HBM> {
 }
 
 /// Whether the round kernels can run model `w`: Q4_0 layers and experts, and a 6-bit lm_head.
-fn can_round35(w : &Qwen35Weights) -> bool {
+pub fn can_round35(w : &Qwen35Weights) -> bool {
   let mut ok = w.lm_head.dtype == U6;
   for l in 0..w.config.num_layers {
     ok = ok && w.layers[l].gate_up.dtype == U4 && w.layers[l].down.dtype == U4 && w.layers[l].shared_gate_up.dtype == U4 && w.layers[l].shared_down.dtype == U4;
@@ -106,7 +106,7 @@ fn can_round35(w : &Qwen35Weights) -> bool {
   return ok;
 }
 
-fn new_round35(c : &Config) -> Round35 {
+pub fn new_round35(c : &Config) -> Round35 {
   let n = ROUND_MAX;
   let kh = c.linear_k_heads;
   let vh = c.linear_v_heads;
@@ -170,7 +170,7 @@ fn new_round35(c : &Config) -> Round35 {
 // ---------------------------------------------------------------------------- small kernels ---
 
 /// `rms_norm_f32` for each of n rows.
-fn rms_norm_f32_rows(y : &mut Tensor<f32, [?, ?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<f32, [?], Memory::HBM>, n : i32, dim : i32, eps : f32) -> void {
+pkg fn rms_norm_f32_rows(y : &mut Tensor<f32, [?, ?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<f32, [?], Memory::HBM>, n : i32, dim : i32, eps : f32) -> void {
   assert(n > 0 && y.extent(0) >= n && x.extent(0) >= n && y.extent(1) >= dim && x.extent(1) >= dim && w.len() >= dim, "rms_norm_f32_rows: a tensor is too small");
   spawn on(Topology::Device) {
     for t in 0..n across blocks {
@@ -201,7 +201,7 @@ fn rms_norm_f32_rows(y : &mut Tensor<f32, [?, ?], Memory::HBM>, x : &Tensor<f32,
 
 /// x[t][i] += a[t][i], for t below n: the residual add of `nn_matvec_q4_add`, after
 /// `nn_matvec_q4_rows` wrote the products to `a`.
-fn add_rows(x : &mut Tensor<f32, [?, ?], Memory::HBM>, a : &Tensor<f32, [?, ?], Memory::HBM>, n : i32, dim : i32) -> void {
+pkg fn add_rows(x : &mut Tensor<f32, [?, ?], Memory::HBM>, a : &Tensor<f32, [?, ?], Memory::HBM>, n : i32, dim : i32) -> void {
   spawn on(Topology::Device) {
     for t in 0..n across blocks {
       for b in 0..(dim + 255) / 256 across blocks {
@@ -218,7 +218,7 @@ fn add_rows(x : &mut Tensor<f32, [?, ?], Memory::HBM>, a : &Tensor<f32, [?, ?], 
 }
 
 /// y[i] = x[t][i], for i below dim.
-fn take_row(y : &mut Tensor<f32, [?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, t : i32, dim : i32) -> void {
+pkg fn take_row(y : &mut Tensor<f32, [?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, t : i32, dim : i32) -> void {
   spawn on(Topology::Device) {
     for b in 0..(dim + 255) / 256 across blocks {
       for l in 0..256 across lanes {
@@ -233,7 +233,7 @@ fn take_row(y : &mut Tensor<f32, [?], Memory::HBM>, x : &Tensor<f32, [?, ?], Mem
 }
 
 /// out[t][0] = sigmoid(logits[t][at]), for t below n: `shared_gate` for each row.
-fn shared_gate_rows(out : &mut Tensor<f32, [?, ?], Memory::HBM>, logits : &Tensor<f32, [?, ?], Memory::HBM>, n : i32, at : i32) -> void {
+pkg fn shared_gate_rows(out : &mut Tensor<f32, [?, ?], Memory::HBM>, logits : &Tensor<f32, [?, ?], Memory::HBM>, n : i32, at : i32) -> void {
   spawn on(Topology::Device) {
     for b in 0..1 across blocks {
       for t in 0..ROUND_MAX across lanes {
@@ -484,7 +484,7 @@ fn round_dn_gated_norm(y : &mut Tensor<f32, [?, ?], Memory::HBM>, o : &Tensor<f3
 
 /// `moe_swiglu_q4_blocks` for n positions: out[t * k + e] gets the output of expert ids[t][e] for
 /// x[t]. A block runs the body of `moe_swiglu_q4_blocks` for one position and expert.
-fn moe_swiglu_q4_blocks_rows(out : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, ids : &Tensor<i32, [?, ?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, n : i32, k : i32, rows : i32, cols : i32, experts : i32) -> void {
+pkg fn moe_swiglu_q4_blocks_rows(out : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, ids : &Tensor<i32, [?, ?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, n : i32, k : i32, rows : i32, cols : i32, experts : i32) -> void {
   assert(k > 0 && n > 0 && ids.extent(0) >= n && ids.extent(1) >= k && x.extent(0) >= n && out.extent(0) >= n * k && out.extent(1) >= rows, "moe_swiglu_q4_blocks_rows: `ids` needs n rows of k values, `x` n rows, and `out` a row of rows values for each of the n * k");
   assert(rows % 8 == 0, "moe_swiglu_q4_blocks_rows: rows must be a multiple of 8");
   nn_check_q4(w.len(), scales.len(), x.extent(1), experts * 2 * rows, cols);
@@ -570,7 +570,7 @@ fn moe_swiglu_q4_blocks_rows(out : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &T
 /// `moe_down_q4_add_blocks` for n positions: y[t] += the experts ids[t] of h[t * k] to
 /// h[t * k + k - 1], times weights[t]. A block runs the body of `moe_down_q4_add_blocks` for one
 /// position.
-fn moe_down_q4_add_blocks_rows(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, ids : &Tensor<i32, [?, ?], Memory::HBM>, weights : &Tensor<f32, [?, ?], Memory::HBM>, h : &Tensor<f32, [?, ?], Memory::HBM>, n : i32, k : i32, rows : i32, cols : i32, experts : i32) -> void {
+pkg fn moe_down_q4_add_blocks_rows(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, ids : &Tensor<i32, [?, ?], Memory::HBM>, weights : &Tensor<f32, [?, ?], Memory::HBM>, h : &Tensor<f32, [?, ?], Memory::HBM>, n : i32, k : i32, rows : i32, cols : i32, experts : i32) -> void {
   assert(k > 0 && n > 0 && ids.extent(0) >= n && ids.extent(1) >= k && weights.extent(0) >= n && weights.extent(1) >= k && h.extent(0) >= n * k && h.extent(1) >= cols && y.extent(0) >= n, "moe_down_q4_add_blocks_rows: `ids` and `weights` need n rows of k values, `h` a row of cols values for each of the n * k, and `y` n rows");
   nn_check_q4(w.len(), scales.len(), cols, experts * rows, cols);
   assert(rows % 8 == 0 && y.extent(1) >= rows, "moe_down_q4_add_blocks_rows: rows must be a multiple of 8, and the output needs rows values");
@@ -653,7 +653,7 @@ fn moe_down_q4_add_blocks_rows(y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &T
 /// `run_qwen35_layers` and then `predict_qwen35` for each token in turn: r.next[t] gets the greedy
 /// token after token t. The KV caches get the rows of all n tokens. The DeltaNet states do not
 /// change: `commit_round35` writes them for the tokens that the caller keeps.
-fn run_round35(w : &Qwen35Weights, s : &mut Qwen35State, r : &mut Round35, tokens : &Vec<i32>, start : i32, n : i32) -> void {
+pub fn run_round35(w : &Qwen35Weights, s : &mut Qwen35State, r : &mut Round35, tokens : &Vec<i32>, start : i32, n : i32) -> void {
   let c = &w.config;
   let eps = c.rms_norm_eps as f32;
   let kh = c.linear_k_heads;
@@ -728,7 +728,7 @@ fn run_round35(w : &Qwen35Weights, s : &mut Qwen35State, r : &mut Round35, token
 
 /// Keeps the first `count` tokens of the last round: writes the DeltaNet states as `run_qwen35_layers`
 /// leaves them after those tokens, bit for bit. The KV caches already have their rows.
-fn commit_round35(w : &Qwen35Weights, s : &mut Qwen35State, r : &Round35, count : i32) -> void {
+pub fn commit_round35(w : &Qwen35Weights, s : &mut Qwen35State, r : &Round35, count : i32) -> void {
   let c = &w.config;
   let kh = c.linear_k_heads;
   let vh = c.linear_v_heads;
