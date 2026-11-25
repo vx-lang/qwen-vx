@@ -414,6 +414,27 @@ not read them.
 
 **Result.** The numbers come after a run that follows the benchmarking policy.
 
+### 19. Drafts from the context in the rounds of the MTP drafts
+
+**Problem.** In an edit, the output repeats long parts of the prompt. The drafts from the context
+(entry 14) then give long rounds whose drafts are all kept. The MTP drafts (entry 16) give at most
+L tokens in a round. But `--draft` and `--mtp` could not run together.
+
+**Change.**
+
+- With `--mtp` and `--draft D`, each round first finds the longest match in the context, as
+  `generate_with_drafts35` does. When the match has at least 16 tokens, the round drafts up to D
+  tokens of the context after the match. Otherwise it drafts from the MTP layer as before.
+- `--draft D,M` sets the shortest match to M. On the tuning prompts, matches of 12 to 15 tokens
+  often gave drafts that the round did not keep, and such a round costs more than the MTP round
+  that it replaces. So the default is 16, the longest match that `longest_match` finds.
+- Only the MTP rounds change the running mean of the kept MTP drafts.
+- The MTP rows of the kept tokens still run after each round, so the next MTP draft is ready.
+
+The text is the same as without drafts (`tests/generate_qwen35.vx`).
+
+**Result.** The numbers come after a run that follows the benchmarking policy.
+
 ## What did not help
 
 - **Other tile shapes for the Q4_0 products of a chunk, in Vx v0.0.4** (#19). Tiles of 32 tokens,

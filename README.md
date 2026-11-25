@@ -118,6 +118,10 @@ pip install -r requirements.txt
    gives another number, a multiple of 8. It needs a weight file with the MTP layer, which
    `scripts/convert.py --q4 --q6-lm-head` writes for Qwen3.6-35B-A3B.
 
+   `--mtp 3,5` drafts up to 5 tokens while the model keeps almost all drafts. With
+   `--mtp 3,5 --draft 11`, a round drafts up to 11 tokens from the context when the context has a
+   match of 16 tokens, and from the MTP layer otherwise. This helps in edits.
+
 1. Generate a few tokens with the NumPy reference. It prints the prompt as token ids:
 
    ```sh
