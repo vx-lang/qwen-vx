@@ -360,7 +360,12 @@ logits for position p + 2. llama.cpp uses this layer for its drafts.
   0.95, and K tokens while it is at least 0.85. Long drafts pay in edits, where almost all drafts
   are kept.
 
-**Result.** The numbers come after a run that follows the benchmarking policy.
+**Result.** In the run of 2026-11-25 ([`docs/benchmarks/2026-11-25-qwen36-m4-mtp/`](benchmarks/2026-11-25-qwen36-m4-mtp/README.md)), on the 12
+held-out prompts, `--mtp 3,5` took 14.74 ms a generated token against 22.31 ms without drafts
+(1.51×, faster on 12 of 12 prompts, 1.30× to 1.82×). It kept 84% of its drafts, 1.84 tokens for
+each check, and gave the text without drafts in 36 of 36 runs. Against llama.cpp with its MTP
+drafts (3 tokens, 17.10 ms), it is 1.16× (faster on 12 of 12 prompts). The run has entries 17 to 19
+too.
 
 ### 17. The attention and the lm_head of a round, for all positions at once (#110)
 
@@ -385,7 +390,8 @@ of a round did more work for each position than they must:
 
 Each position keeps the bits of a plain step (`tests/round35.vx`, `tests/round.vx`).
 
-**Result.** The numbers come after a run that follows the benchmarking policy.
+**Result.** The run of 2026-11-25 ([`docs/benchmarks/2026-11-25-qwen36-m4-mtp/`](benchmarks/2026-11-25-qwen36-m4-mtp/README.md)) measures this change
+only together with entries 16, 18 and 19 (entry 16 has the numbers).
 
 ### 18. The lm_head of a round: only the rows that can be the greedy token (#111)
 
@@ -412,7 +418,8 @@ The true error is about 3% of B. In the rounds of a bench on the real model, at 
 of the plain steps (`tests/round35.vx`). Only the other logits of a round change, and the app does
 not read them.
 
-**Result.** The numbers come after a run that follows the benchmarking policy.
+**Result.** The run of 2026-11-25 ([`docs/benchmarks/2026-11-25-qwen36-m4-mtp/`](benchmarks/2026-11-25-qwen36-m4-mtp/README.md)) measures this change
+only together with entries 16, 17 and 19 (entry 16 has the numbers).
 
 ### 19. Drafts from the context in the rounds of the MTP drafts (#113)
 
@@ -433,7 +440,12 @@ L tokens in a round. But `--draft` and `--mtp` could not run together.
 
 The text is the same as without drafts (`tests/generate_qwen35.vx`).
 
-**Result.** The numbers come after a run that follows the benchmarking policy.
+**Result.** In the run of 2026-11-25 ([`docs/benchmarks/2026-11-25-qwen36-m4-mtp/`](benchmarks/2026-11-25-qwen36-m4-mtp/README.md)),
+`--mtp 3,5 --draft 11` took 10.62 ms a generated token on the edit prompts, against 12.94 ms for
+`--mtp 3,5` (1.22×). On the other kinds, the two differ by 1% or less (0.99× to 1.01×). Over the 12
+held-out prompts, it is 1.05× `--mtp 3,5` (faster on 6 of 12, 0.99× to 1.29×), 1.59× the app
+without drafts, and 1.22× llama.cpp with its MTP drafts (14.04 against 17.10 ms, faster on 12 of
+12 prompts).
 
 ## What did not help
 

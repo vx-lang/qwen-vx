@@ -12,8 +12,23 @@ It runs these models:
 - Qwen3-Coder-30B-A3B-Instruct, an MoE model, in Q4_0.
 - The dense Qwen2.5-Coder models, such as 0.5B and 7B, with bf16, fp8 or Q4_0 weights.
 
-[`docs/benchmarks/`](docs/benchmarks) compares the program with llama.cpp on an M4 with 32 GB, as
-the benchmarking policy of the Vx repository asks.
+## Speed
+
+Qwen3.6-35B-A3B on a MacBook Air M4 with 32 GB, against llama.cpp b1b770d. Batch 1, greedy
+decoding, 512 generated tokens, on 12 held-out code prompts (edit, complete, write and explain).
+Generated tokens a second, the geometric mean over 3 runs of each prompt:
+
+| Decoding | qwen-vx | llama.cpp | Ratio | qwen-vx faster on |
+| --- | ---: | ---: | ---: | ---: |
+| Without drafts | 44.8 | 38.3 | 1.17× | 12 of 12 prompts |
+| MTP drafts: `--mtp 3,5 --draft 11` against `draft-mtp` (3 tokens) | 71.2 | 58.5 | 1.22× | 12 of 12 prompts |
+| Drafts from the context: `--draft 11` against `ngram-mod` | 56.3 | 46.0 | 1.22× | 11 of 12 prompts |
+
+The prompt runs at 1.08× to 1.21× the speed of llama.cpp from 512 to 8,192 tokens, and generated
+tokens at 1.16× to 1.21× after prompts of 64 to 32,768 tokens. With drafts, the text is the same as
+without drafts. The run followed the benchmarking policy of the Vx repository. Its report, with
+the setup, every run, the cases where qwen-vx is slower and the limits, is
+[`docs/benchmarks/2026-11-25-qwen36-m4-mtp/`](docs/benchmarks/2026-11-25-qwen36-m4-mtp/README.md).
 
 ## Install Vx
 
