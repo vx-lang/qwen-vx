@@ -1,0 +1,43 @@
+//===- model.vx - Qwen app --------------------------------------------*- Vx -*-===//
+//
+// Part of the Vx Project, under the Apache License v2.0 with LLVM Exceptions.
+// See LICENSE for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+// One token of a Qwen2 or Qwen3 MoE decoder on the GPU, with the kernels of `std::nn`. `State`
+// holds every tensor that a token writes, and the KV cache. It is made once, before the first
+// token, so the token loop allocates nothing.
+import core::convert;
+import core::num;
+import std::nn;
+import std::vec;
+import qwen::attention;
+import qwen::products;
+import qwen::q6;
+import qwen::weights;
+
+/// The keys and the values of every position so far, for one layer: [max_seq, kv_heads, head_dim].
+/// They are f16, half the memory of f32. The kernels compute in f32, and round only what they
+/// store here.
+struct Cache {
+  k : Tensor<f16, [?, ?, ?], Memory::HBM>,
+  v : Tensor<f16, [?, ?, ?], Memory::HBM>,
+}
+
+/// The tensors of a mixture-of-experts layer: the router's score of each expert, the chosen
+/// experts and their weights, and the SwiGLU output of each chosen expert, [experts_per_token,
+/// moe_intermediate_size].
+struct Experts {
+  router_logits : Tensor<f32, [?], Memory::HBM>,
+  ids : Tensor<i32, [?], Memory::HBM>,
+  weights : Tensor<f32, [?], Memory::HBM>,
+  mlp : Tensor<f32, [?, ?], Memory::HBM>,
+}
+
+/// The tensors that a token writes, in GPU memory, and one `Cache` for each layer. `cos` and `sin`
+/// are [max_seq, head_dim / 2].
+struct State {
+  max_seq : i32,
+  x : Tensor<f32, [?], Memory::HBM>,
+  xn : Tensor<f32, [?], Memory::

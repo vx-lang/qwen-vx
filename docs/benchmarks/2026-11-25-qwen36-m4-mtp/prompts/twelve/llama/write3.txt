@@ -1,0 +1,8 @@
+<|im_start|>user
+Write a Rust struct RingBuffer<T> with new, push, pop, len, is_empty and an iterator. Add unit tests.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+

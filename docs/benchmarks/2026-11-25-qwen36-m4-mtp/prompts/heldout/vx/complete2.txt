@@ -1,0 +1,111 @@
+<|im_start|>user
+`utils/memalg/shakedown.py`:
+
+```python
+#!/usr/bin/env python3
+"""Predict -> measure -> compare, end to end.
+
+The dry run. Its output is an error table for one memory link on the machine we already
+own, and its purpose is to find bugs in OUR harness -- a wrong formula, a mislabeled column, a
+unit mismatch -- before any GPU time is paid for. The MLSys admission matrix was dry-run the same
+way and it caught an 8x arithmetic error before any money was spent.
+
+Three steps, each of which can fail loudly:
+
+  predict  generate a Vx program that transfers a tile of each swept size, compile it against the
+           machine file, and harvest `--diagnostics-json` -> predicted picoseconds per hop.
+  measure  run the C benchmark -> achieved copy time per size.
+  compare  join on byte count, report signed relative error.
+
+The join is on `bytes`, which is why the extractor had to emit it: without a byte
+count in the prediction record there is nothing to join on and the two halves cannot be related at
+all.
+"""
+
+import argparse
+import csv
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+# The tile shapes swept. Square f32 tiles, so bytes = 4*d*d; chosen so the byte counts line up
+# with the measurement's powers of two.
+DIMS = [32, 64, 128, 256, 512, 1024, 2048, 4096]
+
+
+def tile_bytes(d):
+    return 4 * d * d
+
+
+def predict(vxc, machine, workdir):
+    """Compile one probe program per size and harvest its predicted hop costs.
+
+    One program per size rather than one program with every size: the resident-set check would
+    reject a program holding every tile at once, and a rejected compile emits no routes.
+    """
+    out = {}
+    for d in DIMS:
+        src = os.path.join(workdir, f"probe_{d}.vx")
+        with open(src, "w") as f:
+            f.write(
+                "fn main() -> i32 {\n"
+                f"  let tile : Tensor<f32, [{d}, {d}]> = Tensor<f32>([{d}, {d}]);\n"
+                "  let _h = transfer(tile, Memory::HBM);\n"
+                "  return 0;\n"
+                "}\n"
+            )
+        js = os.path.join(workdir, f"probe_{d}.json")
+        proc = subprocess.run(
+            [vxc, "--machine", machine, src, "--diagnostics-json", js, "--emit-mlir"],
+            capture_output=True,
+            text=True,
+        )
+        if not os.path.exists(js):
+            print(f"  !! no diagnostics for {d}x{d}: {proc.stderr.strip()[:200]}", file=sys.stderr)
+            continue
+        rec = json.load(open(js))
+        for r in rec.get("routes", []):
+            if r["path"] == ["CPU_DRAM", "HBM"] and r.get("derived_cost") is not None:
+                if r.get("derived_unit") != "ps":
+                    # A cycle-denominated cost cannot be compared against a wall-clock measurement
+                    # without a declared clock. Refusing beats silently treating cycles as ps.
+                    print(
+                        f"  !! {d}x{d}: predicted unit is {r['derived_unit']}, not ps -- "
+                        "cannot compare against wall-clock without a clock figure",
+                        file=sys.stderr,
+                    )
+                    continue
+                out[r["bytes"]] = r["derived_cost"]
+    return out
+
+
+def measure(binary):
+    proc = subprocess.run([binary], capture_output=True, text=True, check=True)
+    rows = {}
+    for row in csv.DictReader(proc.stdout.splitlines()):
+        rows[int(row["bytes"])] = {
+            "ns": float(row["median_ns"]),
+            "q1": float(row["q1_ns"]),
+            "q3": float(row["q3_ns"]),
+            "copy_gbps": float(row["copy_GBps"]),
+            "traffic_gbps": float(row["traffic_GBps"]),
+        }
+    return rows
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--vxc", default="target/release/vxc")
+    ap.add_argument("--machine", default="fleet/m4-uma.vx")
+    ap.add_argument("--bench", default="utils/memalg/measure_link")
+    ap.add_argument("--out", default=None, help="write the error table here as CSV")
+```
+
+This file stops in the middle. Continue it from exactly where it stops. Output only the rest of the file.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+

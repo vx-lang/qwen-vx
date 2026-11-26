@@ -1,0 +1,8 @@
+<|im_start|>user
+Write a Python module with a class LRUCache that has get, put and a capacity, built on OrderedDict. Add pytest tests for it.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+
