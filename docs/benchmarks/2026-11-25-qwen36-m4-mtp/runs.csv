@@ -1,0 +1,313 @@
+table,prompt,kind,round,program,setting,prompt_tokens,llama_prompt_tokens,prompt_ms,first_prompt_ms,later_prompt_ms,ms_per_token,timed_tokens,checks,drafted,accepted,flash_attn,threads,errors,log,start,end,rc,busy,gpu,same_text,same_chars
+A,context/ctx16384,ctx,1,llama-completion,,16384,16384,54128.2800,,,32.2700,255,,,,on,4,0,logs/A.llama.ctx16384.r1.txt,2026-11-25T10:28:38,2026-11-25T10:29:51,0,bash,0,,
+A,context/ctx16384,ctx,2,llama-completion,,16384,16384,53658.8400,,,32.3100,255,,,,on,4,0,logs/A.llama.ctx16384.r2.txt,2026-11-25T10:55:11,2026-11-25T10:56:23,0,bash,0,,
+A,context/ctx16384,ctx,3,llama-completion,,16384,16384,54465.3100,,,32.2600,255,,,,on,4,0,logs/A.llama.ctx16384.r3.txt,2026-11-25T11:28:22,2026-11-25T11:29:34,0,launchd,0,,
+A,context/ctx2048,ctx,1,llama-completion,,2048,2048,5062.4000,,,26.2600,255,,,,on,4,0,logs/A.llama.ctx2048.r1.txt,2026-11-25T10:19:53,2026-11-25T10:20:14,0,bash,0,,
+A,context/ctx2048,ctx,2,llama-completion,,2048,2048,5066.1200,,,26.2600,255,,,,on,4,0,logs/A.llama.ctx2048.r2.txt,2026-11-25T10:46:50,2026-11-25T10:47:11,0,3.7 agy,0,,
+A,context/ctx2048,ctx,3,llama-completion,,2048,2048,5067.6400,,,26.2800,255,,,,on,4,0,logs/A.llama.ctx2048.r3.txt,2026-11-25T11:19:17,2026-11-25T11:19:38,0,com.apple.AppleUserHIDDrivers,0,,
+A,context/ctx32768,ctx,1,llama-completion,,32768,32768,161093.5400,,,58.0000,255,,,,on,4,0,logs/A.llama.ctx32768.r1.txt,2026-11-25T10:35:59,2026-11-25T10:39:05,0,bash,0,,
+A,context/ctx32768,ctx,2,llama-completion,,32768,32768,163903.0300,,,58.9000,255,,,,on,4,0,logs/A.llama.ctx32768.r2.txt,2026-11-25T11:00:30,2026-11-25T11:03:38,0,networkserviceproxy,0,,
+A,context/ctx32768,ctx,3,llama-completion,,32768,32768,149761.3000,,,65.1000,255,,,,on,4,0,logs/A.llama.ctx32768.r3.txt,2026-11-25T11:35:32,2026-11-25T11:38:29,0,0.9 agy,0,,
+A,context/ctx512,ctx,1,llama-completion,,512,512,1216.4400,,,25.8200,255,,,,on,4,0,logs/A.llama.ctx512.r1.txt,2026-11-25T10:16:10,2026-11-25T10:16:27,0,contextstored,0,,
+A,context/ctx512,ctx,2,llama-completion,,512,512,1219.4000,,,26.0300,255,,,,on,4,0,logs/A.llama.ctx512.r2.txt,2026-11-25T10:43:12,2026-11-25T10:43:30,0,airportd,0,,
+A,context/ctx512,ctx,3,llama-completion,,512,512,1218.9700,,,26.4900,255,,,,on,4,0,logs/A.llama.ctx512.r3.txt,2026-11-25T11:15:46,2026-11-25T11:16:04,0,com.apple.AppleUserHIDDrivers,0,,
+A,context/ctx64,ctx,1,llama-completion,,64,64,251.5100,,,25.6700,255,,,,on,4,0,logs/A.llama.ctx64.r1.txt,2026-11-25T10:12:32,2026-11-25T10:12:49,0,AXVisualSupportAgent,0,,
+A,context/ctx64,ctx,2,llama-completion,,64,64,250.2800,,,25.9000,255,,,,on,4,0,logs/A.llama.ctx64.r2.txt,2026-11-25T10:39:45,2026-11-25T10:39:53,0,airportd,0,,
+A,context/ctx64,ctx,3,llama-completion,,64,64,251.5200,,,25.8200,255,,,,on,4,0,logs/A.llama.ctx64.r3.txt,2026-11-25T11:12:12,2026-11-25T11:12:29,0,xprotectd,0,,
+A,context/ctx8192,ctx,1,llama-completion,,8192,8192,22708.7100,,,28.0200,255,,,,on,4,0,logs/A.llama.ctx8192.r1.txt,2026-11-25T10:23:52,2026-11-25T10:24:32,0,com.apple.DriverKit-AppleBCMWLAN,0,,
+A,context/ctx8192,ctx,2,llama-completion,,8192,8192,22632.3200,,,27.8800,255,,,,on,4,0,logs/A.llama.ctx8192.r2.txt,2026-11-25T10:50:44,2026-11-25T10:51:24,0,com.apple.AppleUserHIDDrivers,0,,
+A,context/ctx8192,ctx,3,llama-completion,,8192,8192,22765.6700,,,28.1100,255,,,,on,4,0,logs/A.llama.ctx8192.r3.txt,2026-11-25T11:23:27,2026-11-25T11:24:07,0,distnoted,0,,
+A,context/ctx16384,ctx,1,qwen-vx,,16384,,45967.6361,,,26.6003,,,,,,,0,logs/A.vx.ctx16384.r1.txt,2026-11-25T10:25:12,2026-11-25T10:27:58,0,bash,0,,
+A,context/ctx16384,ctx,2,qwen-vx,,16384,,46380.3368,,,26.7552,,,,,,,0,logs/A.vx.ctx16384.r2.txt,2026-11-25T10:57:03,2026-11-25T10:59:49,0,bash,0,,
+A,context/ctx16384,ctx,3,qwen-vx,,16384,,46196.0106,,,26.5911,,,,,,,0,logs/A.vx.ctx16384.r3.txt,2026-11-25T11:24:47,2026-11-25T11:27:41,0,com.apple.AppleUserHIDDrivers,0,,
+A,context/ctx2048,ctx,1,qwen-vx,,2048,,4108.5272,,,22.6163,,,,,,,0,logs/A.vx.ctx2048.r1.txt,2026-11-25T10:17:08,2026-11-25T10:19:12,0,ZoomUpdater,0,,
+A,context/ctx2048,ctx,2,qwen-vx,,2048,,4109.4403,,,22.6181,,,,,,,0,logs/A.vx.ctx2048.r2.txt,2026-11-25T10:47:52,2026-11-25T10:50:04,0,launchd,0,,
+A,context/ctx2048,ctx,3,qwen-vx,,2048,,4110.9838,,,22.6272,,,,,,,0,logs/A.vx.ctx2048.r3.txt,2026-11-25T11:16:44,2026-11-25T11:18:37,0,com.apple.AppleUserHIDDrivers,0,,
+A,context/ctx32768,ctx,1,qwen-vx,,32768,,141011.3831,,,48.6566,,,,,,,0,logs/A.vx.ctx32768.r1.txt,2026-11-25T10:30:41,2026-11-25T10:35:09,0,cfprefsd,0,,
+A,context/ctx32768,ctx,2,qwen-vx,,32768,,147674.0570,,,50.4905,,,,,,,0,logs/A.vx.ctx32768.r2.txt,2026-11-25T11:04:19,2026-11-25T11:08:53,0,bash,0,,
+A,context/ctx32768,ctx,3,qwen-vx,,32768,,150820.0989,,,51.4064,,,,,,,0,logs/A.vx.ctx32768.r3.txt,2026-11-25T11:30:14,2026-11-25T11:34:52,0,xprotectd,0,,
+A,context/ctx512,ctx,1,qwen-vx,,512,,1122.1459,,,22.1971,,,,,,,0,logs/A.vx.ctx512.r1.txt,2026-11-25T10:13:29,2026-11-25T10:15:30,0,mediaanalysisd,0,,
+A,context/ctx512,ctx,2,qwen-vx,,512,,1121.1429,,,22.1604,,,,,,,0,logs/A.vx.ctx512.r2.txt,2026-11-25T10:44:10,2026-11-25T10:46:10,0,bash,0,,
+A,context/ctx512,ctx,3,qwen-vx,,512,,1122.3640,,,22.2036,,,,,,,0,logs/A.vx.ctx512.r3.txt,2026-11-25T11:13:09,2026-11-25T11:15:06,0,UserEventAgent,0,,
+A,context/ctx64,ctx,1,qwen-vx,,64,,262.7456,,,22.0815,,,,,,,0,logs/A.vx.ctx64.r1.txt,2026-11-25T10:09:43,2026-11-25T10:11:52,0,com.apple.AppleUserHIDDrivers,0,,
+A,context/ctx64,ctx,2,qwen-vx,,64,,262.0611,,,22.0487,,,,,,,0,logs/A.vx.ctx64.r2.txt,2026-11-25T10:40:33,2026-11-25T10:42:32,0,bash,0,,
+A,context/ctx64,ctx,3,qwen-vx,,64,,262.3756,,,22.0265,,,,,,,0,logs/A.vx.ctx64.r3.txt,2026-11-25T11:09:33,2026-11-25T11:11:32,0,com.apple.AppleUserHIDDrivers,0,,
+A,context/ctx8192,ctx,1,qwen-vx,,8192,,18890.1138,,,24.1591,,,,,,,0,logs/A.vx.ctx8192.r1.txt,2026-11-25T10:20:54,2026-11-25T10:23:12,0,trustd,0,,
+A,context/ctx8192,ctx,2,qwen-vx,,8192,,18989.6679,,,24.1602,,,,,,,0,logs/A.vx.ctx8192.r2.txt,2026-11-25T10:52:04,2026-11-25T10:54:31,0,WindowServer,0,,
+A,context/ctx8192,ctx,3,qwen-vx,,8192,,18947.3171,,,24.1139,,,,,,,0,logs/A.vx.ctx8192.r3.txt,2026-11-25T11:20:19,2026-11-25T11:22:47,0,bash,0,,
+C,heldout/complete1,complete,1,llama-completion,,1044,1044,2588.2400,,,26.1100,511,,,,on,4,0,logs/C.complete1.r1.completion.txt,2026-11-25T12:41:50,2026-11-25T12:42:16,0,2.1 agy,0,,
+C,heldout/complete1,complete,1,llama.cpp draft-mtp,3,1044,1044,2703.0000,,,18.1029,515,,459,362,on,4,0,logs/C.complete1.r1.mtp3.txt,2026-11-25T12:43:54,2026-11-25T12:44:08,0,bash,0,False,1055
+C,heldout/complete1,complete,1,llama.cpp ngram-mod,,1044,1044,2551.0000,,,26.2885,513,,0,0,on,4,0,logs/C.complete1.r1.ngram.txt,2026-11-25T12:42:56,2026-11-25T12:43:13,0,xprotectd,0,True,2085
+C,heldout/complete1,complete,1,qwen-vx,,1044,,2168.9289,,,22.2705,,,,,,,0,logs/C.complete1.r1.vx.txt,2026-11-25T12:30:44,2026-11-25T12:32:51,0,airportd,0,,
+C,heldout/complete1,complete,1,qwen-vx --draft,11,1044,,2167.6614,,,21.1836,,161,167,87,,,0,logs/C.complete1.r1.vxdraft11.txt,2026-11-25T12:33:31,2026-11-25T12:35:39,0,0.3 agy,0,True,1982
+C,heldout/complete1,complete,1,qwen-vx --mtp,,1044,,2230.0096,,,16.7782,,240,356,270,,,0,logs/C.complete1.r1.vxmtp.txt,2026-11-25T12:36:19,2026-11-25T12:38:22,0,0.4 agy,0,True,1982
+C,heldout/complete1,complete,1,qwen-vx --mtp --draft,11,1044,,2230.2980,,,16.7714,,240,356,270,,,0,logs/C.complete1.r1.vxmtpdraft11.txt,2026-11-25T12:39:02,2026-11-25T12:41:10,0,loginwindow,0,True,1982
+C,heldout/complete1,complete,2,llama-completion,,1044,1044,2572.6600,,,26.1300,511,,,,on,4,0,logs/C.complete1.r2.completion.txt,2026-11-25T15:24:28,2026-11-25T15:24:45,0,com.apple.AppleUserHIDDrivers,0,,
+C,heldout/complete1,complete,2,llama.cpp draft-mtp,3,1044,1044,2722.0000,,,17.1709,515,,459,362,on,4,0,logs/C.complete1.r2.mtp3.txt,2026-11-25T15:22:28,2026-11-25T15:22:50,0,com.apple.AppleUserHIDDrivers,0,False,1055
+C,heldout/complete1,complete,2,llama.cpp ngram-mod,,1044,1044,2551.0000,,,26.9298,513,,0,0,on,4,0,logs/C.complete1.r2.ngram.txt,2026-11-25T15:23:30,2026-11-25T15:23:48,0,com.apple.AppleUserHIDDrivers,0,True,2085
+C,heldout/complete1,complete,2,qwen-vx,,1044,,2169.7886,,,22.2324,,,,,,,0,logs/C.complete1.r2.vx.txt,2026-11-25T15:33:36,2026-11-25T15:35:30,0,com.apple.AppleUserHIDDrivers,0,,
+C,heldout/complete1,complete,2,qwen-vx --draft,11,1044,,2170.8639,,,21.1574,,161,167,87,,,0,logs/C.complete1.r2.vxdraft11.txt,2026-11-25T15:30:49,2026-11-25T15:32:56,0,com.apple.AppleUserHIDDrivers,0,True,1982
+C,heldout/complete1,complete,2,qwen-vx --mtp,,1044,,2230.0506,,,16.7627,,240,356,270,,,0,logs/C.complete1.r2.vxmtp.txt,2026-11-25T15:28:09,2026-11-25T15:30:09,0,UserEventAgent,0,True,1982
+C,heldout/complete1,complete,2,qwen-vx --mtp --draft,11,1044,,2230.4785,,,16.7800,,240,356,270,,,0,logs/C.complete1.r2.vxmtpdraft11.txt,2026-11-25T15:25:25,2026-11-25T15:27:29,0,xprotectd,0,True,1982
+C,heldout/complete1,complete,3,llama-completion,,1044,1044,2582.7100,,,26.0300,511,,,,on,4,0,logs/C.complete1.r3.completion.txt,2026-11-25T19:31:27,2026-11-25T19:31:53,0,bash,0,,
+C,heldout/complete1,complete,3,llama.cpp draft-mtp,3,1044,1044,2701.0000,,,17.8932,515,,459,362,on,4,0,logs/C.complete1.r3.mtp3.txt,2026-11-25T19:33:31,2026-11-25T19:33:45,0,airportd,0,False,1055
+C,heldout/complete1,complete,3,llama.cpp ngram-mod,,1044,1044,2551.0000,,,26.3333,513,,0,0,on,4,0,logs/C.complete1.r3.ngram.txt,2026-11-25T19:32:33,2026-11-25T19:32:51,0,bash,0,True,2085
+C,heldout/complete1,complete,3,qwen-vx,,1044,,2176.8820,,,22.3297,,,,,,,0,logs/C.complete1.r3.vx.txt,2026-11-25T19:20:27,2026-11-25T19:22:32,0,secd,0,,
+C,heldout/complete1,complete,3,qwen-vx --draft,11,1044,,2173.7106,,,21.2105,,161,167,87,,,0,logs/C.complete1.r3.vxdraft11.txt,2026-11-25T19:23:13,2026-11-25T19:25:19,0,WindowServer,0,True,1982
+C,heldout/complete1,complete,3,qwen-vx --mtp,,1044,,2233.4025,,,16.7734,,240,356,270,,,0,logs/C.complete1.r3.vxmtp.txt,2026-11-25T19:25:59,2026-11-25T19:28:02,0,com.apple.AppleUserHIDDrivers,0,True,1982
+C,heldout/complete1,complete,3,qwen-vx --mtp --draft,11,1044,,2236.3639,,,16.8289,,240,356,270,,,0,logs/C.complete1.r3.vxmtpdraft11.txt,2026-11-25T19:28:42,2026-11-25T19:30:47,0,com.apple.AppleUserHIDDrivers,0,True,1982
+C,heldout/complete2,complete,1,llama-completion,,1086,1086,2756.3800,,,26.2700,511,,,,on,4,0,logs/C.complete2.r1.completion.txt,2026-11-25T13:39:26,2026-11-25T13:39:52,0,com.apple.AppleUserHIDDrivers,0,,
+C,heldout/complete2,complete,1,llama.cpp draft-mtp,3,1086,1086,2862.0000,,,17.4806,516,,461,362,on,4,0,logs/C.complete2.r1.mtp3.txt,2026-11-25T13:41:30,2026-11-25T13:41:44,0,xprotectd,0,True,1938
+C,heldout/complete2,complete,1,llama.cpp ngram-mod,,1086,1086,2720.0000,,,26.3626,513,,0,0,on,4,0,logs/C.complete2.r1.ngram.txt,2026-11-25T13:40:32,2026-11-25T13:40:50,0,airportd,0,True,1938
+C,heldout/complete2,complete,1,qwen-vx,,1086,,2214.4506,,,22.3701,,,,,,,0,logs/C.complete2.r1.vx.txt,2026-11-25T13:26:36,2026-11-25T13:28:54,0,com.apple.AppleUserHIDDrivers,0,,
+C,heldout/complete2,complete,1,qwen-vx --draft,11,1086,,2213.2487,,,21.4173,,92,98,60,,,0,logs/C.complete2.r1.vxdraft11.txt,2026-11-25T13:30:55,2026-11-25T13:32:59,0,1.3 agy,0,True,1934
+C,heldout/complete2,complete,1,qwen-vx --mtp,,1086,,2275.9976,,,15.6653,,204,382,306,,,0,logs/C.complete2.r1.vxmtp.txt,2026-11-25T13:33:39,2026-11-25T13:35:53,0,bash,0,True,1934
+C,heldout/complete2,complete,1,qwen-vx --mtp --draft,11,1086,,2275.6503,,,15.6402,,204,382,306,,,0,logs/C.complete2.r1.vxmtpdraft11.txt,2026-11-25T13:36:33,2026-11-25T13:38:46,0,com.apple.AppleUserHIDDrivers,0,True,1934
+C,heldout/complete2,complete,2,llama-completion,,1086,1086,2735.8500,,,26.0400,511,,,,on,4,0,logs/C.complete2.r2.completion.txt,2026-11-25T16:30:23,2026-11-25T16:30:40,0,com.apple.DriverKit-AppleBCMWLAN,0,,
+C,heldout/complete2,complete,2,llama.cpp draft-mtp,3,1086,1086,2875.0000,,,18.0736,516,,461,362,on,4,0,logs/C.complete2.r2.mtp3.txt,2026-11-25T16:28:22,2026-11-25T16:28:45,0,bash,0,True,1938
+C,heldout/complete2,complete,2,llama.cpp ngram-mod,,1086,1086,2717.0000,,,26.3938,513,,0,0,on,4,0,logs/C.complete2.r2.ngram.txt,2026-11-25T16:29:25,2026-11-25T16:29:42,0,com.apple.AppleUserHIDDrivers,0,True,1938
+C,heldout/complete2,complete,2,qwen-vx,,1086,,2216.1660,,,22.3164,,,,,,,0,logs/C.complete2.r2.vx.txt,2026-11-25T16:39:44,2026-11-25T16:42:00,0,bash,0,,
+C,heldout/complete2,complete,2,qwen-vx --draft,11,1086,,2219.4591,,,21.3498,,92,98,60,,,0,logs/C.complete2.r2.vxdraft11.txt,2026-11-25T16:36:47,2026-11-25T16:38:54,0,com.apple.AppleUserHIDDrivers,0,True,1934
+C,heldout/complete2,complete,2,qwen-vx --mtp,,1086,,2278.5068,,,15.6769,,204,382,306,,,0,logs/C.complete2.r2.vxmtp.txt,2026-11-25T16:34:05,2026-11-25T16:36:07,0,AXVisualSupportAgent,0,True,1934
+C,heldout/complete2,complete,2,qwen-vx --mtp --draft,11,1086,,2276.0420,,,15.6605,,204,382,306,,,0,logs/C.complete2.r2.vxmtpdraft11.txt,2026-11-25T16:31:20,2026-11-25T16:33:25,0,com.apple.AppleUserHIDDrivers,0,True,1934
+C,heldout/complete2,complete,3,llama-completion,,1086,1086,2758.7400,,,26.0900,511,,,,on,4,0,logs/C.complete2.r3.completion.txt,2026-11-25T20:28:03,2026-11-25T20:28:29,0,WindowServer,0,,
+C,heldout/complete2,complete,3,llama.cpp draft-mtp,3,1086,1086,2885.0000,,,17.8140,516,,461,362,on,4,0,logs/C.complete2.r3.mtp3.txt,2026-11-25T20:30:07,2026-11-25T20:30:21,0,WindowServer,0,True,1938
+C,heldout/complete2,complete,3,llama.cpp ngram-mod,,1086,1086,2727.0000,,,26.3899,513,,0,0,on,4,0,logs/C.complete2.r3.ngram.txt,2026-11-25T20:29:09,2026-11-25T20:29:27,0,WindowServer,0,True,1938
+C,heldout/complete2,complete,3,qwen-vx,,1086,,2227.3967,,,22.3669,,,,,,,0,logs/C.complete2.r3.vx.txt,2026-11-25T20:17:05,2026-11-25T20:19:21,0,airportd,0,,
+C,heldout/complete2,complete,3,qwen-vx --draft,11,1086,,2220.3779,,,21.4167,,92,98,60,,,0,logs/C.complete2.r3.vxdraft11.txt,2026-11-25T20:20:01,2026-11-25T20:22:06,0,bash,0,True,1934
+C,heldout/complete2,complete,3,qwen-vx --mtp,,1086,,2282.1054,,,15.7109,,204,382,306,,,0,logs/C.complete2.r3.vxmtp.txt,2026-11-25T20:22:47,2026-11-25T20:24:49,0,WindowServer,0,True,1934
+C,heldout/complete2,complete,3,qwen-vx --mtp --draft,11,1086,,2282.5928,,,15.6665,,204,382,306,,,0,logs/C.complete2.r3.vxmtpdraft11.txt,2026-11-25T20:25:29,2026-11-25T20:27:23,0,com.apple.AppleUserHIDDrivers,0,True,1934
+C,heldout/complete3,complete,1,llama-completion,,1288,1288,3228.2200,,,26.1100,511,,,,on,4,0,logs/C.complete3.r1.completion.txt,2026-11-25T14:36:10,2026-11-25T14:36:36,0,com.apple.DriverKit-AppleBCMWLAN,0,,
+C,heldout/complete3,complete,1,llama.cpp draft-mtp,3,1288,1288,3366.0000,,,16.5883,515,,428,372,on,4,0,logs/C.complete3.r1.mtp3.txt,2026-11-25T14:38:17,2026-11-25T14:38:30,0,secd,0,False,1395
+C,heldout/complete3,complete,1,llama.cpp ngram-mod,,1288,1288,3197.0000,,,30.2710,513,,41,41,on,4,0,logs/C.complete3.r1.ngram.txt,2026-11-25T14:37:16,2026-11-25T14:37:36,0,bash,0,False,1395
+C,heldout/complete3,complete,1,qwen-vx,,1288,,2655.4687,,,22.3249,,,,,,,0,logs/C.complete3.r1.vx.txt,2026-11-25T14:25:01,2026-11-25T14:27:10,0,loginwindow,0,,
+C,heldout/complete3,complete,1,qwen-vx --draft,11,1288,,2656.0371,,,18.3635,,139,334,210,,,0,logs/C.complete3.r1.vxdraft11.txt,2026-11-25T14:27:50,2026-11-25T14:29:55,0,com.apple.DriverKit-AppleBCMWLAN,0,True,1384
+C,heldout/complete3,complete,1,qwen-vx --mtp,,1288,,2730.8335,,,13.9710,,152,418,358,,,0,logs/C.complete3.r1.vxmtp.txt,2026-11-25T14:30:35,2026-11-25T14:32:38,0,PerfPowerServices,0,True,1384
+C,heldout/complete3,complete,1,qwen-vx --mtp --draft,11,1288,,2731.9930,,,13.7800,,133,473,377,,,0,logs/C.complete3.r1.vxmtpdraft11.txt,2026-11-25T14:33:18,2026-11-25T14:35:30,0,bash,0,True,1384
+C,heldout/complete3,complete,2,llama-completion,,1288,1288,3223.5000,,,26.3500,511,,,,on,4,0,logs/C.complete3.r2.completion.txt,2026-11-25T17:51:42,2026-11-25T17:52:00,0,bash,0,,
+C,heldout/complete3,complete,2,llama.cpp draft-mtp,3,1288,1288,3381.0000,,,16.4175,515,,428,372,on,4,0,logs/C.complete3.r2.mtp3.txt,2026-11-25T17:49:39,2026-11-25T17:50:02,0,WindowServer,0,False,1395
+C,heldout/complete3,complete,2,llama.cpp ngram-mod,,1288,1288,3197.0000,,,30.2339,513,,41,41,on,4,0,logs/C.complete3.r2.ngram.txt,2026-11-25T17:50:42,2026-11-25T17:51:02,0,com.apple.AppleUserHIDDrivers,0,False,1395
+C,heldout/complete3,complete,2,qwen-vx,,1288,,2664.2659,,,22.3808,,,,,,,0,logs/C.complete3.r2.vx.txt,2026-11-25T18:28:59,2026-11-25T18:31:08,0,com.apple.AppleUserHIDDrivers,0,,
+C,heldout/complete3,complete,2,qwen-vx --draft,11,1288,,2651.8629,,,18.4372,,139,334,210,,,0,logs/C.complete3.r2.vxdraft11.txt,2026-11-25T22:44:04,2026-11-25T22:46:20,0,com.apple.AppleUserHIDDrivers,0,True,1384
+C,heldout/complete3,complete,2,qwen-vx --mtp,,1288,,2752.4467,,,14.1535,,152,418,358,,,0,logs/C.complete3.r2.vxmtp.txt,2026-11-25T17:55:11,2026-11-25T17:57:13,0,WindowServer,0,True,1384
+C,heldout/complete3,complete,2,qwen-vx --mtp --draft,11,1288,,2741.7710,,,13.8112,,133,473,377,,,0,logs/C.complete3.r2.vxmtpdraft11.txt,2026-11-25T17:52:40,2026-11-25T17:54:30,0,WindowServer,0,True,1384
+C,heldout/complete3,complete,3,llama-completion,,1288,1288,3234.4800,,,26.0900,511,,,,on,4,0,logs/C.complete3.r3.completion.txt,2026-11-25T21:26:24,2026-11-25T21:26:51,0,WindowServer,0,,
+C,heldout/complete3,complete,3,llama.cpp draft-mtp,3,1288,1288,3387.0000,,,16.6913,515,,428,372,on,4,0,logs/C.complete3.r3.mtp3.txt,2026-11-25T21:29:01,2026-11-25T21:29:15,0,WindowServer,0,False,1395
+C,heldout/complete3,complete,3,llama.cpp ngram-mod,,1288,1288,3204.0000,,,30.2963,513,,41,41,on,4,0,logs/C.complete3.r3.ngram.txt,2026-11-25T21:27:31,2026-11-25T21:27:51,0,WindowServer,0,False,1395
+C,heldout/complete3,complete,3,qwen-vx,,1288,,2668.7651,,,22.4049,,,,,,,0,logs/C.complete3.r3.vx.txt,2026-11-25T21:15:03,2026-11-25T21:17:21,0,WindowServer,0,,
+C,heldout/complete3,complete,3,qwen-vx --draft,11,1288,,2658.5958,,,18.4348,,139,334,210,,,0,logs/C.complete3.r3.vxdraft11.txt,2026-11-25T21:18:01,2026-11-25T21:20:06,0,com.apple.AppleUserHIDDrivers,0,True,1384
+C,heldout/complete3,complete,3,qwen-vx --mtp,,1288,,2742.7275,,,14.0276,,152,418,358,,,0,logs/C.complete3.r3.vxmtp.txt,2026-11-25T21:20:46,2026-11-25T21:22:49,0,WindowServer,0,True,1384
+C,heldout/complete3,complete,3,qwen-vx --mtp --draft,11,1288,,2739.7311,,,13.8366,,133,473,377,,,0,logs/C.complete3.r3.vxmtpdraft11.txt,2026-11-25T21:23:29,2026-11-25T21:25:44,0,WindowServer,0,True,1384
+C,heldout/edit1,edit,1,llama-completion,,1668,1668,4227.9200,,,26.4600,511,,,,on,4,0,logs/C.edit1.r1.completion.txt,2026-11-25T12:27:05,2026-11-25T12:27:33,0,com.apple.DriverKit-AppleBCMWLAN,0,,
+C,heldout/edit1,edit,1,llama.cpp draft-mtp,3,1668,1668,4382.0000,,,15.9574,516,,405,381,on,4,0,logs/C.edit1.r1.mtp3.txt,2026-11-25T12:29:39,2026-11-25T12:29:53,0,airportd,0,True,1768
+C,heldout/edit1,edit,1,llama.cpp ngram-mod,,1668,1668,4163.0000,,,20.2281,513,,233,233,on,4,0,logs/C.edit1.r1.ngram.txt,2026-11-25T12:28:43,2026-11-25T12:28:59,0,bash,0,True,1768
+C,heldout/edit1,edit,1,qwen-vx,,1668,,3412.3409,,,22.4827,,,,,,,0,logs/C.edit1.r1.vx.txt,2026-11-25T12:16:06,2026-11-25T12:18:14,0,bash,0,,
+C,heldout/edit1,edit,1,qwen-vx --draft,11,1668,,3407.0940,,,13.8800,,107,404,337,,,0,logs/C.edit1.r1.vxdraft11.txt,2026-11-25T12:18:54,2026-11-25T12:20:59,0,xprotectd,0,True,1768
+C,heldout/edit1,edit,1,qwen-vx --mtp,,1668,,3504.5834,,,13.5390,,134,428,376,,,0,logs/C.edit1.r1.vxmtp.txt,2026-11-25T12:21:39,2026-11-25T12:23:42,0,bash,0,True,1768
+C,heldout/edit1,edit,1,qwen-vx --mtp --draft,11,1668,,3504.3292,,,12.0230,,91,481,419,,,0,logs/C.edit1.r1.vxmtpdraft11.txt,2026-11-25T12:24:22,2026-11-25T12:26:25,0,launchd,0,True,1768
+C,heldout/edit1,edit,2,llama-completion,,1668,1668,4209.7900,,,26.2900,511,,,,on,4,0,logs/C.edit1.r2.completion.txt,2026-11-25T15:09:31,2026-11-25T15:09:50,0,bash,0,,
+C,heldout/edit1,edit,2,llama.cpp draft-mtp,3,1668,1668,4404.0000,,,16.2112,516,,405,381,on,4,0,logs/C.edit1.r2.mtp3.txt,2026-11-25T15:07:41,2026-11-25T15:07:55,0,com.apple.DriverKit-AppleBCMWLAN,0,True,1768
+C,heldout/edit1,edit,2,llama.cpp ngram-mod,,1668,1668,4174.0000,,,20.3704,513,,233,233,on,4,0,logs/C.edit1.r2.ngram.txt,2026-11-25T15:08:35,2026-11-25T15:08:51,0,com.apple.AppleUserHIDDrivers,0,True,1768
+C,heldout/edit1,edit,2,qwen-vx,,1668,,3402.2446,,,22.3993,,,,,,,0,logs/C.edit1.r2.vx.txt,2026-11-25T15:19:40,2026-11-25T15:21:48,0,PerfPowerServices,0,,
+C,heldout/edit1,edit,2,qwen-vx --draft,11,1668,,3402.7846,,,13.8898,,107,404,337,,,0,logs/C.edit1.r2.vxdraft11.txt,2026-11-25T15:16:56,2026-11-25T15:19:00,0,3.7 agy,0,True,1768
+C,heldout/edit1,edit,2,qwen-vx --mtp,,1668,,3502.7447,,,13.5363,,134,428,376,,,0,logs/C.edit1.r2.vxmtp.txt,2026-11-25T15:13:12,2026-11-25T15:15:26,0,com.apple.DriverKit-AppleBCMWLAN,0,True,1768
+C,heldout/edit1,edit,2,qwen-vx --mtp --draft,11,1668,,3503.9628,,,12.0061,,91,481,419,,,0,logs/C.edit1.r2.vxmtpdraft11.txt,2026-11-25T15:10:30,2026-11-25T15:12:32,0,bash,0,True,1768
+C,heldout/edit1,edit,3,llama-completion,,1668,1668,4228.9700,,,26.2400,511,,,,on,4,0,logs/C.edit1.r3.completion.txt,2026-11-25T19:17:29,2026-11-25T19:17:56,0,com.apple.AppleUserHIDDrivers,0,,
+C,heldout/edit1,edit,3,llama.cpp draft-mtp,3,1668,1668,4395.0000,,,15.5368,516,,405,381,on,4,0,logs/C.edit1.r3.mtp3.txt,2026-11-25T19:19:32,2026-11-25T19:19:47,0,bash,0,True,1768
+C,heldout/edit1,edit,3,llama.cpp ngram-mod,,1668,1668,4187.0000,,,20.3528,513,,233,233,on,4,0,logs/C.edit1.r3.ngram.txt,2026-11-25T19:18:36,2026-11-25T19:18:52,0,bash,0,True,1768
+C,heldout/edit1,edit,3,qwen-vx,,1668,,3409.4727,,,22.4536,,,,,,,0,logs/C.edit1.r3.vx.txt,2026-11-25T19:06:24,2026-11-25T19:08:41,0,com.apple.AppleUserHIDDrivers,0,,
+C,heldout/edit1,edit,3,qwen-vx --draft,11,1668,,3412.9529,,,13.9119,,107,404,337,,,0,logs/C.edit1.r3.vxdraft11.txt,2026-11-25T19:09:31,2026-11-25T19:11:32,0,WindowServer,0,True,1768
+C,heldout/edit1,edit,3,qwen-vx --mtp,,1668,,3507.8199,,,13.5409,,134,428,376,,,0,logs/C.edit1.r3.vxmtp.txt,2026-11-25T19:12:12,2026-11-25T19:14:16,0,WindowServer,0,True,1768
+C,heldout/edit1,edit,3,qwen-vx --mtp --draft,11,1668,,3507.7875,,,12.0302,,91,481,419,,,0,logs/C.edit1.r3.vxmtpdraft11.txt,2026-11-25T19:14:56,2026-11-25T19:16:48,0,WindowServer,0,True,1768
+C,heldout/edit2,edit,1,llama-completion,,1286,1286,3212.9800,,,26.2900,511,,,,on,4,0,logs/C.edit2.r1.completion.txt,2026-11-25T13:23:47,2026-11-25T13:24:14,0,com.apple.AppleUserHIDDrivers,0,,
+C,heldout/edit2,edit,1,llama.cpp draft-mtp,3,1286,1286,3332.0000,,,15.0796,515,,390,385,on,4,0,logs/C.edit2.r1.mtp3.txt,2026-11-25T13:25:43,2026-11-25T13:25:56,0,dasd,0,True,2049
+C,heldout/edit2,edit,1,llama.cpp ngram-mod,,1286,1286,3177.0000,,,6.9081,577,,544,544,on,4,0,logs/C.edit2.r1.ngram.txt,2026-11-25T13:24:54,2026-11-25T13:25:03,0,com.apple.DriverKit-AppleBCMWLAN,0,True,2049
+C,heldout/edit2,edit,1,qwen-vx,,1286,,2651.1338,,,22.3422,,,,,,,0,logs/C.edit2.r1.vx.txt,2026-11-25T13:12:45,2026-11-25T13:14:54,0,com.apple.AppleUserHIDDrivers,0,,
+C,heldout/edit2,edit,1,qwen-vx --draft,11,1286,,2650.1749,,,9.0659,,48,462,462,,,0,logs/C.edit2.r1.vxdraft11.txt,2026-11-25T13:15:34,2026-11-25T13:17:35,0,com.apple.AppleUserHIDDrivers,0,True,2049
+C,heldout/edit2,edit,1,qwen-vx --mtp,,1286,,2726.0008,,,12.2403,,109,417,401,,,0,logs/C.edit2.r1.vxmtp.txt,2026-11-25T13:18:15,2026-11-25T13:20:16,0,bash,0,True,2049
+C,heldout/edit2,edit,1,qwen-vx --mtp --draft,11,1286,,2726.2435,,,9.5114,,48,467,462,,,0,logs/C.edit2.r1.vxmtpdraft11.txt,2026-11-25T13:20:56,2026-11-25T13:23:07,0,bash,0,True,2049
+C,heldout/edit2,edit,2,llama-completion,,1286,1286,3190.9000,,,26.5300,511,,,,on,4,0,logs/C.edit2.r2.completion.txt,2026-11-25T16:16:35,2026-11-25T16:16:53,0,com.apple.AppleUserHIDDrivers,0,,
+C,heldout/edit2,edit,2,llama.cpp draft-mtp,3,1286,1286,3358.0000,,,15.3903,515,,390,385,on,4,0,logs/C.edit2.r2.mtp3.txt,2026-11-25T16:14:44,2026-11-25T16:15:06,0,xprotectd,0,True,2049
+C,heldout/edit2,edit,2,llama.cpp ngram-mod,,1286,1286,3170.0000,,,7.1421,577,,544,544,on,4,0,logs/C.edit2.r2.ngram.txt,2026-11-25T16:15:46,2026-11-25T16:15:55,0,com.apple.AppleUserHIDDrivers,0,True,2049
+C,heldout/edit2,edit,2,qwen-vx,,1286,,2646.5898,,,22.3142,,,,,,,0,logs/C.edit2.r2.vx.txt,2026-11-25T16:25:37,2026-11-25T16:27:42,0,com.apple.AppleUserHIDDrivers,0,,
+C,heldout/edit2,edit,2,qwen-vx --draft,11,1286,,2648.7257,,,9.0513,,48,462,462,,,0,logs/C.edit2.r2.vxdraft11.txt,2026-11-25T16:22:56,2026-11-25T16:24:57,0,bash,0,True,2049
+C,heldout/edit2,edit,2,qwen-vx --mtp,,1286,,2723.2914,,,12.2388,,109,417,401,,,0,logs/C.edit2.r2.vxmtp.txt,2026-11-25T16:20:16,2026-11-25T16:22:16,0,ZoomUpdater,0,True,2049
+C,heldout/edit2,edit,2,qwen-vx --mtp --draft,11,1286,,2723.5990,,,9.4726,,48,467,462,,,0,logs/C.edit2.r2.vxmtpdraft11.txt,2026-11-25T16:17:33,2026-11-25T16:19:36,0,xprotectd,0,True,2049
+C,heldout/edit2,edit,3,llama-completion,,1286,1286,3217.5300,,,26.4200,511,,,,on,4,0,logs/C.edit2.r3.completion.txt,2026-11-25T20:14:17,2026-11-25T20:14:43,0,com.apple.AppleUserHIDDrivers,0,,
+C,heldout/edit2,edit,3,llama.cpp draft-mtp,3,1286,1286,3348.0000,,,15.3184,515,,390,385,on,4,0,logs/C.edit2.r3.mtp3.txt,2026-11-25T20:16:12,2026-11-25T20:16:25,0,com.apple.AppleUserHIDDrivers,0,True,2049
+C,heldout/edit2,edit,3,llama.cpp ngram-mod,,1286,1286,3180.0000,,,6.9307,577,,544,544,on,4,0,logs/C.edit2.r3.ngram.txt,2026-11-25T20:15:23,2026-11-25T20:15:32,0,bash,0,True,2049
+C,heldout/edit2,edit,3,qwen-vx,,1286,,2657.9332,,,22.3211,,,,,,,0,logs/C.edit2.r3.vx.txt,2026-11-25T20:03:05,2026-11-25T20:05:21,0,WindowServer,0,,
+C,heldout/edit2,edit,3,qwen-vx --draft,11,1286,,2660.9807,,,9.1284,,48,462,462,,,0,logs/C.edit2.r3.vxdraft11.txt,2026-11-25T20:06:02,2026-11-25T20:08:03,0,com.apple.DriverKit-AppleBCMWLAN,0,True,2049
+C,heldout/edit2,edit,3,qwen-vx --mtp,,1286,,2733.3550,,,12.2611,,109,417,401,,,0,logs/C.edit2.r3.vxmtp.txt,2026-11-25T20:08:53,2026-11-25T20:10:55,0,mdworker_shared,0,True,2049
+C,heldout/edit2,edit,3,qwen-vx --mtp --draft,11,1286,,2729.7268,,,9.5413,,48,467,462,,,0,logs/C.edit2.r3.vxmtpdraft11.txt,2026-11-25T20:11:35,2026-11-25T20:13:36,0,WindowServer,0,True,2049
+C,heldout/edit3,edit,1,llama-completion,,1605,1605,4070.3700,,,26.1500,511,,,,on,4,0,logs/C.edit3.r1.completion.txt,2026-11-25T14:21:58,2026-11-25T14:22:26,0,secd,0,,
+C,heldout/edit3,edit,1,llama.cpp draft-mtp,3,1605,1605,4240.0000,,,15.6957,516,,398,383,on,4,0,logs/C.edit3.r1.mtp3.txt,2026-11-25T14:23:57,2026-11-25T14:24:11,0,bash,0,True,1909
+C,heldout/edit3,edit,1,llama.cpp ngram-mod,,1605,1605,4026.0000,,,10.6082,513,,422,422,on,4,0,logs/C.edit3.r1.ngram.txt,2026-11-25T14:23:06,2026-11-25T14:23:16,0,com.apple.AppleUserHIDDrivers,0,True,1909
+C,heldout/edit3,edit,1,qwen-vx,,1605,,3278.2621,,,22.3999,,,,,,,0,logs/C.edit3.r1.vx.txt,2026-11-25T14:11:02,2026-11-25T14:13:11,0,loginwindow,0,,
+C,heldout/edit3,edit,1,qwen-vx --draft,11,1605,,3277.6890,,,10.5243,,51,437,422,,,0,logs/C.edit3.r1.vxdraft11.txt,2026-11-25T14:13:51,2026-11-25T14:15:53,0,launchd,0,True,1870
+C,heldout/edit3,edit,1,qwen-vx --mtp,,1605,,3371.6421,,,13.0523,,120,430,389,,,0,logs/C.edit3.r1.vxmtp.txt,2026-11-25T14:16:33,2026-11-25T14:18:34,0,com.apple.AppleUserHIDDrivers,0,True,1870
+C,heldout/edit3,edit,1,qwen-vx --mtp --draft,11,1605,,3373.2078,,,10.4564,,65,470,445,,,0,logs/C.edit3.r1.vxmtpdraft11.txt,2026-11-25T14:19:14,2026-11-25T14:21:18,0,0.7 sleep,0,True,1870
+C,heldout/edit3,edit,2,llama-completion,,1605,1605,4038.0100,,,26.3200,511,,,,on,4,0,logs/C.edit3.r2.completion.txt,2026-11-25T22:43:05,2026-11-25T22:43:23,0,mediaanalysisd,0,,
+C,heldout/edit3,edit,2,llama.cpp draft-mtp,3,1605,1605,4227.0000,,,15.3101,516,,398,383,on,4,0,logs/C.edit3.r2.mtp3.txt,2026-11-25T22:41:20,2026-11-25T22:41:34,0,com.apple.AppleUserHIDDrivers,0,True,1909
+C,heldout/edit3,edit,2,llama.cpp ngram-mod,,1605,1605,4004.0000,,,10.6121,513,,422,422,on,4,0,logs/C.edit3.r2.ngram.txt,2026-11-25T22:42:14,2026-11-25T22:42:25,0,bash,0,True,1909
+C,heldout/edit3,edit,2,qwen-vx,,1605,,3284.4131,,,22.3932,,,,,,,0,logs/C.edit3.r2.vx.txt,2026-11-25T17:46:40,2026-11-25T17:48:59,0,com.apple.AppleUserHIDDrivers,0,,
+C,heldout/edit3,edit,2,qwen-vx --draft,11,1605,,3281.4114,,,10.5544,,51,437,422,,,0,logs/C.edit3.r2.vxdraft11.txt,2026-11-25T17:43:46,2026-11-25T17:46:00,0,bash,0,True,1870
+C,heldout/edit3,edit,2,qwen-vx --mtp,,1605,,3372.4318,,,13.0750,,120,430,389,,,0,logs/C.edit3.r2.vxmtp.txt,2026-11-25T17:40:54,2026-11-25T17:43:05,0,dasd,0,True,1870
+C,heldout/edit3,edit,2,qwen-vx --mtp --draft,11,1605,,3379.4837,,,10.4934,,65,470,445,,,0,logs/C.edit3.r2.vxmtpdraft11.txt,2026-11-25T17:36:59,2026-11-25T17:39:14,0,15.1 agy,0,True,1870
+C,heldout/edit3,edit,3,llama-completion,,1605,1605,4071.9000,,,26.5200,511,,,,on,4,0,logs/C.edit3.r3.completion.txt,2026-11-25T21:12:10,2026-11-25T21:12:37,0,com.apple.DriverKit-AppleBCMWLAN,0,,
+C,heldout/edit3,edit,3,llama.cpp draft-mtp,3,1605,1605,4238.0000,,,16.1124,516,,398,383,on,4,0,logs/C.edit3.r3.mtp3.txt,2026-11-25T21:14:08,2026-11-25T21:14:23,0,WindowServer,0,True,1909
+C,heldout/edit3,edit,3,llama.cpp ngram-mod,,1605,1605,4028.0000,,,10.7641,513,,422,422,on,4,0,logs/C.edit3.r3.ngram.txt,2026-11-25T21:13:17,2026-11-25T21:13:28,0,bash,0,True,1909
+C,heldout/edit3,edit,3,qwen-vx,,1605,,3280.9324,,,22.4747,,,,,,,0,logs/C.edit3.r3.vx.txt,2026-11-25T21:00:53,2026-11-25T21:02:59,0,dasd,0,,
+C,heldout/edit3,edit,3,qwen-vx --draft,11,1605,,3282.0396,,,10.5480,,51,437,422,,,0,logs/C.edit3.r3.vxdraft11.txt,2026-11-25T21:03:39,2026-11-25T21:05:51,0,com.apple.AppleUserHIDDrivers,0,True,1870
+C,heldout/edit3,edit,3,qwen-vx --mtp,,1605,,3376.5440,,,13.0639,,120,430,389,,,0,logs/C.edit3.r3.vxmtp.txt,2026-11-25T21:06:41,2026-11-25T21:08:46,0,PerfPowerServices,0,True,1870
+C,heldout/edit3,edit,3,qwen-vx --mtp --draft,11,1605,,3375.7653,,,10.4853,,65,470,445,,,0,logs/C.edit3.r3.vxmtpdraft11.txt,2026-11-25T21:09:26,2026-11-25T21:11:29,0,bash,0,True,1870
+C,heldout/explain1,explain,1,llama-completion,,1503,1503,3644.3300,,,26.2100,511,,,,on,4,0,logs/C.explain1.r1.completion.txt,2026-11-25T13:09:43,2026-11-25T13:10:10,0,xprotectd,0,,
+C,heldout/explain1,explain,1,llama.cpp draft-mtp,3,1503,1503,3773.0000,,,20.3721,516,,529,339,on,4,0,logs/C.explain1.r1.mtp3.txt,2026-11-25T13:11:49,2026-11-25T13:12:05,0,cfprefsd,0,True,1943
+C,heldout/explain1,explain,1,llama.cpp ngram-mod,,1503,1503,3603.0000,,,26.3996,513,,0,0,on,4,0,logs/C.explain1.r1.ngram.txt,2026-11-25T13:10:50,2026-11-25T13:11:09,0,bash,0,True,1943
+C,heldout/explain1,explain,1,qwen-vx,,1503,,3049.3157,,,22.3532,,,,,,,0,logs/C.explain1.r1.vx.txt,2026-11-25T12:58:30,2026-11-25T13:00:37,0,bash,0,,
+C,heldout/explain1,explain,1,qwen-vx --draft,11,1503,,3049.6187,,,21.8011,,96,105,55,,,0,logs/C.explain1.r1.vxdraft11.txt,2026-11-25T13:01:17,2026-11-25T13:03:24,0,com.apple.AppleUserHIDDrivers,0,True,1902
+C,heldout/explain1,explain,1,qwen-vx --mtp,,1503,,3137.5952,,,17.1786,,245,353,264,,,0,logs/C.explain1.r1.vxmtp.txt,2026-11-25T13:04:04,2026-11-25T13:06:09,0,secd,0,True,1902
+C,heldout/explain1,explain,1,qwen-vx --mtp --draft,11,1503,,3138.1412,,,17.2024,,245,353,264,,,0,logs/C.explain1.r1.vxmtpdraft11.txt,2026-11-25T13:06:50,2026-11-25T13:09:03,0,airportd,0,True,1902
+C,heldout/explain1,explain,2,llama-completion,,1503,1503,3613.3400,,,26.3600,511,,,,on,4,0,logs/C.explain1.r2.completion.txt,2026-11-25T16:02:19,2026-11-25T16:02:37,0,bash,0,,
+C,heldout/explain1,explain,2,llama.cpp draft-mtp,3,1503,1503,3813.0000,,,20.2558,516,,529,339,on,4,0,logs/C.explain1.r2.mtp3.txt,2026-11-25T15:50:22,2026-11-25T15:50:47,0,launchd,0,True,1943
+C,heldout/explain1,explain,2,llama.cpp ngram-mod,,1503,1503,3581.0000,,,26.5341,513,,0,0,on,4,0,logs/C.explain1.r2.ngram.txt,2026-11-25T16:01:20,2026-11-25T16:01:38,0,xprotectd,0,True,1943
+C,heldout/explain1,explain,2,qwen-vx,,1503,,3047.5409,,,22.3728,,,,,,,0,logs/C.explain1.r2.vx.txt,2026-11-25T16:11:58,2026-11-25T16:14:04,0,com.apple.AppleUserHIDDrivers,0,,
+C,heldout/explain1,explain,2,qwen-vx --draft,11,1503,,3045.5558,,,21.7079,,96,105,55,,,0,logs/C.explain1.r2.vxdraft11.txt,2026-11-25T16:08:59,2026-11-25T16:11:18,0,com.apple.AppleUserHIDDrivers,0,True,1902
+C,heldout/explain1,explain,2,qwen-vx --mtp,,1503,,3131.1727,,,17.1932,,245,353,264,,,0,logs/C.explain1.r2.vxmtp.txt,2026-11-25T16:06:14,2026-11-25T16:08:19,0,bash,0,True,1902
+C,heldout/explain1,explain,2,qwen-vx --mtp --draft,11,1503,,3130.3205,,,17.1823,,245,353,264,,,0,logs/C.explain1.r2.vxmtpdraft11.txt,2026-11-25T16:03:17,2026-11-25T16:05:34,0,WindowServer,0,True,1902
+C,heldout/explain1,explain,3,llama-completion,,1503,1503,3663.2800,,,26.2400,511,,,,on,4,0,logs/C.explain1.r3.completion.txt,2026-11-25T20:00:03,2026-11-25T20:00:30,0,WindowServer,0,,
+C,heldout/explain1,explain,3,llama.cpp draft-mtp,3,1503,1503,3790.0000,,,20.0911,516,,529,339,on,4,0,logs/C.explain1.r3.mtp3.txt,2026-11-25T20:02:08,2026-11-25T20:02:24,0,WindowServer,0,True,1943
+C,heldout/explain1,explain,3,llama.cpp ngram-mod,,1503,1503,3618.0000,,,26.5302,513,,0,0,on,4,0,logs/C.explain1.r3.ngram.txt,2026-11-25T20:01:10,2026-11-25T20:01:28,0,WindowServer,0,True,1943
+C,heldout/explain1,explain,3,qwen-vx,,1503,,3055.8681,,,22.4812,,,,,,,0,logs/C.explain1.r3.vx.txt,2026-11-25T19:48:37,2026-11-25T19:50:55,0,networkserviceproxy,0,,
+C,heldout/explain1,explain,3,qwen-vx --draft,11,1503,,3058.0268,,,21.7976,,96,105,55,,,0,logs/C.explain1.r3.vxdraft11.txt,2026-11-25T19:51:35,2026-11-25T19:53:43,0,WindowServer,0,True,1902
+C,heldout/explain1,explain,3,qwen-vx --mtp,,1503,,3144.3477,,,17.2131,,245,353,264,,,0,logs/C.explain1.r3.vxmtp.txt,2026-11-25T19:54:23,2026-11-25T19:56:28,0,AXVisualSupportAgent,0,True,1902
+C,heldout/explain1,explain,3,qwen-vx --mtp --draft,11,1503,,3151.3653,,,17.2578,,245,353,264,,,0,logs/C.explain1.r3.vxmtpdraft11.txt,2026-11-25T19:57:08,2026-11-25T19:59:22,0,com.apple.AppleUserHIDDrivers,0,True,1902
+C,heldout/explain2,explain,1,llama-completion,,1330,1330,3309.3600,,,26.5500,511,,,,on,4,0,logs/C.explain2.r1.completion.txt,2026-11-25T14:08:01,2026-11-25T14:08:28,0,loginwindow,0,,
+C,heldout/explain2,explain,1,llama.cpp draft-mtp,3,1330,1330,3430.0000,,,19.0000,516,,483,355,on,4,0,logs/C.explain2.r1.mtp3.txt,2026-11-25T14:10:07,2026-11-25T14:10:22,0,airportd,0,True,2000
+C,heldout/explain2,explain,1,llama.cpp ngram-mod,,1330,1330,3270.0000,,,27.6823,513,,19,19,on,4,0,logs/C.explain2.r1.ngram.txt,2026-11-25T14:09:08,2026-11-25T14:09:27,0,identityservicesd,0,True,2000
+C,heldout/explain2,explain,1,qwen-vx,,1330,,2697.1352,,,22.3364,,,,,,,0,logs/C.explain2.r1.vx.txt,2026-11-25T13:56:42,2026-11-25T13:58:48,0,bash,0,,
+C,heldout/explain2,explain,1,qwen-vx --draft,11,1330,,2698.3886,,,20.4039,,108,176,110,,,0,logs/C.explain2.r1.vxdraft11.txt,2026-11-25T13:59:28,2026-11-25T14:01:35,0,com.apple.AppleUserHIDDrivers,0,True,2034
+C,heldout/explain2,explain,1,qwen-vx --mtp,,1330,,2775.3668,,,15.7067,,201,388,309,,,0,logs/C.explain2.r1.vxmtp.txt,2026-11-25T14:02:15,2026-11-25T14:04:28,0,bash,0,True,2034
+C,heldout/explain2,explain,1,qwen-vx --mtp --draft,11,1330,,2776.6137,,,16.0164,,202,406,307,,,0,logs/C.explain2.r1.vxmtpdraft11.txt,2026-11-25T14:05:09,2026-11-25T14:07:21,0,WindowServer,0,True,2034
+C,heldout/explain2,explain,2,llama-completion,,1330,1330,3265.4300,,,26.1400,511,,,,on,4,0,logs/C.explain2.r2.completion.txt,2026-11-25T17:01:10,2026-11-25T17:01:27,0,PerfPowerServices,0,,
+C,heldout/explain2,explain,2,llama.cpp draft-mtp,3,1330,1330,3434.0000,,,18.8391,516,,483,355,on,4,0,logs/C.explain2.r2.mtp3.txt,2026-11-25T16:56:56,2026-11-25T16:57:20,0,bash,0,True,2000
+C,heldout/explain2,explain,2,llama.cpp ngram-mod,,1330,1330,3264.0000,,,27.5789,513,,19,19,on,4,0,logs/C.explain2.r2.ngram.txt,2026-11-25T16:58:00,2026-11-25T16:58:19,0,loginwindow,0,True,2000
+C,heldout/explain2,explain,2,qwen-vx,,1330,,2697.5098,,,22.3569,,,,,,,0,logs/C.explain2.r2.vx.txt,2026-11-25T17:10:33,2026-11-25T17:12:50,0,airportd,0,,
+C,heldout/explain2,explain,2,qwen-vx --draft,11,1330,,2697.3882,,,20.4133,,108,176,110,,,0,logs/C.explain2.r2.vxdraft11.txt,2026-11-25T17:07:47,2026-11-25T17:09:53,0,bash,0,True,2034
+C,heldout/explain2,explain,2,qwen-vx --mtp,,1330,,2772.5029,,,15.7262,,201,388,309,,,0,logs/C.explain2.r2.vxmtp.txt,2026-11-25T17:04:53,2026-11-25T17:07:07,0,clocksyncd,0,True,2034
+C,heldout/explain2,explain,2,qwen-vx --mtp --draft,11,1330,,2773.1552,,,16.0371,,202,406,307,,,0,logs/C.explain2.r2.vxmtpdraft11.txt,2026-11-25T17:02:08,2026-11-25T17:04:12,0,airportd,0,True,2034
+C,heldout/explain2,explain,3,llama-completion,,1330,1330,3307.1700,,,26.2000,511,,,,on,4,0,logs/C.explain2.r3.completion.txt,2026-11-25T20:57:52,2026-11-25T20:58:19,0,biomesyncd,0,,
+C,heldout/explain2,explain,3,llama.cpp draft-mtp,3,1330,1330,3427.0000,,,18.1085,516,,483,355,on,4,0,logs/C.explain2.r3.mtp3.txt,2026-11-25T20:59:58,2026-11-25T21:00:13,0,bash,0,True,2000
+C,heldout/explain2,explain,3,llama.cpp ngram-mod,,1330,1330,3269.0000,,,27.3528,513,,19,19,on,4,0,logs/C.explain2.r3.ngram.txt,2026-11-25T20:58:59,2026-11-25T20:59:18,0,dasd,0,True,2000
+C,heldout/explain2,explain,3,qwen-vx,,1330,,2724.4759,,,22.5825,,,,,,,0,logs/C.explain2.r3.vx.txt,2026-11-25T20:46:18,2026-11-25T20:48:24,0,WindowServer,0,,
+C,heldout/explain2,explain,3,qwen-vx --draft,11,1330,,2700.2499,,,20.4105,,108,176,110,,,0,logs/C.explain2.r3.vxdraft11.txt,2026-11-25T20:49:05,2026-11-25T20:51:12,0,0.3 agy,0,True,2034
+C,heldout/explain2,explain,3,qwen-vx --mtp,,1330,,2805.6397,,,16.1541,,201,388,309,,,0,logs/C.explain2.r3.vxmtp.txt,2026-11-25T20:51:52,2026-11-25T20:53:55,0,WindowServer,0,True,2034
+C,heldout/explain2,explain,3,qwen-vx --mtp --draft,11,1330,,2778.8503,,,16.0408,,202,406,307,,,0,logs/C.explain2.r3.vxmtpdraft11.txt,2026-11-25T20:55:06,2026-11-25T20:57:12,0,WindowServer,0,True,2034
+C,heldout/explain3,explain,1,llama-completion,,1257,1257,3157.8500,,,26.1000,511,,,,on,4,0,logs/C.explain3.r1.completion.txt,2026-11-25T15:04:30,2026-11-25T15:04:57,0,com.apple.AppleUserHIDDrivers,0,,
+C,heldout/explain3,explain,1,llama.cpp draft-mtp,3,1257,1257,3275.0000,,,20.0916,513,,526,337,on,4,0,logs/C.explain3.r1.mtp3.txt,2026-11-25T15:06:45,2026-11-25T15:07:01,0,airportd,0,False,457
+C,heldout/explain3,explain,1,llama.cpp ngram-mod,,1257,1257,3118.0000,,,26.3704,513,,0,0,on,4,0,logs/C.explain3.r1.ngram.txt,2026-11-25T15:05:47,2026-11-25T15:06:05,0,com.apple.AppleUserHIDDrivers,0,False,457
+C,heldout/explain3,explain,1,qwen-vx,,1257,,2559.6418,,,22.3159,,,,,,,0,logs/C.explain3.r1.vx.txt,2026-11-25T14:53:17,2026-11-25T14:55:33,0,airportd,0,,
+C,heldout/explain3,explain,1,qwen-vx --draft,11,1257,,2560.4732,,,22.4699,,43,43,14,,,0,logs/C.explain3.r1.vxdraft11.txt,2026-11-25T14:56:13,2026-11-25T14:58:20,0,WindowServer,0,True,2144
+C,heldout/explain3,explain,1,qwen-vx --mtp,,1257,,2632.3977,,,17.1259,,246,350,263,,,0,logs/C.explain3.r1.vxmtp.txt,2026-11-25T14:59:00,2026-11-25T15:01:04,0,loginwindow,0,True,2144
+C,heldout/explain3,explain,1,qwen-vx --mtp --draft,11,1257,,2633.4457,,,17.1306,,246,350,263,,,0,logs/C.explain3.r1.vxmtpdraft11.txt,2026-11-25T15:01:44,2026-11-25T15:03:50,0,com.apple.AppleUserHIDDrivers,0,True,2144
+C,heldout/explain3,explain,2,llama-completion,,1257,1257,3143.8900,,,26.2200,511,,,,on,4,0,logs/C.explain3.r2.completion.txt,2026-11-25T18:53:59,2026-11-25T18:54:17,0,bash,0,,
+C,heldout/explain3,explain,2,llama.cpp draft-mtp,3,1257,1257,3297.0000,,,20.1520,513,,526,337,on,4,0,logs/C.explain3.r2.mtp3.txt,2026-11-25T18:51:46,2026-11-25T18:52:11,0,airportd,0,False,457
+C,heldout/explain3,explain,2,llama.cpp ngram-mod,,1257,1257,3116.0000,,,26.4366,513,,0,0,on,4,0,logs/C.explain3.r2.ngram.txt,2026-11-25T18:53:01,2026-11-25T18:53:19,0,bash,0,False,457
+C,heldout/explain3,explain,2,qwen-vx,,1257,,2566.1280,,,22.2896,,,,,,,0,logs/C.explain3.r2.vx.txt,2026-11-25T19:03:36,2026-11-25T19:05:43,0,com.apple.AppleUserHIDDrivers,0,,
+C,heldout/explain3,explain,2,qwen-vx --draft,11,1257,,2564.3876,,,22.5365,,43,43,14,,,0,logs/C.explain3.r2.vxdraft11.txt,2026-11-25T19:00:48,2026-11-25T19:02:56,0,PowerUIAgent,0,True,2144
+C,heldout/explain3,explain,2,qwen-vx --mtp,,1257,,2633.5731,,,17.1099,,246,350,263,,,0,logs/C.explain3.r2.vxmtp.txt,2026-11-25T18:58:01,2026-11-25T19:00:08,0,WindowServer,0,True,2144
+C,heldout/explain3,explain,2,qwen-vx --mtp --draft,11,1257,,2634.1031,,,17.1508,,246,350,263,,,0,logs/C.explain3.r2.vxmtpdraft11.txt,2026-11-25T18:54:57,2026-11-25T18:57:10,0,bash,0,True,2144
+C,heldout/explain3,explain,3,llama-completion,,1257,1257,3169.4000,,,26.1400,511,,,,on,4,0,logs/C.explain3.r3.completion.txt,2026-11-25T22:31:49,2026-11-25T22:32:16,0,airportd,0,,
+C,heldout/explain3,explain,3,llama.cpp draft-mtp,3,1257,1257,3289.0000,,,20.3860,513,,526,337,on,4,0,logs/C.explain3.r3.mtp3.txt,2026-11-25T22:33:54,2026-11-25T22:34:10,0,bash,0,False,457
+C,heldout/explain3,explain,3,llama.cpp ngram-mod,,1257,1257,3130.0000,,,26.3489,513,,0,0,on,4,0,logs/C.explain3.r3.ngram.txt,2026-11-25T22:32:56,2026-11-25T22:33:14,0,bash,0,False,457
+C,heldout/explain3,explain,3,qwen-vx,,1257,,2570.4012,,,22.3472,,,,,,,0,logs/C.explain3.r3.vx.txt,2026-11-25T22:20:46,2026-11-25T22:22:51,0,com.apple.AppleUserHIDDrivers,0,,
+C,heldout/explain3,explain,3,qwen-vx --draft,11,1257,,2570.0867,,,22.5746,,43,43,14,,,0,logs/C.explain3.r3.vxdraft11.txt,2026-11-25T22:23:32,2026-11-25T22:25:40,0,bash,0,True,2144
+C,heldout/explain3,explain,3,qwen-vx --mtp,,1257,,2641.2733,,,17.1771,,246,350,263,,,0,logs/C.explain3.r3.vxmtp.txt,2026-11-25T22:26:20,2026-11-25T22:28:15,0,bash,0,True,2144
+C,heldout/explain3,explain,3,qwen-vx --mtp --draft,11,1257,,2640.9259,,,17.5767,,246,350,263,,,0,logs/C.explain3.r3.vxmtpdraft11.txt,2026-11-25T22:28:55,2026-11-25T22:31:09,0,com.apple.DriverKit-AppleBCMWLAN,0,True,2144
+C,heldout/write1,write,1,llama-completion,,44,44,240.5800,,,25.6800,511,,,,on,4,0,logs/C.write1.r1.completion.txt,2026-11-25T12:55:40,2026-11-25T12:56:04,0,com.apple.AppleUserHIDDrivers,0,,
+C,heldout/write1,write,1,llama.cpp draft-mtp,3,44,44,251.0000,,,16.7529,514,,434,369,on,4,0,logs/C.write1.r1.mtp3.txt,2026-11-25T12:57:39,2026-11-25T12:57:49,0,airportd,0,False,773
+C,heldout/write1,write,1,llama.cpp ngram-mod,,44,44,234.0000,,,25.8908,513,,0,0,on,4,0,logs/C.write1.r1.ngram.txt,2026-11-25T12:56:44,2026-11-25T12:56:58,0,bash,0,False,773
+C,heldout/write1,write,1,qwen-vx,,44,,252.4635,,,22.1728,,,,,,,0,logs/C.write1.r1.vx.txt,2026-11-25T12:44:48,2026-11-25T12:46:53,0,1.7 agy,0,,
+C,heldout/write1,write,1,qwen-vx --draft,11,44,,249.7835,,,20.8352,,101,114,73,,,0,logs/C.write1.r1.vxdraft11.txt,2026-11-25T12:47:34,2026-11-25T12:49:38,0,com.apple.AppleUserHIDDrivers,0,True,1764
+C,heldout/write1,write,1,qwen-vx --mtp,,44,,256.2283,,,15.1538,,198,382,312,,,0,logs/C.write1.r1.vxmtp.txt,2026-11-25T12:50:18,2026-11-25T12:52:18,0,com.apple.AppleUserHIDDrivers,0,True,1764
+C,heldout/write1,write,1,qwen-vx --mtp --draft,11,44,,256.5742,,,15.1512,,198,382,312,,,0,logs/C.write1.r1.vxmtpdraft11.txt,2026-11-25T12:52:58,2026-11-25T12:55:00,0,bash,0,True,1764
+C,heldout/write1,write,2,llama-completion,,44,44,238.7700,,,25.6500,511,,,,on,4,0,logs/C.write1.r2.completion.txt,2026-11-25T15:38:05,2026-11-25T15:38:19,0,bash,0,,
+C,heldout/write1,write,2,llama.cpp draft-mtp,3,44,44,254.0000,,,16.1459,514,,434,369,on,4,0,logs/C.write1.r2.mtp3.txt,2026-11-25T15:36:11,2026-11-25T15:36:30,0,PerfPowerServices,0,False,773
+C,heldout/write1,write,2,llama.cpp ngram-mod,,44,44,235.0000,,,26.0409,513,,0,0,on,4,0,logs/C.write1.r2.ngram.txt,2026-11-25T15:37:10,2026-11-25T15:37:25,0,com.apple.AppleUserHIDDrivers,0,False,773
+C,heldout/write1,write,2,qwen-vx,,44,,249.2174,,,22.0482,,,,,,,0,logs/C.write1.r2.vx.txt,2026-11-25T15:47:28,2026-11-25T15:49:31,0,secd,0,,
+C,heldout/write1,write,2,qwen-vx --draft,11,44,,250.7617,,,20.7818,,101,114,73,,,0,logs/C.write1.r2.vxdraft11.txt,2026-11-25T15:44:31,2026-11-25T15:46:47,0,secd,0,True,1764
+C,heldout/write1,write,2,qwen-vx --mtp,,44,,256.4156,,,15.1602,,198,382,312,,,0,logs/C.write1.r2.vxmtp.txt,2026-11-25T15:41:51,2026-11-25T15:43:51,0,launchd,0,True,1764
+C,heldout/write1,write,2,qwen-vx --mtp --draft,11,44,,257.2377,,,15.1459,,198,382,312,,,0,logs/C.write1.r2.vxmtpdraft11.txt,2026-11-25T15:39:00,2026-11-25T15:41:11,0,airportd,0,True,1764
+C,heldout/write1,write,3,llama-completion,,44,44,240.6100,,,25.7300,511,,,,on,4,0,logs/C.write1.r3.completion.txt,2026-11-25T19:45:48,2026-11-25T19:46:11,0,com.apple.AppleUserHIDDrivers,0,,
+C,heldout/write1,write,3,llama.cpp draft-mtp,3,44,44,249.0000,,,16.1401,514,,434,369,on,4,0,logs/C.write1.r3.mtp3.txt,2026-11-25T19:47:46,2026-11-25T19:47:56,0,cfprefsd,0,False,773
+C,heldout/write1,write,3,llama.cpp ngram-mod,,44,44,235.0000,,,26.0058,513,,0,0,on,4,0,logs/C.write1.r3.ngram.txt,2026-11-25T19:46:51,2026-11-25T19:47:06,0,launchd,0,False,773
+C,heldout/write1,write,3,qwen-vx,,44,,249.9455,,,22.1700,,,,,,,0,logs/C.write1.r3.vx.txt,2026-11-25T19:34:25,2026-11-25T19:36:38,0,bash,0,,
+C,heldout/write1,write,3,qwen-vx --draft,11,44,,250.5453,,,20.8593,,101,114,73,,,0,logs/C.write1.r3.vxdraft11.txt,2026-11-25T19:37:19,2026-11-25T19:39:35,0,com.apple.AppleUserHIDDrivers,0,True,1764
+C,heldout/write1,write,3,qwen-vx --mtp,,44,,258.2385,,,15.2092,,198,382,312,,,0,logs/C.write1.r3.vxmtp.txt,2026-11-25T19:40:15,2026-11-25T19:42:26,0,com.apple.AppleUserHIDDrivers,0,True,1764
+C,heldout/write1,write,3,qwen-vx --mtp --draft,11,44,,257.0762,,,15.2071,,198,382,312,,,0,logs/C.write1.r3.vxmtpdraft11.txt,2026-11-25T19:43:06,2026-11-25T19:45:07,0,WindowServer,0,True,1764
+C,heldout/write2,write,1,llama-completion,,52,52,250.8300,,,25.8400,511,,,,on,4,0,logs/C.write2.r1.completion.txt,2026-11-25T13:53:53,2026-11-25T13:54:16,0,clocksyncd,0,,
+C,heldout/write2,write,1,llama.cpp draft-mtp,3,52,52,267.0000,,,16.4457,516,,443,368,on,4,0,logs/C.write2.r1.mtp3.txt,2026-11-25T13:55:51,2026-11-25T13:56:02,0,launchd,0,False,1581
+C,heldout/write2,write,1,llama.cpp ngram-mod,,52,52,244.0000,,,25.8129,513,,0,0,on,4,0,logs/C.write2.r1.ngram.txt,2026-11-25T13:54:56,2026-11-25T13:55:11,0,com.apple.AppleUserHIDDrivers,0,False,1600
+C,heldout/write2,write,1,qwen-vx,,52,,257.5855,,,22.0798,,,,,,,0,logs/C.write2.r1.vx.txt,2026-11-25T13:42:24,2026-11-25T13:44:30,0,mdworker_shared,0,,
+C,heldout/write2,write,1,qwen-vx --draft,11,52,,256.8762,,,21.7088,,115,115,51,,,0,logs/C.write2.r1.vxdraft11.txt,2026-11-25T13:45:10,2026-11-25T13:47:32,0,bash,0,True,1661
+C,heldout/write2,write,1,qwen-vx --mtp,,52,,265.4873,,,13.6362,,156,413,354,,,0,logs/C.write2.r1.vxmtp.txt,2026-11-25T13:48:12,2026-11-25T13:50:22,0,WiFiAgent,0,True,1661
+C,heldout/write2,write,1,qwen-vx --mtp --draft,11,52,,265.1375,,,13.6293,,156,413,354,,,0,logs/C.write2.r1.vxmtpdraft11.txt,2026-11-25T13:51:02,2026-11-25T13:53:12,0,loginwindow,0,True,1661
+C,heldout/write2,write,2,llama-completion,,52,52,248.9500,,,25.6500,511,,,,on,4,0,logs/C.write2.r2.completion.txt,2026-11-25T16:44:35,2026-11-25T16:44:50,0,airportd,0,,
+C,heldout/write2,write,2,llama.cpp draft-mtp,3,52,52,268.0000,,,17.0058,516,,443,368,on,4,0,logs/C.write2.r2.mtp3.txt,2026-11-25T16:42:40,2026-11-25T16:43:00,0,mdworker_shared,0,False,1581
+C,heldout/write2,write,2,llama.cpp ngram-mod,,52,52,244.0000,,,26.1384,513,,0,0,on,4,0,logs/C.write2.r2.ngram.txt,2026-11-25T16:43:40,2026-11-25T16:43:55,0,secd,0,False,1600
+C,heldout/write2,write,2,qwen-vx,,52,,258.2448,,,22.0335,,,,,,,0,logs/C.write2.r2.vx.txt,2026-11-25T16:54:12,2026-11-25T16:56:16,0,bash,0,,
+C,heldout/write2,write,2,qwen-vx --draft,11,52,,257.0325,,,21.7833,,115,115,51,,,0,logs/C.write2.r2.vxdraft11.txt,2026-11-25T16:51:29,2026-11-25T16:53:31,0,com.apple.DriverKit-AppleBCMWLAN,0,True,1661
+C,heldout/write2,write,2,qwen-vx --mtp,,52,,266.7265,,,13.6815,,156,413,354,,,0,logs/C.write2.r2.vxmtp.txt,2026-11-25T16:48:10,2026-11-25T16:50:09,0,bash,0,True,1661
+C,heldout/write2,write,2,qwen-vx --mtp --draft,11,52,,267.2539,,,13.7725,,156,413,354,,,0,logs/C.write2.r2.vxmtpdraft11.txt,2026-11-25T16:45:30,2026-11-25T16:47:30,0,cfprefsd,0,True,1661
+C,heldout/write2,write,3,llama-completion,,52,52,250.5700,,,25.6600,511,,,,on,4,0,logs/C.write2.r3.completion.txt,2026-11-25T20:42:48,2026-11-25T20:43:11,0,com.apple.DriverKit-AppleBCMWLAN,0,,
+C,heldout/write2,write,3,llama.cpp draft-mtp,3,52,52,277.0000,,,16.7733,516,,443,368,on,4,0,logs/C.write2.r3.mtp3.txt,2026-11-25T20:44:46,2026-11-25T20:44:57,0,WindowServer,3,False,1581
+C,heldout/write2,write,3,llama.cpp ngram-mod,,52,52,244.0000,,,25.9805,513,,0,0,on,4,0,logs/C.write2.r3.ngram.txt,2026-11-25T20:43:51,2026-11-25T20:44:06,0,launchd,0,False,1600
+C,heldout/write2,write,3,qwen-vx,,52,,258.4810,,,22.1067,,,,,,,0,logs/C.write2.r3.vx.txt,2026-11-25T20:31:01,2026-11-25T20:33:06,0,WindowServer,0,,
+C,heldout/write2,write,3,qwen-vx --draft,11,52,,258.4373,,,21.8187,,115,115,51,,,0,logs/C.write2.r3.vxdraft11.txt,2026-11-25T20:33:46,2026-11-25T20:35:51,0,bash,0,True,1661
+C,heldout/write2,write,3,qwen-vx --mtp,,52,,266.0921,,,13.6430,,156,413,354,,,0,logs/C.write2.r3.vxmtp.txt,2026-11-25T20:37:31,2026-11-25T20:39:28,0,bash,0,True,1661
+C,heldout/write2,write,3,qwen-vx --mtp --draft,11,52,,268.6160,,,13.8713,,156,413,354,,,0,logs/C.write2.r3.vxmtpdraft11.txt,2026-11-25T20:40:09,2026-11-25T20:42:08,0,networkserviceproxy,0,True,1661
+C,heldout/write3,write,1,llama-completion,,35,35,214.6800,,,25.6400,511,,,,on,4,0,logs/C.write3.r1.completion.txt,2026-11-25T14:50:29,2026-11-25T14:50:52,0,com.apple.AppleUserHIDDrivers,0,,
+C,heldout/write3,write,1,llama.cpp draft-mtp,3,35,35,234.0000,,,14.8760,516,,404,381,on,4,0,logs/C.write3.r1.mtp3.txt,2026-11-25T14:52:27,2026-11-25T14:52:37,0,com.apple.DriverKit-AppleBCMWLAN,0,True,1924
+C,heldout/write3,write,1,llama.cpp ngram-mod,,35,35,208.0000,,,26.6374,513,,15,15,on,4,0,logs/C.write3.r1.ngram.txt,2026-11-25T14:51:32,2026-11-25T14:51:47,0,com.apple.DriverKit-AppleBCMWLAN,0,True,1924
+C,heldout/write3,write,1,qwen-vx,,35,,231.2130,,,22.0347,,,,,,,0,logs/C.write3.r1.vx.txt,2026-11-25T14:39:11,2026-11-25T14:41:25,0,com.apple.AppleUserHIDDrivers,0,,
+C,heldout/write3,write,1,qwen-vx --draft,11,35,,231.2503,,,19.4956,,95,176,123,,,0,logs/C.write3.r1.vxdraft11.txt,2026-11-25T14:42:05,2026-11-25T14:44:28,0,bash,0,True,1942
+C,heldout/write3,write,1,qwen-vx --mtp,,35,,238.3590,,,13.5392,,149,427,361,,,0,logs/C.write3.r1.vxmtp.txt,2026-11-25T14:45:09,2026-11-25T14:47:09,0,UserEventAgent,0,True,1942
+C,heldout/write3,write,1,qwen-vx --mtp --draft,11,35,,238.7589,,,13.5754,,143,453,367,,,0,logs/C.write3.r1.vxmtpdraft11.txt,2026-11-25T14:47:49,2026-11-25T14:49:48,0,xprotectd,0,True,1942
+C,heldout/write3,write,2,llama-completion,,35,35,213.3800,,,25.7200,511,,,,on,4,0,logs/C.write3.r2.completion.txt,2026-11-25T18:33:42,2026-11-25T18:33:57,0,airportd,0,,
+C,heldout/write3,write,2,llama.cpp draft-mtp,3,35,35,231.0000,,,15.4961,516,,404,381,on,4,0,logs/C.write3.r2.mtp3.txt,2026-11-25T18:31:48,2026-11-25T18:32:07,0,com.apple.AppleUserHIDDrivers,0,True,1924
+C,heldout/write3,write,2,llama.cpp ngram-mod,,35,35,209.0000,,,26.7914,513,,15,15,on,4,0,logs/C.write3.r2.ngram.txt,2026-11-25T18:32:47,2026-11-25T18:33:02,0,bash,0,True,1924
+C,heldout/write3,write,2,qwen-vx,,35,,232.5422,,,22.1629,,,,,,,0,logs/C.write3.r2.vx.txt,2026-11-25T18:48:52,2026-11-25T18:51:06,0,WindowServer,0,,
+C,heldout/write3,write,2,qwen-vx --draft,11,35,,232.2731,,,19.5489,,95,176,123,,,0,logs/C.write3.r2.vxdraft11.txt,2026-11-25T18:46:09,2026-11-25T18:48:12,0,WindowServer,0,True,1942
+C,heldout/write3,write,2,qwen-vx --mtp,,35,,239.3553,,,13.5829,,149,427,361,,,0,logs/C.write3.r2.vxmtp.txt,2026-11-25T18:37:28,2026-11-25T18:39:26,0,com.apple.AppleUserHIDDrivers,0,True,1942
+C,heldout/write3,write,2,qwen-vx --mtp --draft,11,35,,240.0632,,,13.5890,,143,453,367,,,0,logs/C.write3.r2.vxmtpdraft11.txt,2026-11-25T18:34:37,2026-11-25T18:36:48,0,bash,0,True,1942
+C,heldout/write3,write,3,llama-completion,,35,35,214.4300,,,25.6500,511,,,,on,4,0,logs/C.write3.r3.completion.txt,2026-11-25T22:55:14,2026-11-25T22:55:37,0,bash,0,,
+C,heldout/write3,write,3,llama.cpp draft-mtp,3,35,35,241.0000,,,14.9671,516,,404,381,on,4,0,logs/C.write3.r3.mtp3.txt,2026-11-25T22:19:56,2026-11-25T22:20:06,0,com.apple.AppleUserHIDDrivers,0,True,1924
+C,heldout/write3,write,3,llama.cpp ngram-mod,,35,35,210.0000,,,26.7641,513,,15,15,on,4,0,logs/C.write3.r3.ngram.txt,2026-11-25T22:18:54,2026-11-25T22:19:16,0,bash,0,True,1924
+C,heldout/write3,write,3,qwen-vx,,35,,234.7096,,,22.2838,,,,,,,0,logs/C.write3.r3.vx.txt,2026-11-25T21:29:55,2026-11-25T21:32:04,0,com.apple.AppleUserHIDDrivers,0,,
+C,heldout/write3,write,3,qwen-vx --draft,11,35,,232.2784,,,19.5272,,95,176,123,,,0,logs/C.write3.r3.vxdraft11.txt,2026-11-25T22:47:00,2026-11-25T22:49:02,0,loginwindow,0,True,1942
+C,heldout/write3,write,3,qwen-vx --mtp,,35,,238.7506,,,13.5427,,149,427,361,,,0,logs/C.write3.r3.vxmtp.txt,2026-11-25T22:49:42,2026-11-25T22:51:52,0,contextstored,0,True,1942
+C,heldout/write3,write,3,qwen-vx --mtp --draft,11,35,,238.6567,,,13.5874,,143,453,367,,,0,logs/C.write3.r3.vxmtpdraft11.txt,2026-11-25T22:52:32,2026-11-25T22:54:34,0,bash,0,True,1942
+P,context/ctx2048,ctx,1,llama-completion,,2048,2048,5086.7300,,,0.0000,1,,,,on,4,0,logs/P.llama.ctx2048.r1.txt,2026-11-25T11:45:25,2026-11-25T11:45:40,0,WindowServer,0,,
+P,context/ctx2048,ctx,2,llama-completion,,2048,2048,5072.6500,,,0.0000,1,,,,on,4,0,logs/P.llama.ctx2048.r2.txt,2026-11-25T11:54:54,2026-11-25T11:55:09,0,com.apple.AppleUserHIDDrivers,0,,
+P,context/ctx2048,ctx,3,llama-completion,,2048,2048,5069.7300,,,0.0000,1,,,,on,4,0,logs/P.llama.ctx2048.r3.txt,2026-11-25T12:10:25,2026-11-25T12:10:40,0,bash,0,,
+P,context/ctx512,ctx,1,llama-completion,,512,512,1224.5000,,,0.0000,1,,,,on,4,0,logs/P.llama.ctx512.r1.txt,2026-11-25T11:41:49,2026-11-25T11:42:00,0,com.apple.AppleUserHIDDrivers,0,,
+P,context/ctx512,ctx,2,llama-completion,,512,512,1220.5500,,,0.0000,1,,,,on,4,0,logs/P.llama.ctx512.r2.txt,2026-11-25T11:51:25,2026-11-25T11:51:28,0,com.apple.AppleUserHIDDrivers,0,,
+P,context/ctx512,ctx,3,llama-completion,,512,512,1219.6000,,,0.0000,1,,,,on,4,0,logs/P.llama.ctx512.r3.txt,2026-11-25T12:06:18,2026-11-25T12:06:29,0,com.apple.AppleUserHIDDrivers,0,,
+P,context/ctx8192,ctx,1,llama-completion,,8192,8192,23057.4300,,,0.0000,1,,,,on,4,0,logs/P.llama.ctx8192.r1.txt,2026-11-25T11:50:02,2026-11-25T11:50:35,0,bash,0,,
+P,context/ctx8192,ctx,2,llama-completion,,8192,8192,22695.7100,,,0.0000,1,,,,on,4,0,logs/P.llama.ctx8192.r2.txt,2026-11-25T11:58:45,2026-11-25T11:59:17,0,PerfPowerServices,0,,
+P,context/ctx8192,ctx,3,llama-completion,,8192,8192,22984.7400,,,0.0000,1,,,,on,4,0,logs/P.llama.ctx8192.r3.txt,2026-11-25T12:14:53,2026-11-25T12:15:25,0,configd,0,,
+P,context/ctx2048,ctx,1,qwen-vx,,2048,,4208.2429,4118.7291,4169.2 4208.2,,,,,,,,0,logs/P.vx.ctx2048.r1.txt,2026-11-25T11:42:40,2026-11-25T11:44:45,0,AXVisualSupportAgent,0,,
+P,context/ctx2048,ctx,2,qwen-vx,,2048,,4186.1730,4111.4521,4158.8 4186.2,,,,,,,,0,logs/P.vx.ctx2048.r2.txt,2026-11-25T11:55:49,2026-11-25T11:58:05,0,bash,0,,
+P,context/ctx2048,ctx,3,qwen-vx,,2048,,4181.4628,4107.7361,4155.5 4181.5,,,,,,,,0,logs/P.vx.ctx2048.r3.txt,2026-11-25T12:07:39,2026-11-25T12:09:45,0,airportd,0,,
+P,context/ctx512,ctx,1,qwen-vx,,512,,1143.9018,1132.8037,1140.0 1143.9,,,,,,,,0,logs/P.vx.ctx512.r1.txt,2026-11-25T11:39:09,2026-11-25T11:41:09,0,airportd,0,,
+P,context/ctx512,ctx,2,qwen-vx,,512,,1135.0738,1121.9127,1130.2 1135.1,,,,,,,,0,logs/P.vx.ctx512.r2.txt,2026-11-25T11:52:18,2026-11-25T11:54:14,0,com.apple.AppleUserHIDDrivers,0,,
+P,context/ctx512,ctx,3,qwen-vx,,512,,1136.7702,1122.1888,1132.9 1136.8,,,,,,,,0,logs/P.vx.ctx512.r3.txt,2026-11-25T12:03:40,2026-11-25T12:05:38,0,bash,0,,
+P,context/ctx8192,ctx,1,qwen-vx,,8192,,20783.7791,19019.1174,20352.1 20783.8,,,,,,,,0,logs/P.vx.ctx8192.r1.txt,2026-11-25T11:46:31,2026-11-25T11:49:22,0,com.apple.DriverKit-AppleBCMWLAN,0,,
+P,context/ctx8192,ctx,2,qwen-vx,,8192,,20703.3863,19022.7470,20323.1 20703.4,,,,,,,,0,logs/P.vx.ctx8192.r2.txt,2026-11-25T11:59:57,2026-11-25T12:03:00,0,com.apple.AppleUserHIDDrivers,0,,
+P,context/ctx8192,ctx,3,qwen-vx,,8192,,20690.5193,18923.0289,20169.5 20690.5,,,,,,,,0,logs/P.vx.ctx8192.r3.txt,2026-11-25T12:11:20,2026-11-25T12:14:12,0,airportd,0,,
+fa,context/ctx2048,ctx,1,llama-completion,,2048,2048,5027.8200,,,27.6100,255,,,,off,4,0,logs/fa-off.ctx2048.r1.txt,2026-11-25T09:54:48,2026-11-25T09:55:01,0,com.apple.AppleUserHIDDrivers,0,,
+fa,context/ctx2048,ctx,2,llama-completion,,2048,2048,5038.3600,,,28.4500,255,,,,off,4,0,logs/fa-off.ctx2048.r2.txt,2026-11-25T09:55:41,2026-11-25T09:55:55,0,cfprefsd,0,,
+fa,context/ctx2048,ctx,3,llama-completion,,2048,2048,5039.1300,,,27.8800,255,,,,off,4,0,logs/fa-off.ctx2048.r3.txt,2026-11-25T09:58:21,2026-11-25T09:58:35,0,launchd,0,,
+fa,context/ctx2048,ctx,1,llama-completion,,2048,2048,4991.8800,,,26.6800,255,,,,on,4,0,logs/fa-on.ctx2048.r1.txt,2026-11-25T09:53:45,2026-11-25T09:54:08,0,mediaanalysisd,0,,
+fa,context/ctx2048,ctx,2,llama-completion,,2048,2048,5003.1300,,,26.2900,255,,,,on,4,0,logs/fa-on.ctx2048.r2.txt,2026-11-25T09:56:35,2026-11-25T09:56:48,0,com.apple.AppleUserHIDDrivers,0,,
+fa,context/ctx2048,ctx,3,llama-completion,,2048,2048,5008.7200,,,26.3100,255,,,,on,4,0,logs/fa-on.ctx2048.r3.txt,2026-11-25T09:57:28,2026-11-25T09:57:41,0,com.apple.AppleUserHIDDrivers,0,,

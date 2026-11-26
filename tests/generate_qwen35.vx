@@ -18,6 +18,9 @@
 //   the tiny model has random weights, so its drafts are not those of the model.
 // - the same with --mtp 3,5,0: the second length of drafts (5) from a kept share of 0%, so each
 //   round drafts 5 tokens and checks 6 positions.
+// - the Q4_0 file with the MTP layer with --mtp 3 --draft 7,2, after the prompt of the --draft
+//   test: a round drafts 7 tokens from the context, the other rounds draft from the MTP layer, and
+//   the steps are those of the file without the MTP layer and without drafts.
 //
 // The products of a chunk round each Q4_0 weight, (code - 8) times its scale, to f16, as for the
 // Qwen3 models. So the Q4_0 files get 0.003, as in tests/prefill.vx, and the bf16 files 0.001.
@@ -66,6 +69,12 @@
 // RUN: grep step= %t-mtp5.vx > %t-mtp5.steps
 // RUN: diff %t-long24.steps %t-mtp5.steps
 // RUN: grep rounds= %t-mtp5.vx | FileCheck %s --check-prefix=MTP
+// RUN: vxc %S/../src/main.vx --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t-long.vxw --tokens 31,41,59,26,53,58,97,93,23,84,109,99,62,64,33,83,27,31,41,59,26,53,58,97,93,23,84 --steps 32 > %t-long-plain.vx
+// RUN: vxc %S/../src/main.vx --package qwen=%S/../src --host default --machine $VX_FLEET/m4-uma.vx -- %t-mtp.vxw --tokens 31,41,59,26,53,58,97,93,23,84,109,99,62,64,33,83,27,31,41,59,26,53,58,97,93,23,84 --steps 32 --mtp 3 --draft 7,2 > %t-mtp-context.vx
+// RUN: grep step= %t-long-plain.vx > %t-long-plain.steps
+// RUN: grep step= %t-mtp-context.vx > %t-mtp-context.steps
+// RUN: diff %t-long-plain.steps %t-mtp-context.steps
+// RUN: grep context_drafts: %t-mtp-context.vx | FileCheck %s --check-prefix=MTP-CONTEXT
 //
 // CHECK: 16 steps, same tokens, logits within 0.001
 // Q4: 16 steps, same tokens, logits within 0.003
@@ -76,3 +85,4 @@
 // RUNS: {{^}}3{{$}}
 // MTP-STEPS: {{^}}24{{$}}
 // MTP: rounds={{[0-9]+}} drafted={{[0-9]+}} accepted={{[0-9]+}};
+// MTP-CONTEXT: context_drafts: rounds=1 drafted=7 kept=0;

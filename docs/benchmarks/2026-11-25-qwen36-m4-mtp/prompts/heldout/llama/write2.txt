@@ -1,0 +1,8 @@
+<|im_start|>user
+Write a C function `void reverse_words(char *s)` that reverses the order of the words in a string in place, with single spaces between words. Add a main() that tests it.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+
