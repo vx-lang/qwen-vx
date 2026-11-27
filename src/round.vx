@@ -28,7 +28,7 @@ fn vec_attention_groups(pos : i32) -> i32 {
 }
 
 /// The scratch space of `round_attention`, on the CPU.
-fn round_attention_scratch(q_heads : i32) -> Tensor<f32, [?, ?, ?]> {
+pub fn round_attention_scratch(q_heads : i32) -> Tensor<f32, [?, ?, ?]> {
   return Tensor<f32>([q_heads, 128, ROUND_MAX * 132]);
 }
 
@@ -38,7 +38,7 @@ fn round_attention_scratch(q_heads : i32) -> Tensor<f32, [?, ?, ?]> {
 /// `round_attention_scratch`. Up to 4 queries that use the same number of SIMD groups share one
 /// kernel: for 8 queries, pieces of 4 are about 20% faster than one kernel at position 2,000, and 7%
 /// at 8,000, since each query costs the same work in a kernel for more queries.
-fn round_attention(out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+pub fn round_attention(out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
   assert(n >= 1 && n <= ROUND_MAX && q.extent(0) >= n && out.extent(0) >= n, "round_attention: n must be 1 to ROUND_MAX, and q and out need n rows");
   nn_check_heads(q.extent(1), q.extent(2), q_heads, head_dim);
   nn_check_heads(out.extent(1), out.extent(2), q_heads, head_dim);
@@ -63,7 +63,7 @@ fn round_attention(out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, part : &mut T
 
 /// `norm_rope_and_store` of src/attention.vx for n tokens at positions start to start + n - 1: q,
 /// k and v are [n, heads, head_dim], and q_out gets [n, q_heads, head_dim].
-fn round_norm_rope_and_store(q_out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &mut Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &mut Tensor<f16, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k : &Tensor<f32, [?, ?, ?], Memory::HBM>, v : &Tensor<f32, [?, ?, ?], Memory::HBM>, q_norm : &Tensor<bf16, [?], Memory::HBM>, k_norm : &Tensor<bf16, [?], Memory::HBM>, cos : &Tensor<f32, [?, ?], Memory::HBM>, sin : &Tensor<f32, [?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32, head_dim : i32, eps : f32) -> void {
+pub fn round_norm_rope_and_store(q_out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &mut Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &mut Tensor<f16, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k : &Tensor<f32, [?, ?, ?], Memory::HBM>, v : &Tensor<f32, [?, ?, ?], Memory::HBM>, q_norm : &Tensor<bf16, [?], Memory::HBM>, k_norm : &Tensor<bf16, [?], Memory::HBM>, cos : &Tensor<f32, [?, ?], Memory::HBM>, sin : &Tensor<f32, [?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32, head_dim : i32, eps : f32) -> void {
   let half = head_dim / 2;
   assert(n >= 1 && q.extent(0) >= n && k.extent(0) >= n && v.extent(0) >= n && q_out.extent(0) >= n, "round_norm_rope_and_store: q, k, v and q_out need n rows");
   nn_check_heads(q.extent(1), q.extent(2), q_heads, head_dim);
@@ -155,7 +155,7 @@ fn round_attention_parts_1(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : 
     for h in 0..q_heads across blocks {
       for w in 0..nwg across blocks {
         let g = h / group;
-        let _d = mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %t0 = t0 : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
+        let _d = unsafe { mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %t0 = t0 : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
           %c0 = arith.constant 0 : index
           %c1 = arith.constant 1 : index
           %c4 = arith.constant 4 : index
@@ -247,7 +247,7 @@ fn round_attention_parts_1(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : 
             memref.store %st#1, %part[%hi, %wi, %as0] : memref<?x?x?xf32>
           }
           macro.yield %h : i32
-        };
+        } };
       }
     }
   }
@@ -261,7 +261,7 @@ fn round_attention_parts_2(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : 
     for h in 0..q_heads across blocks {
       for w in 0..nwg across blocks {
         let g = h / group;
-        let _d = mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %t0 = t0 : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
+        let _d = unsafe { mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %t0 = t0 : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
           %c0 = arith.constant 0 : index
           %c1 = arith.constant 1 : index
           %c4 = arith.constant 4 : index
@@ -395,7 +395,7 @@ fn round_attention_parts_2(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : 
             memref.store %st#4, %part[%hi, %wi, %as1] : memref<?x?x?xf32>
           }
           macro.yield %h : i32
-        };
+        } };
       }
     }
   }
@@ -409,7 +409,7 @@ fn round_attention_parts_3(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : 
     for h in 0..q_heads across blocks {
       for w in 0..nwg across blocks {
         let g = h / group;
-        let _d = mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %t0 = t0 : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
+        let _d = unsafe { mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %t0 = t0 : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
           %c0 = arith.constant 0 : index
           %c1 = arith.constant 1 : index
           %c4 = arith.constant 4 : index
@@ -585,7 +585,7 @@ fn round_attention_parts_3(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : 
             memref.store %st#7, %part[%hi, %wi, %as2] : memref<?x?x?xf32>
           }
           macro.yield %h : i32
-        };
+        } };
       }
     }
   }
@@ -599,7 +599,7 @@ fn round_attention_parts_4(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : 
     for h in 0..q_heads across blocks {
       for w in 0..nwg across blocks {
         let g = h / group;
-        let _d = mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %t0 = t0 : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
+        let _d = unsafe { mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %t0 = t0 : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
           %c0 = arith.constant 0 : index
           %c1 = arith.constant 1 : index
           %c4 = arith.constant 4 : index
@@ -817,7 +817,7 @@ fn round_attention_parts_4(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : 
             memref.store %st#10, %part[%hi, %wi, %as3] : memref<?x?x?xf32>
           }
           macro.yield %h : i32
-        };
+        } };
       }
     }
   }
@@ -831,7 +831,7 @@ fn round_attention_parts_5(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : 
     for h in 0..q_heads across blocks {
       for w in 0..nwg across blocks {
         let g = h / group;
-        let _d = mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %t0 = t0 : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
+        let _d = unsafe { mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %t0 = t0 : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
           %c0 = arith.constant 0 : index
           %c1 = arith.constant 1 : index
           %c4 = arith.constant 4 : index
@@ -1091,7 +1091,7 @@ fn round_attention_parts_5(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : 
             memref.store %st#13, %part[%hi, %wi, %as4] : memref<?x?x?xf32>
           }
           macro.yield %h : i32
-        };
+        } };
       }
     }
   }
@@ -1105,7 +1105,7 @@ fn round_attention_parts_6(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : 
     for h in 0..q_heads across blocks {
       for w in 0..nwg across blocks {
         let g = h / group;
-        let _d = mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %t0 = t0 : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
+        let _d = unsafe { mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %t0 = t0 : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
           %c0 = arith.constant 0 : index
           %c1 = arith.constant 1 : index
           %c4 = arith.constant 4 : index
@@ -1407,7 +1407,7 @@ fn round_attention_parts_6(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : 
             memref.store %st#16, %part[%hi, %wi, %as5] : memref<?x?x?xf32>
           }
           macro.yield %h : i32
-        };
+        } };
       }
     }
   }
@@ -1421,7 +1421,7 @@ fn round_attention_parts_7(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : 
     for h in 0..q_heads across blocks {
       for w in 0..nwg across blocks {
         let g = h / group;
-        let _d = mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %t0 = t0 : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
+        let _d = unsafe { mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %t0 = t0 : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
           %c0 = arith.constant 0 : index
           %c1 = arith.constant 1 : index
           %c4 = arith.constant 4 : index
@@ -1765,7 +1765,7 @@ fn round_attention_parts_7(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : 
             memref.store %st#19, %part[%hi, %wi, %as6] : memref<?x?x?xf32>
           }
           macro.yield %h : i32
-        };
+        } };
       }
     }
   }
@@ -1779,7 +1779,7 @@ fn round_attention_parts_8(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : 
     for h in 0..q_heads across blocks {
       for w in 0..nwg across blocks {
         let g = h / group;
-        let _d = mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %t0 = t0 : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
+        let _d = unsafe { mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %t0 = t0 : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
           %c0 = arith.constant 0 : index
           %c1 = arith.constant 1 : index
           %c4 = arith.constant 4 : index
@@ -2165,7 +2165,7 @@ fn round_attention_parts_8(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : 
             memref.store %st#22, %part[%hi, %wi, %as7] : memref<?x?x?xf32>
           }
           macro.yield %h : i32
-        };
+        } };
       }
     }
   }
@@ -2179,7 +2179,7 @@ fn round_attention_merge(out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, part : 
     for i in 0..n across blocks {
       for h in 0..q_heads across blocks {
         let t = t0 + i;
-        let _d = mlir!( threads : 128, inputs : (%out = out : memref<?x?x?xf32>, %part = part : memref<?x?x?xf32>, %parts = parts : i32, %h = h : i32, %t = t : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(part), writes_only(out[t][h])]) {
+        let _d = unsafe { mlir!( threads : 128, inputs : (%out = out : memref<?x?x?xf32>, %part = part : memref<?x?x?xf32>, %parts = parts : i32, %h = h : i32, %t = t : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(part), writes_only(out[t][h])]) {
           %c0 = arith.constant 0 : index
           %c1 = arith.constant 1 : index
           %c2 = arith.constant 2 : index
@@ -2292,7 +2292,7 @@ fn round_attention_merge(out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, part : 
             }
           }
           macro.yield %h : i32
-        };
+        } };
       }
     }
   }

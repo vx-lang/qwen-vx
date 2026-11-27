@@ -35,7 +35,7 @@ import qwen::tokenizer;
 // Declared here, so that `write` is this one and not `core::ptr::write`.
 extern {
   fn read(fd : i32, buf : *mut i8, n : i64) -> i64;
-  fn write(fd : i32, buf : *const i8, n : i64) -> i64;
+  pkg fn write(fd : i32, buf : *const i8, n : i64) -> i64;
   fn fwrite(ptr : *const i8, size : i64, count : i64, stream : *mut i8) -> i64;
 }
 
@@ -417,7 +417,7 @@ fn load_cache(w : &Weights, s : &mut State, session : &mut Session, path : *cons
 }
 
 /// Answers the requests of the file at `requests` until it ends.
-fn run_session(weights_path : *const i8, tokenizer_path : *const i8, requests : *const i8, replies : *const i8, context : i32) -> i32 {
+pub fn run_session(weights_path : *const i8, tokenizer_path : *const i8, requests : *const i8, replies : *const i8, context : i32) -> i32 {
   let t = load_tokenizer(tokenizer_path);
   let w = load_weights(weights_path);
   assert(context > 0 && context <= w.config.max_positions, "--context must be between 1 and the max_positions of the model");

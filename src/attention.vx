@@ -24,7 +24,7 @@ import std::nn;
 /// The blocks of the first kernel split the positions, 32 to a block below position 640 and 64 from
 /// there on. A block serves the 8 heads of Q that share a head of K and V, so it reads each row of
 /// the cache once for all 8. A second kernel merges the parts of the blocks for each head.
-fn split_attention<M : Memory>(out : &mut Tensor<f32, [?, ?], Memory::M>, part : &mut Tensor<f32, [?, ?, ?, ?], Memory::M>, q : &Tensor<f32, [?, ?], Memory::M>, k_cache : &Tensor<f16, [?, ?, ?], Memory::M>, v_cache : &Tensor<f16, [?, ?, ?], Memory::M>, pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+pub fn split_attention<M : Memory>(out : &mut Tensor<f32, [?, ?], Memory::M>, part : &mut Tensor<f32, [?, ?, ?, ?], Memory::M>, q : &Tensor<f32, [?, ?], Memory::M>, k_cache : &Tensor<f16, [?, ?, ?], Memory::M>, v_cache : &Tensor<f16, [?, ?, ?], Memory::M>, pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
   nn_check_heads(q.extent(0), q.extent(1), q_heads, head_dim);
   nn_check_heads(out.extent(0), out.extent(1), q_heads, head_dim);
   nn_check_cache(k_cache.extent(0), k_cache.extent(1), k_cache.extent(2), pos, kv_heads, head_dim);
@@ -51,7 +51,7 @@ fn split_attention<M : Memory>(out : &mut Tensor<f32, [?, ?], Memory::M>, part :
 /// (llama.cpp goes on to 4 SIMD groups of 32 a block, but 128 parts are no faster here: their merge costs what
 /// they save.) `vec_attention_merge` then merges the parts. `part` is scratch space from
 /// `vec_attention_scratch`.
-fn vec_attention(out : &mut Tensor<f32, [?, ?], Memory::HBM>, part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+pub fn vec_attention(out : &mut Tensor<f32, [?, ?], Memory::HBM>, part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
   nn_check_heads(q.extent(0), q.extent(1), q_heads, head_dim);
   nn_check_heads(out.extent(0), out.extent(1), q_heads, head_dim);
   nn_check_cache(k_cache.extent(0), k_cache.extent(1), k_cache.extent(2), pos, kv_heads, head_dim);
@@ -70,7 +70,7 @@ fn vec_attention(out : &mut Tensor<f32, [?, ?], Memory::HBM>, part : &mut Tensor
 /// The scratch space of `vec_attention`, on the CPU: up to 128 parts for each head of Q, each the sum of V
 /// (128 values), the largest score, and the sum of the weights. A part has 132 values, so that each starts
 /// at a multiple of 16 bytes.
-fn vec_attention_scratch(q_heads : i32) -> Tensor<f32, [?, ?, ?]> {
+pub fn vec_attention_scratch(q_heads : i32) -> Tensor<f32, [?, ?, ?]> {
   return Tensor<f32>([q_heads, 128, 132]);
 }
 
@@ -85,7 +85,7 @@ fn vec_attention_parts(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Ten
     for h in 0..q_heads across blocks {
       for w in 0..nwg across blocks {
         let g = h / group;
-        let _d = mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
+        let _d = unsafe { mlir!( threads : 32, inputs : (%part = part : memref<?x?x?xf32>, %q = q : memref<?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %pos = pos : i32, %nwg = nwg : i32, %scale = scale : f32, %h = h : i32, %w = w : i32, %g = g : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(q), reads_only(k_cache), reads_only(v_cache), writes_only(part[h][w])]) {
           %c0 = arith.constant 0 : index
           %c1 = arith.constant 1 : index
           %c4 = arith.constant 4 : index
@@ -162,7 +162,7 @@ fn vec_attention_parts(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Ten
             memref.store %st#1, %part[%hi, %wi, %c129] : memref<?x?x?xf32>
           }
           macro.yield %h : i32
-        };
+        } };
       }
     }
   }
@@ -175,7 +175,7 @@ fn vec_attention_parts(part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Ten
 fn vec_attention_merge(out : &mut Tensor<f32, [?, ?], Memory::HBM>, part : &Tensor<f32, [?, ?, ?], Memory::HBM>, parts : i32, q_heads : i32) -> void {
   spawn on(Topology::Device) {
     for h in 0..q_heads across blocks {
-      let _d = mlir!( threads : 128, inputs : (%out = out : memref<?x?xf32>, %part = part : memref<?x?x?xf32>, %parts = parts : i32, %h = h : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(part), writes_only(out[h])]) {
+      let _d = unsafe { mlir!( threads : 128, inputs : (%out = out : memref<?x?xf32>, %part = part : memref<?x?x?xf32>, %parts = parts : i32, %h = h : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [reads_only(part), writes_only(out[h])]) {
         %c0 = arith.constant 0 : index
         %c1 = arith.constant 1 : index
         %c2 = arith.constant 2 : index
@@ -282,7 +282,7 @@ fn vec_attention_merge(out : &mut Tensor<f32, [?, ?], Memory::HBM>, part : &Tens
           }
         }
         macro.yield %h : i32
-      };
+      } };
     }
   }
   return;
@@ -291,7 +291,7 @@ fn vec_attention_merge(out : &mut Tensor<f32, [?, ?], Memory::HBM>, part : &Tens
 /// The scratch space of `split_attention` for positions below `max_seq`, on the CPU. Transfer it to the
 /// memory of the other tensors. Each block of positions writes the weighted sum of V for each of its
 /// heads, then the largest score and the sum of the weights.
-fn split_attention_scratch(max_seq : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> Tensor<f32, [?, ?, ?, ?]> {
+pkg fn split_attention_scratch(max_seq : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> Tensor<f32, [?, ?, ?, ?]> {
   // 20 blocks of 32 positions below position 640, and blocks of 64 positions from there on.
   let mut splits = (max_seq + 63) / 64;
   if splits < 20 {
@@ -794,7 +794,7 @@ fn split_attention_merge<M : Memory>(out : &mut Tensor<f32, [?, ?], Memory::M>, 
 /// q, turned, to `q_out`, and each head of k, turned, and of v to row `pos` of the cache. Value i
 /// of a head pairs with value i + head_dim / 2, as in the Llama and Qwen models of Hugging Face.
 /// Both turn by the angle whose cosine and sine are cos[pos][i] and sin[pos][i].
-fn rope_and_store<M : Memory>(q_out : &mut Tensor<f32, [?, ?], Memory::M>, k_cache : &mut Tensor<f16, [?, ?, ?], Memory::M>, v_cache : &mut Tensor<f16, [?, ?, ?], Memory::M>, q : &Tensor<f32, [?, ?], Memory::M>, k : &Tensor<f32, [?, ?], Memory::M>, v : &Tensor<f32, [?, ?], Memory::M>, cos : &Tensor<f32, [?, ?], Memory::M>, sin : &Tensor<f32, [?, ?], Memory::M>, pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
+pkg fn rope_and_store<M : Memory>(q_out : &mut Tensor<f32, [?, ?], Memory::M>, k_cache : &mut Tensor<f16, [?, ?, ?], Memory::M>, v_cache : &mut Tensor<f16, [?, ?, ?], Memory::M>, q : &Tensor<f32, [?, ?], Memory::M>, k : &Tensor<f32, [?, ?], Memory::M>, v : &Tensor<f32, [?, ?], Memory::M>, cos : &Tensor<f32, [?, ?], Memory::M>, sin : &Tensor<f32, [?, ?], Memory::M>, pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32) -> void {
   let half = head_dim / 2;
   nn_check_heads(q.extent(0), q.extent(1), q_heads, head_dim);
   nn_check_heads(q_out.extent(0), q_out.extent(1), q_heads, head_dim);
@@ -834,7 +834,7 @@ fn rope_and_store<M : Memory>(q_out : &mut Tensor<f32, [?, ?], Memory::M>, k_cac
 /// As `rope_and_store`, after an RMSNorm over each head of q and of k: value i of a head x
 /// becomes x[i] / sqrt(mean(x^2) + eps) * norm[i], where `norm` is `q_norm` for q and `k_norm`
 /// for k. Qwen3 has these norms.
-fn norm_rope_and_store<M : Memory>(q_out : &mut Tensor<f32, [?, ?], Memory::M>, k_cache : &mut Tensor<f16, [?, ?, ?], Memory::M>, v_cache : &mut Tensor<f16, [?, ?, ?], Memory::M>, q : &Tensor<f32, [?, ?], Memory::M>, k : &Tensor<f32, [?, ?], Memory::M>, v : &Tensor<f32, [?, ?], Memory::M>, q_norm : &Tensor<bf16, [?], Memory::M>, k_norm : &Tensor<bf16, [?], Memory::M>, cos : &Tensor<f32, [?, ?], Memory::M>, sin : &Tensor<f32, [?, ?], Memory::M>, pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32, eps : f32) -> void {
+pub fn norm_rope_and_store<M : Memory>(q_out : &mut Tensor<f32, [?, ?], Memory::M>, k_cache : &mut Tensor<f16, [?, ?, ?], Memory::M>, v_cache : &mut Tensor<f16, [?, ?, ?], Memory::M>, q : &Tensor<f32, [?, ?], Memory::M>, k : &Tensor<f32, [?, ?], Memory::M>, v : &Tensor<f32, [?, ?], Memory::M>, q_norm : &Tensor<bf16, [?], Memory::M>, k_norm : &Tensor<bf16, [?], Memory::M>, cos : &Tensor<f32, [?, ?], Memory::M>, sin : &Tensor<f32, [?, ?], Memory::M>, pos : i32, q_heads : i32, kv_heads : i32, head_dim : i32, eps : f32) -> void {
   let half = head_dim / 2;
   nn_check_heads(q.extent(0), q.extent(1), q_heads, head_dim);
   nn_check_heads(q_out.extent(0), q_out.extent(1), q_heads, head_dim);

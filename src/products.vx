@@ -14,7 +14,7 @@
 import core::num;
 import std::nn;
 
-fn qkv_q4_blocks(q : &mut Tensor<f32, [?, ?], Memory::HBM>, k : &mut Tensor<f32, [?, ?], Memory::HBM>, v : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, b : &Tensor<bf16, [?], Memory::HBM>, x : &Tensor<f32, [?], Memory::HBM>, q_heads : i32, kv_heads : i32, head_dim : i32, cols : i32) -> void {
+pkg fn qkv_q4_blocks(q : &mut Tensor<f32, [?, ?], Memory::HBM>, k : &mut Tensor<f32, [?, ?], Memory::HBM>, v : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, b : &Tensor<bf16, [?], Memory::HBM>, x : &Tensor<f32, [?], Memory::HBM>, q_heads : i32, kv_heads : i32, head_dim : i32, cols : i32) -> void {
   let heads = q_heads + 2 * kv_heads;
   nn_check_heads(q.extent(0), q.extent(1), q_heads, head_dim);
   nn_check_heads(k.extent(0), k.extent(1), kv_heads, head_dim);
@@ -106,7 +106,7 @@ fn qkv_q4_blocks(q : &mut Tensor<f32, [?, ?], Memory::HBM>, k : &mut Tensor<f32,
 }
 
 
-fn matvec_q4_heads_add_blocks(y : &mut Tensor<f32, [?], Memory::HBM>, w : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, rows : i32, heads : i32, head_dim : i32) -> void {
+pkg fn matvec_q4_heads_add_blocks(y : &mut Tensor<f32, [?], Memory::HBM>, w : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, rows : i32, heads : i32, head_dim : i32) -> void {
   let cols = heads * head_dim;
   nn_check_heads(x.extent(0), x.extent(1), heads, head_dim);
   nn_check_q4(w.len(), scales.len(), cols, rows, cols);
@@ -186,7 +186,7 @@ fn matvec_q4_heads_add_blocks(y : &mut Tensor<f32, [?], Memory::HBM>, w : &Tenso
 }
 
 
-fn moe_swiglu_q4_blocks(out : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, ids : &Tensor<i32, [?], Memory::HBM>, x : &Tensor<f32, [?], Memory::HBM>, k : i32, rows : i32, cols : i32, experts : i32) -> void {
+pkg fn moe_swiglu_q4_blocks(out : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, ids : &Tensor<i32, [?], Memory::HBM>, x : &Tensor<f32, [?], Memory::HBM>, k : i32, rows : i32, cols : i32, experts : i32) -> void {
   assert(k > 0 && ids.len() >= k && out.extent(0) >= k && out.extent(1) >= rows, "nn_moe_swiglu_q4: `ids` needs k values, and `out` a row of rows values for each");
   assert(rows % 8 == 0, "nn_moe_swiglu_q4: rows must be a multiple of 8");
   nn_check_q4(w.len(), scales.len(), x.len(), experts * 2 * rows, cols);
@@ -270,7 +270,7 @@ fn moe_swiglu_q4_blocks(out : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor
 }
 
 
-fn moe_down_q4_add_blocks(y : &mut Tensor<f32, [?], Memory::HBM>, w : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, ids : &Tensor<i32, [?], Memory::HBM>, weights : &Tensor<f32, [?], Memory::HBM>, h : &Tensor<f32, [?, ?], Memory::HBM>, k : i32, rows : i32, cols : i32, experts : i32) -> void {
+pkg fn moe_down_q4_add_blocks(y : &mut Tensor<f32, [?], Memory::HBM>, w : &Tensor<u32, [?], Memory::HBM>, scales : &Tensor<f16, [?], Memory::HBM>, ids : &Tensor<i32, [?], Memory::HBM>, weights : &Tensor<f32, [?], Memory::HBM>, h : &Tensor<f32, [?, ?], Memory::HBM>, k : i32, rows : i32, cols : i32, experts : i32) -> void {
   assert(k > 0 && ids.len() >= k && weights.len() >= k && h.extent(0) >= k && h.extent(1) >= cols, "nn_moe_down_q4_add: `ids` and `weights` need k values, and `h` a row of cols values for each");
   nn_check_q4(w.len(), scales.len(), cols, experts * rows, cols);
   assert(rows % 8 == 0 && y.len() >= rows, "nn q4: rows must be a multiple of 8, and the output needs rows values");

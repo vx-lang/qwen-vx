@@ -35,16 +35,17 @@
 // DECODE: {{^}}decoded 11 texts, 11 equal to the NFC form of the text{{$}}
 import core::convert;
 import core::ptr;
+import std::string;
 import std::vec;
 import qwen::tokenizer;
 
 /// Whether the C string `a` is `b`.
 fn same_text(a : *const i8, b : *const i8) -> bool {
-  let n = unsafe { strlen(a) };
-  if n != unsafe { strlen(b) } {
+  let n = unsafe { string_length(a) };
+  if n != unsafe { string_length(b) } {
     return false;
   }
-  let mut i : i64 = 0;
+  let mut i : i32 = 0;
   while i < n {
     if unsafe { a[i] } != unsafe { b[i] } {
       return false;
@@ -101,7 +102,7 @@ fn decode_all(t : &Tokenizer, input : &Text) -> i32 {
       digits = 0;
       if ch == 10 {
         // The one byte of the empty C string is its NUL.
-        write_bytes("", 1);
+        print_bytes("", 1);
       }
     }
     i = i + 1;

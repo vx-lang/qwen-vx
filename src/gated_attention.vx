@@ -25,7 +25,7 @@ import qwen::simd;
 
 /// The norms and RoPE of q and k at position `pos`, and the store of k and v into the caches. Block h
 /// does head h of q, then the heads of k. `cos` and `sin` have rot / 2 values for each position.
-fn gated_norm_rope_and_store(q_out : &mut Tensor<f32, [?, ?], Memory::HBM>, k_cache : &mut Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &mut Tensor<f16, [?, ?, ?], Memory::HBM>, qkvg : &Tensor<f32, [?], Memory::HBM>, q_norm : &Tensor<f32, [?], Memory::HBM>, k_norm : &Tensor<f32, [?], Memory::HBM>, cos : &Tensor<f32, [?, ?], Memory::HBM>, sin : &Tensor<f32, [?, ?], Memory::HBM>, pos : i32, q_heads : i32, kv_heads : i32, rot : i32, eps : f32) -> void {
+pub fn gated_norm_rope_and_store(q_out : &mut Tensor<f32, [?, ?], Memory::HBM>, k_cache : &mut Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &mut Tensor<f16, [?, ?, ?], Memory::HBM>, qkvg : &Tensor<f32, [?], Memory::HBM>, q_norm : &Tensor<f32, [?], Memory::HBM>, k_norm : &Tensor<f32, [?], Memory::HBM>, cos : &Tensor<f32, [?, ?], Memory::HBM>, sin : &Tensor<f32, [?, ?], Memory::HBM>, pos : i32, q_heads : i32, kv_heads : i32, rot : i32, eps : f32) -> void {
   let half = rot / 2;
   assert(q_out.extent(0) == q_heads && q_out.extent(1) == 256, "gated_norm_rope_and_store: q_out must be [q_heads, 256]");
   assert(k_cache.extent(0) > pos && k_cache.extent(1) == kv_heads && k_cache.extent(2) == 256 && v_cache.extent(0) > pos && v_cache.extent(1) == kv_heads && v_cache.extent(2) == 256, "gated_norm_rope_and_store: the caches must be [positions, kv_heads, 256] with a row for pos");
@@ -80,7 +80,7 @@ fn gated_norm_rope_and_store(q_out : &mut Tensor<f32, [?, ?], Memory::HBM>, k_ca
 
 /// The attention of the token at position `pos`, times sigmoid(gate): y[h * 256 + d] for each head
 /// h of q. `part` is scratch space from `gated_attention_scratch`.
-fn gated_attention(y : &mut Tensor<f32, [?], Memory::HBM>, part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, qkvg : &Tensor<f32, [?], Memory::HBM>, pos : i32, q_heads : i32, kv_heads : i32) -> void {
+pub fn gated_attention(y : &mut Tensor<f32, [?], Memory::HBM>, part : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, qkvg : &Tensor<f32, [?], Memory::HBM>, pos : i32, q_heads : i32, kv_heads : i32) -> void {
   assert(q.extent(0) == q_heads && q.extent(1) == 256 && q_heads % kv_heads == 0, "gated_attention: q must be [q_heads, 256], and q_heads a multiple of kv_heads");
   assert(k_cache.extent(0) > pos && k_cache.extent(1) == kv_heads && k_cache.extent(2) == 256 && v_cache.extent(0) > pos && v_cache.extent(1) == kv_heads && v_cache.extent(2) == 256, "gated_attention: the caches must be [positions, kv_heads, 256] with a row for pos");
   assert(part.extent(0) >= q_heads && part.extent(1) >= 64 && part.extent(2) == 260, "gated_attention: `part` is too small. Make it with gated_attention_scratch");
@@ -96,7 +96,7 @@ fn gated_attention(y : &mut Tensor<f32, [?], Memory::HBM>, part : &mut Tensor<f3
 
 /// The scratch space of `gated_attention`, on the CPU: up to 64 parts for each head of q, each the sum
 /// of V (256 values), the largest score, and the sum of the weights.
-fn gated_attention_scratch(q_heads : i32) -> Tensor<f32, [?, ?, ?]> {
+pub fn gated_attention_scratch(q_heads : i32) -> Tensor<f32, [?, ?, ?]> {
   return Tensor<f32>([q_heads, 64, 260]);
 }
 
@@ -262,7 +262,7 @@ fn gated_attention_merge(y : &mut Tensor<f32, [?], Memory::HBM>, part : &Tensor<
 /// their rows in the caches: position t is at start + t, with q[t], qkvg[t] and y[t]. Each position
 /// gets the bits of `gated_attention` at its position, with 2 launches for all n. `part` is scratch
 /// space from `gated_attention_rows_scratch`.
-fn gated_attention_rows(y : &mut Tensor<f32, [?, ?], Memory::HBM>, part : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, qkvg : &Tensor<f32, [?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32) -> void {
+pkg fn gated_attention_rows(y : &mut Tensor<f32, [?, ?], Memory::HBM>, part : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, qkvg : &Tensor<f32, [?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32) -> void {
   assert(n >= 1 && q.extent(0) >= n && q.extent(1) == q_heads && q.extent(2) == 256 && q_heads % kv_heads == 0, "gated_attention_rows: q must be [n, q_heads, 256], and q_heads a multiple of kv_heads");
   assert(k_cache.extent(0) >= start + n && k_cache.extent(1) == kv_heads && k_cache.extent(2) == 256 && v_cache.extent(0) >= start + n && v_cache.extent(1) == kv_heads && v_cache.extent(2) == 256, "gated_attention_rows: the caches must be [positions, kv_heads, 256] with rows for the n positions");
   assert(part.extent(0) >= n && part.extent(1) == q_heads && part.extent(2) >= 64 && part.extent(3) == 260, "gated_attention_rows: `part` is too small. Make it with gated_attention_rows_scratch");
@@ -273,7 +273,7 @@ fn gated_attention_rows(y : &mut Tensor<f32, [?, ?], Memory::HBM>, part : &mut T
 }
 
 /// The scratch space of `gated_attention_rows` for up to n positions, on the CPU.
-fn gated_attention_rows_scratch(n : i32, q_heads : i32) -> Tensor<f32, [?, ?, ?, ?]> {
+pkg fn gated_attention_rows_scratch(n : i32, q_heads : i32) -> Tensor<f32, [?, ?, ?, ?]> {
   return Tensor<f32>([n, q_heads, 64, 260]);
 }
 

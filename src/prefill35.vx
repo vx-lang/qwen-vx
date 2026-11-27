@@ -65,7 +65,7 @@ struct Prefill35 {
 }
 
 /// The tensors for chunks of up to `chunk` tokens.
-fn new_prefill35(c : &Config, chunk : i32) -> Prefill35 {
+pub fn new_prefill35(c : &Config, chunk : i32) -> Prefill35 {
   assert(chunk > 0 && chunk % 16 == 0, "new_prefill35: the chunk must be a multiple of 16");
   let k = c.experts_per_token;
   let experts = c.num_experts;
@@ -117,7 +117,7 @@ fn new_prefill35(c : &Config, chunk : i32) -> Prefill35 {
 // ------------------------------------------------------------------------------ norms ---
 
 /// `pf_rms_norm` with f32 weights.
-fn pf35_rms_norm(y : &mut Tensor<f32, [?, ?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<f32, [?], Memory::HBM>, n : i32, dim : i32, eps : f32) -> void {
+pkg fn pf35_rms_norm(y : &mut Tensor<f32, [?, ?], Memory::HBM>, x : &Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<f32, [?], Memory::HBM>, n : i32, dim : i32, eps : f32) -> void {
   spawn on(Topology::Device) {
     for t in 0..n across blocks {
       let mut part = unsafe { Tensor<f32, [1024], Memory::SMEM>::uninit() };
@@ -146,7 +146,7 @@ fn pf35_rms_norm(y : &mut Tensor<f32, [?, ?], Memory::HBM>, x : &Tensor<f32, [?,
 }
 
 /// `pf_add_rms_norm` with f32 weights: x[t] += y[t], then y[t] = the RMSNorm of x[t] times w.
-fn pf35_add_rms_norm(x : &mut Tensor<f32, [?, ?], Memory::HBM>, y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<f32, [?], Memory::HBM>, n : i32, dim : i32, eps : f32) -> void {
+pkg fn pf35_add_rms_norm(x : &mut Tensor<f32, [?, ?], Memory::HBM>, y : &mut Tensor<f32, [?, ?], Memory::HBM>, w : &Tensor<f32, [?], Memory::HBM>, n : i32, dim : i32, eps : f32) -> void {
   spawn on(Topology::Device) {
     for t in 0..n across blocks {
       let mut part = unsafe { Tensor<f32, [1024], Memory::SMEM>::uninit() };
@@ -518,7 +518,7 @@ fn pf_dn_recur(o : &mut Tensor<f32, [?, ?, ?, ?], Memory::HBM>, state : &mut Ten
 /// The norms and RoPE of q and k, and the store of k and v, for the n tokens of the chunk, as
 /// `gated_norm_rope_and_store`: token t is at position start + t. Block (t, h) does head h of q,
 /// then the heads of k.
-fn pf_gated_norm_rope_and_store(q_out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &mut Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &mut Tensor<f16, [?, ?, ?], Memory::HBM>, qkvg : &Tensor<f32, [?, ?], Memory::HBM>, q_norm : &Tensor<f32, [?], Memory::HBM>, k_norm : &Tensor<f32, [?], Memory::HBM>, cos : &Tensor<f32, [?, ?], Memory::HBM>, sin : &Tensor<f32, [?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32, rot : i32, eps : f32) -> void {
+pkg fn pf_gated_norm_rope_and_store(q_out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &mut Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &mut Tensor<f16, [?, ?, ?], Memory::HBM>, qkvg : &Tensor<f32, [?, ?], Memory::HBM>, q_norm : &Tensor<f32, [?], Memory::HBM>, k_norm : &Tensor<f32, [?], Memory::HBM>, cos : &Tensor<f32, [?, ?], Memory::HBM>, sin : &Tensor<f32, [?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, kv_heads : i32, rot : i32, eps : f32) -> void {
   let half = rot / 2;
   assert(k_cache.extent(0) >= start + n && v_cache.extent(0) >= start + n && cos.extent(0) >= start + n && sin.extent(0) >= start + n, "pf_gated_norm_rope_and_store: the caches and the angles need rows for the chunk");
   spawn on(Topology::Device) {
@@ -583,7 +583,7 @@ fn pf_gated_norm_rope_and_store(q_out : &mut Tensor<f32, [?, ?, ?], Memory::HBM>
 ///
 /// scripts/mlir_kernels/gated_flash_attention.py writes this function: change that script, not the
 /// MLIR.
-fn pf_gated_flash_attention(y : &mut Tensor<f32, [?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, qkvg : &Tensor<f32, [?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, group : i32, gate_at : i32, scale : f32) -> void {
+pkg fn pf_gated_flash_attention(y : &mut Tensor<f32, [?, ?], Memory::HBM>, q : &Tensor<f32, [?, ?, ?], Memory::HBM>, k_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, v_cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, qkvg : &Tensor<f32, [?, ?], Memory::HBM>, start : i32, n : i32, q_heads : i32, group : i32, gate_at : i32, scale : f32) -> void {
   assert(q.extent(2) == 256 && k_cache.extent(2) == 256 && k_cache.extent(0) % 64 == 0 && start + n <= k_cache.extent(0), "pf_gated_flash_attention: heads of 256 values, and a KV cache of a multiple of 64 positions");
   spawn on(Topology::Device) {
     for qb in 0..(n + 7) / 8 across blocks {
@@ -592,7 +592,7 @@ fn pf_gated_flash_attention(y : &mut Tensor<f32, [?, ?], Memory::HBM>, q : &Tens
         let mut so = unsafe { Tensor<f32, [2048], Memory::SMEM>::uninit() };
         let mut ss = unsafe { Tensor<f32, [512], Memory::SMEM>::uninit() };
         let mut sp = unsafe { Tensor<f16, [512], Memory::SMEM>::uninit() };
-        let _d = mlir!( threads : 128, inputs : (%sq = &mut sq : memref<2048xf16, 3>, %so = &mut so : memref<2048xf32, 3>, %ss = &mut ss : memref<512xf32, 3>, %sp = &mut sp : memref<512xf16, 3>, %y = y : memref<?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %qkvg = qkvg : memref<?x?xf32>, %start = start : i32, %n = n : i32, %group = group : i32, %gate_at = gate_at : i32, %scale = scale : f32, %qb = qb : i32, %h = h : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [writes_only(sq), writes_only(so), writes_only(ss), writes_only(sp), reads_only(q), reads_only(k_cache), reads_only(v_cache), reads_only(qkvg), writes_only(y[qb * 8..qb * 8 + 8][h * 256..h * 256 + 256])]) {
+        let _d = unsafe { mlir!( threads : 128, inputs : (%sq = &mut sq : memref<2048xf16, 3>, %so = &mut so : memref<2048xf32, 3>, %ss = &mut ss : memref<512xf32, 3>, %sp = &mut sp : memref<512xf16, 3>, %y = y : memref<?x?xf32>, %q = q : memref<?x?x?xf32>, %k3 = k_cache : memref<?x?x?xf16>, %v3 = v_cache : memref<?x?x?xf16>, %qkvg = qkvg : memref<?x?xf32>, %start = start : i32, %n = n : i32, %group = group : i32, %gate_at = gate_at : i32, %scale = scale : f32, %qb = qb : i32, %h = h : i32), returns : i32, dialects : ["arith", "memref", "scf", "gpu", "vector", "math"], ensures : [writes_only(sq), writes_only(so), writes_only(ss), writes_only(sp), reads_only(q), reads_only(k_cache), reads_only(v_cache), reads_only(qkvg), writes_only(y[qb * 8..qb * 8 + 8][h * 256..h * 256 + 256])]) {
           %c0 = arith.constant 0 : index
           %c1 = arith.constant 1 : index
           %c2 = arith.constant 2 : index
@@ -955,7 +955,7 @@ fn pf_gated_flash_attention(y : &mut Tensor<f32, [?, ?], Memory::HBM>, q : &Tens
             vector.store %fg1b, %y[%qt1, %yc1b] : memref<?x?xf32>, vector<4xf32>
           }
           macro.yield %qb : i32
-        };
+        } };
       }
     }
   }
@@ -967,7 +967,7 @@ fn pf_gated_flash_attention(y : &mut Tensor<f32, [?, ?], Memory::HBM>, q : &Tens
 /// A dense product of the chunk: `pf_mm` with no bias and no `add`, or, for a Q4_0 matrix of whole
 /// blocks of 64 rows, `pf_mm_q4_mlir64`, whose blocks of 64 tokens decode each weight for 64 tokens
 /// in place of 32. `new_prefill35` makes the tensors of the chunk for whole blocks of 64 tokens.
-fn pf35_mm(y : &mut Tensor<f32, [?, ?], Memory::HBM>, m : &WeightMatrix, x : &Tensor<f32, [?, ?], Memory::HBM>, list : &Tensor<i32, [?], Memory::HBM>, zeros : &Tensor<i32, [?], Memory::HBM>, no_bias : &Tensor<bf16, [?], Memory::HBM>, rows : i32, cols : i32, tiles : i32) -> void {
+pkg fn pf35_mm(y : &mut Tensor<f32, [?, ?], Memory::HBM>, m : &WeightMatrix, x : &Tensor<f32, [?, ?], Memory::HBM>, list : &Tensor<i32, [?], Memory::HBM>, zeros : &Tensor<i32, [?], Memory::HBM>, no_bias : &Tensor<bf16, [?], Memory::HBM>, rows : i32, cols : i32, tiles : i32) -> void {
   if m.dtype == U4 && rows % 64 == 0 {
     pf_mm_q4_mlir64(y, &m.codes, &m.group_scales, x, list, zeros, 0, rows, cols, tiles);
   } else {
@@ -996,7 +996,7 @@ fn pf35_add_shared(x : &mut Tensor<f32, [?, ?], Memory::HBM>, out : &Tensor<f32,
 
 /// The experts and the shared expert of a layer, for the n tokens of the chunk: x += the experts of
 /// each token, for the norm of x in xn, as `pf_experts`, and the shared expert times its gate.
-fn pf35_experts(p : &mut Prefill35, layer : &Qwen35Layer, c : &Config, n : i32, tiles : i32) -> void {
+pkg fn pf35_experts(p : &mut Prefill35, layer : &Qwen35Layer, c : &Config, n : i32, tiles : i32) -> void {
   let k = c.experts_per_token;
   let experts = c.num_experts;
   let inter = c.moe_intermediate_size;
@@ -1029,7 +1029,7 @@ fn pf35_experts(p : &mut Prefill35, layer : &Qwen35Layer, c : &Config, n : i32, 
 
 /// Runs tokens start to start + n - 1 of the prompt, in `p.tokens`, through every layer. The state
 /// of each layer is updated, and the hidden states go to p.x.
-fn pf35_chunk(w : &Qwen35Weights, s : &mut Qwen35State, p : &mut Prefill35, start : i32, n : i32) -> void {
+pkg fn pf35_chunk(w : &Qwen35Weights, s : &mut Qwen35State, p : &mut Prefill35, start : i32, n : i32) -> void {
   let c = &w.config;
   let eps = c.rms_norm_eps as f32;
   let tiles = (n + 15) / 16;
@@ -1068,14 +1068,14 @@ fn pf35_chunk(w : &Qwen35Weights, s : &mut Qwen35State, p : &mut Prefill35, star
 
 /// The chunk of `prefill_qwen35` for a prompt of `count` tokens: CHUNK, or fewer for a shorter
 /// prompt.
-fn prefill35_chunk(count : i32) -> i32 {
+pub fn prefill35_chunk(count : i32) -> i32 {
   return i32::min(CHUNK, (count + 15) / 16 * 16);
 }
 
 /// Runs the prompt through every layer, in chunks of up to CHUNK tokens, from position 0. The
 /// hidden state of the last token is then in `s.x`, as after `run_qwen35_layers`, so
 /// `predict_qwen35` gives the next token.
-fn prefill_qwen35(w : &Qwen35Weights, s : &mut Qwen35State, prompt : &Vec<i32>) -> void {
+pub fn prefill_qwen35(w : &Qwen35Weights, s : &mut Qwen35State, prompt : &Vec<i32>) -> void {
   let mut p = new_prefill35(&w.config, prefill35_chunk(prompt.len()));
   prefill_qwen35_with(w, s, &mut p, prompt);
   return;
@@ -1083,7 +1083,7 @@ fn prefill_qwen35(w : &Qwen35Weights, s : &mut Qwen35State, prompt : &Vec<i32>) 
 
 /// `prefill_qwen35` with the tensors of `p`, from `new_prefill35`, so that more prompts can use the
 /// same tensors. Each chunk writes the parts of them that it reads.
-fn prefill_qwen35_with(w : &Qwen35Weights, s : &mut Qwen35State, p : &mut Prefill35, prompt : &Vec<i32>) -> void {
+pub fn prefill_qwen35_with(w : &Qwen35Weights, s : &mut Qwen35State, p : &mut Prefill35, prompt : &Vec<i32>) -> void {
   let c = &w.config;
   let count = prompt.len();
   assert(count > 0 && count <= s.max_seq, "prefill_qwen35: the prompt must have tokens and fit in the state");

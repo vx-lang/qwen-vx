@@ -18,8 +18,8 @@ import std::vec;
 import core::ptr;
 
 extern {
-  fn strlen(s : *const i8) -> i64;
-  fn strcmp(a : *const i8, b : *const i8) -> i32;
+  pkg fn strlen(s : *const i8) -> i64;
+  pub fn strcmp(a : *const i8, b : *const i8) -> i32;
 }
 
 /// The bytes "VXQWEN01" at the start of the file, read as one little-endian i64.
@@ -451,7 +451,7 @@ fn read_config(r : &Reader) -> Config {
 
 /// The arch of the model in the weight file at `path`: 0 for `load_weights`, and 1 for
 /// `load_qwen35_weights`. It reads only the header.
-fn weight_file_arch(path : *const i8) -> i32 {
+pub fn weight_file_arch(path : *const i8) -> i32 {
   let r = open_weight_file(path);
   let arch = read_config(&r).arch;
   close_weight_file(&r);
@@ -466,7 +466,7 @@ fn empty_matrix() -> WeightMatrix {
 }
 
 /// Loads the weight file at `path`, of an arch 1 model, into GPU memory.
-fn load_qwen35_weights(path : *const i8) -> Qwen35Weights {
+pub fn load_qwen35_weights(path : *const i8) -> Qwen35Weights {
   let mut r = open_weight_file(path);
   let config = read_config(&r);
   assert(config.arch == ARCH_QWEN35, "this weight file is not of a Qwen3.5 MoE model; use load_weights");
@@ -595,7 +595,7 @@ fn load_qwen35_layer(r : &mut Reader, config : &Config, dtype : i64, full : bool
 }
 
 /// Loads the weight file at `path`, of an arch 0 model, into GPU memory.
-fn load_weights(path : *const i8) -> Weights {
+pub fn load_weights(path : *const i8) -> Weights {
   let mut r = open_weight_file(path);
   let config = read_config(&r);
   assert(config.arch == 0, "this weight file is of a Qwen3.5 MoE model; use load_qwen35_weights");

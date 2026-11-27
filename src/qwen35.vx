@@ -63,7 +63,7 @@ fn zeros_f32(n : i32) -> Tensor<f32, [?], Memory::HBM> {
 
 /// The state for up to `max_seq` positions. The angles of RoPE are computed in f64, as in
 /// `reference.py`, and rounded to f32 once.
-fn new_qwen35_state(c : &Config, max_seq : i32) -> Qwen35State {
+pub fn new_qwen35_state(c : &Config, max_seq : i32) -> Qwen35State {
   assert(c.arch == 1, "new_qwen35_state: the model is not a Qwen3.5 model");
   assert(max_seq > 0 && max_seq <= c.max_positions, "max_seq must be between 1 and the max_positions of the model");
   assert(c.head_dim == 256 && c.rotary_dim % 2 == 0 && c.rotary_dim <= 256, "the full attention needs heads of 256 values");
@@ -128,7 +128,7 @@ fn new_qwen35_state(c : &Config, max_seq : i32) -> Qwen35State {
 }
 
 /// y = x / sqrt(mean(x^2) + eps) * w, with f32 weights, as `nn_rms_norm` does with bf16 weights.
-fn rms_norm_f32(y : &mut Tensor<f32, [?], Memory::HBM>, x : &Tensor<f32, [?], Memory::HBM>, w : &Tensor<f32, [?], Memory::HBM>, n : i32, eps : f32) -> void {
+pkg fn rms_norm_f32(y : &mut Tensor<f32, [?], Memory::HBM>, x : &Tensor<f32, [?], Memory::HBM>, w : &Tensor<f32, [?], Memory::HBM>, n : i32, eps : f32) -> void {
   assert(n > 0 && y.len() >= n && x.len() >= n && w.len() >= n, "rms_norm_f32: a tensor has fewer than n values");
   spawn on(Topology::Device) {
     for b in 0..1 across blocks {
@@ -176,7 +176,7 @@ fn shared_gate(out : &mut Tensor<f32, [?], Memory::HBM>, logits : &Tensor<f32, [
 /// The order lets the GPU run launches that do not depend on each other at the same time: the
 /// SwiGLU of the shared expert with the router, top-k with the gate of the shared expert, and the
 /// down product of the shared expert with the SwiGLU of the chosen experts.
-fn add_experts_shared(e : &mut Experts, x : &mut Tensor<f32, [?], Memory::HBM>, xn : &Tensor<f32, [?], Memory::HBM>, shared_weight : &mut Tensor<f32, [?], Memory::HBM>, shared_mlp : &mut Tensor<f32, [?, ?], Memory::HBM>, shared_id : &Tensor<i32, [?], Memory::HBM>, layer : &Qwen35Layer, c : &Config) -> void {
+pkg fn add_experts_shared(e : &mut Experts, x : &mut Tensor<f32, [?], Memory::HBM>, xn : &Tensor<f32, [?], Memory::HBM>, shared_weight : &mut Tensor<f32, [?], Memory::HBM>, shared_mlp : &mut Tensor<f32, [?, ?], Memory::HBM>, shared_id : &Tensor<i32, [?], Memory::HBM>, layer : &Qwen35Layer, c : &Config) -> void {
   let k = c.experts_per_token;
   let inter = c.moe_intermediate_size;
   let shared = c.shared_expert_inter;
@@ -204,7 +204,7 @@ fn add_experts_shared(e : &mut Experts, x : &mut Tensor<f32, [?], Memory::HBM>, 
 
 /// Runs the token in `token` at position `pos` through every layer. The hidden state of the token
 /// is then in `s.x`, and the state of each layer is updated.
-fn run_qwen35_layers(w : &Qwen35Weights, s : &mut Qwen35State, token : &Tensor<i32, [?], Memory::HBM>, pos : i32) -> void {
+pub fn run_qwen35_layers(w : &Qwen35Weights, s : &mut Qwen35State, token : &Tensor<i32, [?], Memory::HBM>, pos : i32) -> void {
   let c = &w.config;
   let eps = c.rms_norm_eps as f32;
   assert(pos >= 0 && pos < s.max_seq, "the position is past the end of the KV cache");
@@ -239,7 +239,7 @@ fn run_qwen35_layers(w : &Qwen35Weights, s : &mut Qwen35State, token : &Tensor<i
 
 /// The logits of the token whose hidden state is in `s.x`, and in `next` the index of the largest
 /// one. Both stay in GPU memory.
-fn predict_qwen35(w : &Qwen35Weights, s : &mut Qwen35State, next : &mut Tensor<i32, [?], Memory::HBM>) -> void {
+pub fn predict_qwen35(w : &Qwen35Weights, s : &mut Qwen35State, next : &mut Tensor<i32, [?], Memory::HBM>) -> void {
   let c = &w.config;
   rms_norm_f32(&mut s.xn, &s.x, &w.final_norm, c.hidden_size, c.rms_norm_eps as f32);
   matvec(&mut s.logits, &w.lm_head, &s.xn, c.vocab_size, c.hidden_size);
