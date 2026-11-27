@@ -1,6 +1,6 @@
 # How the program works
 
-The prompt in chunks, the attention of long contexts, and the tokenizer.
+The prompt in chunks, the attention of long contexts, the tokenizer, and the rights of the program.
 
 ## The prompt in chunks
 
@@ -95,3 +95,12 @@ the `unicodedata` module of Python, so `convert_tokenizer.py` needs the Unicode 
 ```sh
 QWEN_TOKENIZER_CORPUS_MB=40 python3 scripts/test_tokenizer.py
 ```
+
+## The rights of the program
+
+`main` takes the rights of the program from Vx: `fn main(root : Root, args : Vec<String>)`. It
+passes `&root.files`, the right to open files, to the functions that open the weight file, the
+tokenizer file, a prompt file and a cache file. It passes `root.stdout`, the right to print, to the
+functions that print the tokens. Safe code can open a file only with a `&Files`. The `print!` and
+`println!` of Vx still need no right. The program declares no `extern` function. It still calls
+`malloc` and `free` of `std::libc` for its buffers.

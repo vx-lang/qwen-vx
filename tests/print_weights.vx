@@ -94,6 +94,9 @@
 import qwen::weights;
 import core::num;
 import core::convert;
+import std::root;
+import std::string;
+import std::vec;
 
 /// The 16 bits of a bf16 value.
 fn code(v : bf16) -> u32 {
@@ -204,9 +207,9 @@ fn report_matrix(name : *const i8, scale_name : *const i8, layer : i32, m : &Wei
   return;
 }
 
-fn main(argc : i32, argv : *mut *mut i8) -> i32 {
-  assert(argc == 2, "give the weight file as the only argument");
-  let w = load_weights(unsafe { argv[1] });
+fn main(root : Root, args : Vec<String>) -> i32 {
+  assert(args.len() == 2, "give the weight file as the only argument");
+  let w = load_weights(&root.files, args.get_ref(1));
   let c = &w.config;
   println!("config hidden={} layers={} vocab={};", c.hidden_size, c.num_layers, c.vocab_size);
   report("embed", -1, &w.embed);

@@ -19,6 +19,8 @@ import qwen::attention;
 import qwen::weights;
 import qwen::model;
 import qwen::prefill;
+import std::root;
+import std::string;
 
 const NORMS : i32 = 1;
 const QKV : i32 = 2;
@@ -148,8 +150,8 @@ fn print_part(m : i32, t : f64, part : f64) -> void {
   return;
 }
 
-fn main(argc : i32, argv : *mut *mut i8) -> i32 {
-  let w = load_weights(unsafe { argv[1] });
+fn main(root : Root, args : Vec<String>) -> i32 {
+  let w = load_weights(&root.files, args.get_ref(1));
   assert(w.config.num_experts > 0 && w.layers[0].gate_up.dtype == U4, "give the Q4_0 file of the 30B MoE model");
   let mut s = new_state(&w.config, 2048);
   let mut next = transfer(Tensor<i32>([1]), Memory::HBM);

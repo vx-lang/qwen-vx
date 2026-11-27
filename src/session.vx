@@ -23,21 +23,16 @@
 // writes `ready context=N` and a new line to the file of replies.
 import core::convert;
 import core::ptr;
+import core::result;
 import std::fs;
 import std::libc;
+import std::string;
 import std::time;
 import std::vec;
 import qwen::weights;
 import qwen::model;
 import qwen::prefill;
 import qwen::tokenizer;
-
-// Declared here, so that `write` is this one and not `core::ptr::write`.
-extern {
-  fn read(fd : i32, buf : *mut i8, n : i64) -> i64;
-  pkg fn write(fd : i32, buf : *const i8, n : i64) -> i64;
-  fn fwrite(ptr : *const i8, size : i64, count : i64, stream : *mut i8) -> i64;
-}
 
 /// The bytes "VXQKV001" at the start of a cache file, read as one little-endian i64.
 const CACHE_MAGIC : i64 = 3544386053929523286;
@@ -49,29 +44,28 @@ const CACHE_HEADER_WORDS : i64 = 16;
 const LINE_BYTES : i64 = 4096;
 
 struct Session {
-  input : i32,
-  output : i32,
+  input : File,
+  output : File,
   tokens : Vec<i32>,
   weights_bytes : i64,
   line : *mut i8,
 }
 
 /// The size in bytes of the file at `path`.
-fn file_bytes(path : *const i8) -> i64 {
-  let fd : i32 = unsafe { open(path, 0) };
-  assert(fd >= 0, "cannot open the weight file");
-  let size : i64 = unsafe { lseek(fd, 0, 2) };
-  unsafe { close(fd); }
-  return size;
+fn file_bytes(files : &Files, path : &String) -> i64 {
+  let mut file = File::open(files, path, OpenMode::Read).expect("cannot open the weight file");
+  return file.seek(0, 2);
 }
 
-/// Reads one line of the file `fd` into `line`, without its new line, and ends it with a NUL byte.
+/// Reads one line of `input` into `line`, without its new line, and ends it with a NUL byte.
 /// Gives its length, or -1 at the end of the file.
-fn read_line(fd : i32, line : *mut i8) -> i64 {
+fn read_line(input : &mut File, line : *mut i8) -> i64 {
   let mut n : i64 = 0;
   while true {
-    let got = unsafe { read(fd, offset_mut(line, n), 1) };
-    if got <= 0 {
+    let got = unsafe {
+      input.read_raw(offset_mut(line, n) as *mut u8, 1 as u64)
+    };
+    if got == 0 as u64 {
       if n == 0 {
         return -1;
       }
@@ -87,17 +81,19 @@ fn read_line(fd : i32, line : *mut i8) -> i64 {
   return n;
 }
 
-/// Reads exactly `n` bytes of the file `fd` into new memory.
-fn read_bytes(fd : i32, n : i64) -> *mut i8 {
-  let buf : *mut i8 = unsafe { malloc((n + 1) as usize) };
+/// Reads exactly `n` bytes of `input` into `buf`, which has room for `n + 1`, and ends them with a
+/// NUL byte.
+fn read_bytes(input : &mut File, buf : *mut i8, n : i64) -> void {
   let mut done : i64 = 0;
   while done < n {
-    let got = unsafe { read(fd, offset_mut(buf, done), n - done) };
+    let got = unsafe {
+      input.read_raw(offset_mut(buf, done) as *mut u8, (n - done) as u64)
+    } as i64;
     assert(got > 0, "the input ended inside the text of a request");
     done = done + got;
   }
   unsafe { buf[n] = 0 as i8; }
-  return buf;
+  return;
 }
 
 /// Whether the C string `line` starts with the C string `word`.
@@ -127,30 +123,40 @@ fn number_at(line : *const i8, at : i64, end : &mut i64) -> i64 {
   return value;
 }
 
-/// Writes `n` bytes at `bytes` to the file `fd`, all of them.
-fn out_bytes(fd : i32, bytes : *const i8, n : i64) -> void {
+/// Writes the `n` bytes at `bytes` to `out`. Gives false when a write takes none of them.
+fn write_bytes(out : &mut File, bytes : *const i8, n : i64) -> bool {
   let mut done : i64 = 0;
   while done < n {
-    let wrote = unsafe { write(fd, offset(bytes, done), n - done) };
-    assert(wrote > 0, "cannot write a reply");
+    let wrote = unsafe {
+      out.write_raw(offset(bytes, done) as *const u8, (n - done) as u64)
+    } as i64;
+    if wrote <= 0 {
+      return false;
+    }
     done = done + wrote;
   }
+  return true;
+}
+
+/// Writes `n` bytes at `bytes` to the file of replies `out`, all of them.
+fn out_bytes(out : &mut File, bytes : *const i8, n : i64) -> void {
+  assert(write_bytes(out, bytes, n), "cannot write a reply");
   return;
 }
 
-/// Writes the C string `text` to the file `fd`.
-fn out_text(fd : i32, text : *const i8) -> void {
-  out_bytes(fd, text, unsafe { strlen(text) });
+/// Writes the C string `text` to `out`.
+fn out_text(out : &mut File, text : *const i8) -> void {
+  out_bytes(out, text, unsafe { string_length(text) } as i64);
   return;
 }
 
-/// Writes `value` in decimal to the file `fd`.
-fn out_number(fd : i32, value : i64) -> void {
+/// Writes `value` in decimal to `out`.
+fn out_number(out : &mut File, value : i64) -> void {
   let digits : *mut i8 = unsafe { malloc(24 as usize) };
   let mut v = value;
   let mut n : i64 = 0;
   if v < 0 {
-    out_text(fd, "-");
+    out_text(out, "-");
     v = 0 - v;
   }
   while n == 0 || v > 0 {
@@ -158,21 +164,21 @@ fn out_number(fd : i32, value : i64) -> void {
     v = v / 10;
     n = n + 1;
   }
-  out_bytes(fd, offset(digits as *const i8, 24 - n), n);
+  out_bytes(out, offset(digits as *const i8, 24 - n), n);
   unsafe { free(digits); }
   return;
 }
 
-/// Writes the bytes of token `id` to the file `fd`.
-fn out_token(fd : i32, t : &Tokenizer, id : i32) -> void {
+/// Writes the bytes of token `id` to `out`.
+fn out_token(out : &mut File, t : &Tokenizer, id : i32) -> void {
   let first = unsafe { t.token_starts[id] } as i64;
-  out_bytes(fd, offset(t.token_bytes as *const i8, first), token_length(t, id));
+  out_bytes(out, offset(t.token_bytes as *const i8, first), token_length(t, id));
   return;
 }
 
 /// Writes the NUL byte that ends the text of a reply. Its last line follows.
-fn end_reply(fd : i32) -> void {
-  out_bytes(fd, "", 1);
+fn end_reply(out : &mut File) -> void {
+  out_bytes(out, "", 1);
   return;
 }
 
@@ -202,14 +208,14 @@ fn generate(w : &Weights, s : &mut State, p : &mut Prefill, t : &Tokenizer, sess
   let ids = encode(t, text, length);
   let count = ids.len();
   if count == 0 || count + steps > s.max_seq {
-    end_reply(session.output);
-    out_text(session.output, "error the prompt has ");
-    out_number(session.output, count as i64);
-    out_text(session.output, " tokens, and with ");
-    out_number(session.output, steps as i64);
-    out_text(session.output, " steps it does not fit in the context of ");
-    out_number(session.output, s.max_seq as i64);
-    out_text(session.output, "\n");
+    end_reply(&mut session.output);
+    out_text(&mut session.output, "error the prompt has ");
+    out_number(&mut session.output, count as i64);
+    out_text(&mut session.output, " tokens, and with ");
+    out_number(&mut session.output, steps as i64);
+    out_text(&mut session.output, " steps it does not fit in the context of ");
+    out_number(&mut session.output, s.max_seq as i64);
+    out_text(&mut session.output, "\n");
     return;
   }
   let mut reused = common_prefix(&session.tokens, &ids);
@@ -233,7 +239,7 @@ fn generate(w : &Weights, s : &mut State, p : &mut Prefill, t : &Tokenizer, sess
     let decode = Instant::now();
     let mut step = 0;
     while step < steps && !is_special(t, token) && token != w.config.eos_token_id {
-      out_token(session.output, t, token);
+      out_token(&mut session.output, t, token);
       generated = generated + 1;
       step = step + 1;
       if step < steps {
@@ -251,7 +257,7 @@ fn generate(w : &Weights, s : &mut State, p : &mut Prefill, t : &Tokenizer, sess
   if generated > 1 {
     per_token_us = decode_us / (generated - 1) as i64;
   }
-  let o = session.output;
+  let o = &mut session.output;
   end_reply(o);
   out_text(o, "done prompt=");
   out_number(o, count as i64);
@@ -291,7 +297,7 @@ fn cache_header(w : &Weights, session : &Session, n : i64) -> Vec<i64> {
 }
 
 /// Writes the first n rows of a cache tensor [max_seq, kv_heads, head_dim] to `f`.
-fn write_rows(f : *mut i8, cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, n : i32, kv_heads : i32, head_dim : i32) -> void {
+fn write_rows(f : &mut File, cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, n : i32, kv_heads : i32, head_dim : i32) -> void {
   let h = transfer(cache, Memory::CPU_DRAM);
   let count = (n as i64) * (kv_heads as i64) * (head_dim as i64);
   let buf : *mut i8 = unsafe { malloc((count * 2) as usize) };
@@ -305,29 +311,29 @@ fn write_rows(f : *mut i8, cache : &Tensor<f16, [?, ?, ?], Memory::HBM>, n : i32
       }
     }
   }
-  let wrote = unsafe { fwrite(buf, 2, count, f) };
-  assert(wrote == count, "cannot write the cache file");
+  assert(write_bytes(f, buf, count * 2), "cannot write the cache file");
   unsafe { free(buf); }
   return;
 }
 
 /// save PATH: the header, the tokens, and the rows of K and then V of each layer.
-fn save_cache(w : &Weights, s : &State, session : &Session, path : *const i8) -> void {
+fn save_cache(files : &Files, w : &Weights, s : &State, session : &mut Session, path : &String) -> void {
   let c = &w.config;
   let n = session.tokens.len();
-  let f = unsafe { fopen(path, "wb") };
-  if eq(f as *const i8, unsafe { 0 as *const i8 }) {
-    end_reply(session.output);
-    out_text(session.output, "error cannot open the cache file to write\n");
+  let opened = File::open(files, path, OpenMode::Write);
+  if opened.is_err() {
+    end_reply(&mut session.output);
+    out_text(&mut session.output, "error cannot open the cache file to write\n");
     return;
   }
+  let mut f = opened.unwrap();
   let header = cache_header(w, session, n as i64);
   let words : *mut i8 = unsafe { malloc((CACHE_HEADER_WORDS * 8) as usize) };
   let hw : *mut i64 = words;
   for i in 0..header.len() {
     unsafe { hw[i] = header[i]; }
   }
-  unsafe { fwrite(words, 8, CACHE_HEADER_WORDS, f); }
+  assert(write_bytes(&mut f, words, CACHE_HEADER_WORDS * 8), "cannot write the cache file");
   unsafe { free(words); }
   // The tokens, padded to a multiple of 2, so the rows start at a multiple of 8 bytes.
   let padded = (n + 1) / 2 * 2;
@@ -340,17 +346,16 @@ fn save_cache(w : &Weights, s : &State, session : &Session, path : *const i8) ->
       unsafe { iw[i] = 0; }
     }
   }
-  unsafe { fwrite(ids, 4, padded as i64, f); }
+  assert(write_bytes(&mut f, ids, (padded as i64) * 4), "cannot write the cache file");
   unsafe { free(ids); }
   for cache in s.caches.iter() {
-    write_rows(f, &cache.k, n, c.num_kv_heads, c.head_dim);
-    write_rows(f, &cache.v, n, c.num_kv_heads, c.head_dim);
+    write_rows(&mut f, &cache.k, n, c.num_kv_heads, c.head_dim);
+    write_rows(&mut f, &cache.v, n, c.num_kv_heads, c.head_dim);
   }
-  unsafe { fclose(f); }
-  end_reply(session.output);
-  out_text(session.output, "ok tokens=");
-  out_number(session.output, n as i64);
-  out_text(session.output, "\n");
+  end_reply(&mut session.output);
+  out_text(&mut session.output, "ok tokens=");
+  out_number(&mut session.output, n as i64);
+  out_text(&mut session.output, "\n");
   return;
 }
 
@@ -370,15 +375,23 @@ fn read_rows(values : *mut f16, n : i32, max_seq : i32, kv_heads : i32, head_dim
 }
 
 /// load PATH: reads a file of `save_cache` into the KV cache, if it fits this model.
-fn load_cache(w : &Weights, s : &mut State, session : &mut Session, path : *const i8) -> void {
+fn load_cache(files : &Files, w : &Weights, s : &mut State, session : &mut Session, path : &String) -> void {
   let c = &w.config;
-  let file = read_text_file(path);
-  let words : *mut i64 = file.bytes;
-  if file.length < CACHE_HEADER_WORDS * 8 || unsafe { words[0] } != CACHE_MAGIC || unsafe {
+  let opened = File::open(files, path, OpenMode::Read);
+  if opened.is_err() {
+    end_reply(&mut session.output);
+    out_text(&mut session.output, "error cannot open the cache file to read\n");
+    return;
+  }
+  let map = opened.unwrap().map().expect("cannot map the cache file into memory");
+  let length = map.len();
+  let base = map.as_ptr() as *mut i8;
+  let words : *mut i64 = base;
+  if length < CACHE_HEADER_WORDS * 8 || unsafe { words[0] } != CACHE_MAGIC || unsafe {
     words[1]
   } != CACHE_VERSION {
-    end_reply(session.output);
-    out_text(session.output, "error not a cache file of this version\n");
+    end_reply(&mut session.output);
+    out_text(&mut session.output, "error not a cache file of this version\n");
     return;
   }
   let n = unsafe { words[2] } as i32;
@@ -390,17 +403,17 @@ fn load_cache(w : &Weights, s : &mut State, session : &mut Session, path : *cons
   let padded = (n + 1) / 2 * 2;
   let row = (c.num_kv_heads as i64) * (c.head_dim as i64);
   let bytes = CACHE_HEADER_WORDS * 8 + (padded as i64) * 4 + (c.num_layers as i64) * 2 * (n as i64) * row * 2;
-  if !fits || file.length != bytes {
-    end_reply(session.output);
-    out_text(session.output, "error the cache file was made for another model or context\n");
+  if !fits || length != bytes {
+    end_reply(&mut session.output);
+    out_text(&mut session.output, "error the cache file was made for another model or context\n");
     return;
   }
-  let ids : *mut i32 = offset_mut(file.bytes, CACHE_HEADER_WORDS * 8);
+  let ids : *mut i32 = offset_mut(base, CACHE_HEADER_WORDS * 8);
   let mut tokens = Vec<i32>::new();
   for i in 0..n {
     tokens.push(unsafe { ids[i] });
   }
-  let rows : *mut f16 = offset_mut(file.bytes, CACHE_HEADER_WORDS * 8 + (padded as i64) * 4);
+  let rows : *mut f16 = offset_mut(base, CACHE_HEADER_WORDS * 8 + (padded as i64) * 4);
   let mut at : i64 = 0;
   for cache in s.caches.iter_mut() {
     cache.k = read_rows(offset_mut(rows, at), n, s.max_seq, c.num_kv_heads, c.head_dim);
@@ -409,27 +422,20 @@ fn load_cache(w : &Weights, s : &mut State, session : &mut Session, path : *cons
     at = at + (n as i64) * row;
   }
   session.tokens = tokens;
-  end_reply(session.output);
-  out_text(session.output, "ok tokens=");
-  out_number(session.output, n as i64);
-  out_text(session.output, "\n");
+  end_reply(&mut session.output);
+  out_text(&mut session.output, "ok tokens=");
+  out_number(&mut session.output, n as i64);
+  out_text(&mut session.output, "\n");
   return;
 }
 
 /// Answers the requests of the file at `requests` until it ends.
-pub fn run_session(weights_path : *const i8, tokenizer_path : *const i8, requests : *const i8, replies : *const i8, context : i32) -> i32 {
-  let t = load_tokenizer(tokenizer_path);
-  let w = load_weights(weights_path);
+pub fn run_session(files : &Files, weights_path : &String, tokenizer_path : &String, requests : &String, replies : &String, context : i32) -> i32 {
+  let t = load_tokenizer(files, tokenizer_path);
+  let w = load_weights(files, weights_path);
   assert(context > 0 && context <= w.config.max_positions, "--context must be between 1 and the max_positions of the model");
   let mut s = new_state(&w.config, context);
   let mut p = new_prefill(&w.config, context, CHUNK);
-  let mut session = Session {
-    input: -1,
-    output: -1,
-    tokens: Vec<i32>::new(),
-    weights_bytes: file_bytes(weights_path),
-    line: unsafe { malloc(LINE_BYTES as usize) },
-  };
   // The first pass over the weights takes seconds, so it runs before the first request. It leaves
   // row 0 of the cache, but no token, so the first request runs from position 0.
   let mut warm = Vec<i32>::new();
@@ -439,17 +445,21 @@ pub fn run_session(weights_path : *const i8, tokenizer_path : *const i8, request
   predict(&w, &mut s, &mut next);
   let first = read_first(&next);
   assert(first >= 0, "the warm-up gave no token");
-  // A named pipe opens when the client opens its other end, so these wait for the client. 1 is
-  // O_WRONLY. The file of replies must exist, as a named pipe does.
-  session.output = unsafe { open(replies, 1) };
-  assert(session.output >= 0, "cannot open the file of replies");
-  out_text(session.output, "ready context=");
-  out_number(session.output, context as i64);
-  out_text(session.output, "\n");
-  session.input = unsafe { open(requests, 0) };
-  assert(session.input >= 0, "cannot open the file of requests");
+  // A named pipe opens when the client opens its other end, so these wait for the client.
+  let mut output = File::open(files, replies, OpenMode::Write).expect("cannot open the file of replies");
+  out_text(&mut output, "ready context=");
+  out_number(&mut output, context as i64);
+  out_text(&mut output, "\n");
+  let input = File::open(files, requests, OpenMode::Read).expect("cannot open the file of requests");
+  let mut session = Session {
+    input: input,
+    output: output,
+    tokens: Vec<i32>::new(),
+    weights_bytes: file_bytes(files, weights_path),
+    line: unsafe { malloc(LINE_BYTES as usize) },
+  };
   while true {
-    let n = read_line(session.input, session.line);
+    let n = read_line(&mut session.input, session.line);
     if n < 0 {
       break;
     }
@@ -458,21 +468,23 @@ pub fn run_session(weights_path : *const i8, tokenizer_path : *const i8, request
       let mut end : i64 = 0;
       let steps = number_at(line, 9, &mut end);
       let bytes = number_at(line, end + 1, &mut end);
-      let text = read_bytes(session.input, bytes);
+      let text : *mut i8 = unsafe { malloc((bytes + 1) as usize) };
+      read_bytes(&mut session.input, text, bytes);
       generate(&w, &mut s, &mut p, &t, &mut session, steps as i32, text, bytes);
       unsafe { free(text); }
     } else if starts_with(line, "save ") {
-      save_cache(&w, &s, &session, offset_mut(line, 5));
+      // read_line ends the line with a NUL byte.
+      let path = unsafe { String::from_c_str(offset(line as *const i8, 5)) };
+      save_cache(files, &w, &s, &mut session, &path);
     } else if starts_with(line, "load ") {
-      load_cache(&w, &mut s, &mut session, offset_mut(line, 5));
+      let path = unsafe { String::from_c_str(offset(line as *const i8, 5)) };
+      load_cache(files, &w, &mut s, &mut session, &path);
     } else if n > 0 {
-      end_reply(session.output);
-      out_text(session.output, "error unknown request: ");
-      out_text(session.output, line);
-      out_text(session.output, "\n");
+      end_reply(&mut session.output);
+      out_text(&mut session.output, "error unknown request: ");
+      out_text(&mut session.output, line);
+      out_text(&mut session.output, "\n");
     }
   }
-  unsafe { close(session.input); }
-  unsafe { close(session.output); }
   return 0;
 }
