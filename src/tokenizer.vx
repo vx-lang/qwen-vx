@@ -7,17 +7,17 @@
 //===----------------------------------------------------------------------===//
 // The byte-level BPE tokenizer of the Qwen2 and Qwen3 models. It reads the tokenizer file that
 // `scripts/convert_tokenizer.py` writes, and that script describes the file and the steps of
-// `encode`. The tables stay in the mapped file, and every lookup is a binary search in them.
+// `encode`. The tables stay in the mapped file, and every lookup is a binary search in them. A
+// function that opens a file takes a `&Files`, and one that prints takes the `Stdout`.
 import core::convert;
+import core::option;
 import core::ptr;
+import core::result;
+import std::fs;
+import std::io;
 import std::libc;
-import std::mmap;
+import std::string;
 import std::vec;
-
-extern {
-  pkg fn strlen(s : *const i8) -> i64;
-  pkg fn write(fd : i32, buf : *const i8, n : i64) -> i64;
-}
 
 /// The bytes "VXQTOK01" at the start of the file, read as one little-endian i64.
 const TOKENIZER_MAGIC : i64 = 3544415710829697110;
@@ -32,8 +32,9 @@ const HANGUL_V_COUNT : i32 = 21;
 const HANGUL_T_COUNT : i32 = 28;
 const HANGUL_N_COUNT : i32 = 588;
 
-/// A tokenizer file mapped into memory. Each pointer is a table of the file.
+/// A tokenizer file mapped into memory. Each pointer is a table of the file, in `map`.
 struct Tokenizer {
+  map : Option<Mapping>,
   base : *mut i8,
   size : i64,
   n_tokens : i32,
@@ -65,12 +66,6 @@ struct Tokenizer {
   compositions : *mut i32,
 }
 
-/// Whether `p` is MAP_FAILED, the address -1 that mmap gives when it fails.
-fn tokenizer_map_failed(p : *mut i8) -> bool {
-  let failed : *mut i8 = offset_mut(unsafe { 0 as *mut i8 }, -1);
-  return eq(p as *const i8, failed as *const i8);
-}
-
 /// The i64 word at `index` of the header.
 fn header_word(base : *mut i8, index : i64) -> i64 {
   let words : *mut i64 = base;
@@ -85,17 +80,16 @@ fn table(base : *mut i8, size : i64, index : i64) -> *mut i8 {
 }
 
 /// Maps the tokenizer file at `path` into memory.
-pub fn load_tokenizer(path : *const i8) -> Tokenizer {
-  let fd : i32 = unsafe { open(path, 0) };
-  assert(fd >= 0, "cannot open the tokenizer file");
-  let size : i64 = unsafe { lseek(fd, 0, 2) };
+pub fn load_tokenizer(files : &Files, path : &String) -> Tokenizer {
+  let file = File::open(files, path, OpenMode::Read).expect("cannot open the tokenizer file");
+  let map = file.map().expect("cannot map the tokenizer file into memory");
+  let size = map.len();
   assert(size >= 256, "the tokenizer file is too short");
-  let base : *mut i8 = unsafe { mmap(0 as *mut i8, size, 1, 1, fd, 0) };
-  assert(!tokenizer_map_failed(base), "cannot map the tokenizer file into memory");
-  unsafe { close(fd); }
+  let base = map.as_ptr() as *mut i8;
   assert(header_word(base, 0) == TOKENIZER_MAGIC, "this is not a tokenizer file of the Qwen app");
   assert(header_word(base, 1) == TOKENIZER_VERSION, "the tokenizer file has another format version");
   return Tokenizer {
+    map: Option<Mapping>::Some(map),
     base: base,
     size: size,
     n_tokens: header_word(base, 2) as i32,
@@ -132,7 +126,7 @@ pub fn load_tokenizer(path : *const i8) -> Tokenizer {
 pub fn no_tokenizer() -> Tokenizer {
   let none : *mut i8 = unsafe { 0 as *mut i8 };
   return Tokenizer {
-    base: none, size: 0, n_tokens: 0, n_merges: 0, n_added: 0, n_letters: 0, n_numbers: 0,
+    map: Option<Mapping>::None, base: none, size: 0, n_tokens: 0, n_merges: 0, n_added: 0, n_letters: 0, n_numbers: 0,
     n_spaces: 0, n_decomposed: 0, n_combining: 0, n_compositions: 0,
     byte_tokens: none, token_starts: none, token_bytes: none, merge_pairs: none,
     merge_ranks: none, merge_tokens: none, added_tokens: none, added_special: none,
@@ -647,7 +641,7 @@ pub fn encode(t : &Tokenizer, text : *const i8, length : i64) -> Vec<i32> {
 
 /// The token ids of the NUL-terminated UTF-8 text at `text`.
 fn encode_c_str(t : &Tokenizer, text : *const i8) -> Vec<i32> {
-  return encode(t, text, unsafe { strlen(text) });
+  return encode(t, text, unsafe { string_length(text) } as i64);
 }
 
 // ------------------------------------------------------------ decode ---
@@ -664,7 +658,7 @@ pub fn is_special(t : &Tokenizer, id : i32) -> bool {
 
 /// The id of the added token whose text is `name`, such as "<|im_end|>", or -1.
 fn added_token(t : &Tokenizer, name : *const i8) -> i32 {
-  let length = unsafe { strlen(name) };
+  let length = unsafe { string_length(name) } as i64;
   let id = added_at(t, name, 0, length);
   if id >= 0 && token_length(t, id) == length {
     return id;
@@ -674,20 +668,24 @@ fn added_token(t : &Tokenizer, name : *const i8) -> i32 {
 
 /// Writes the bytes of token `id` to standard output. A token can hold part of a UTF-8
 /// character, so the bytes of the next tokens complete it.
-pub fn write_token(t : &Tokenizer, id : i32) -> void {
+pub fn write_token(out : &mut Stdout, t : &Tokenizer, id : i32) -> void {
   assert(id >= 0 && id < t.n_tokens, "the token is not in the vocabulary");
   let first = unsafe { t.token_starts[id] } as i64;
-  let size = token_length(t, id);
-  if size > 0 {
-    unsafe { write(1, offset_mut(t.token_bytes, first), size); }
-  }
+  print_bytes(out, offset(t.token_bytes as *const i8, first), token_length(t, id));
   return;
 }
 
-/// Writes the `length` bytes at `text` to standard output.
-pub fn print_bytes(text : *const i8, length : i64) -> void {
+/// Writes the `length` bytes at `text` to standard output. A failed write is not an error, as
+/// for `print!`.
+pub fn print_bytes(out : &mut Stdout, text : *const i8, length : i64) -> void {
   if length > 0 {
-    unsafe { write(1, text, length); }
+    let mut bytes = Vec<u8>::with_capacity(length as i32);
+    let mut i : i64 = 0;
+    while i < length {
+      bytes.push(unsafe { text[i] } as u8);
+      i = i + 1;
+    }
+    let _written = out.write_all(&bytes);
   }
   return;
 }
@@ -700,30 +698,28 @@ struct Text {
   length : i64,
 }
 
-/// The bytes of the file at `path`, mapped into memory. An empty file has no bytes.
-pub fn read_text_file(path : *const i8) -> Text {
-  let fd : i32 = unsafe { open(path, 0) };
-  assert(fd >= 0, "cannot open the text file");
-  let size : i64 = unsafe { lseek(fd, 0, 2) };
-  assert(size >= 0, "cannot read the size of the text file");
+/// The bytes of the file at `path`, in new memory. An empty file has no bytes.
+pub fn read_text_file(files : &Files, path : &String) -> Text {
+  let file = File::open(files, path, OpenMode::Read).expect("cannot open the text file");
+  let map = file.map().expect("cannot map the text file into memory");
+  let size = map.len();
   if size == 0 {
-    unsafe { close(fd); }
     return Text {
       bytes: unsafe { 0 as *mut i8 }, length: 0
     };
   }
-  let base : *mut i8 = unsafe { mmap(0 as *mut i8, size, 1, 1, fd, 0) };
-  assert(!tokenizer_map_failed(base), "cannot map the text file into memory");
-  unsafe { close(fd); }
+  // A copy, because the file is unmapped when `map` drops.
+  let bytes : *mut i8 = unsafe { malloc((size + 1) as usize) };
+  copy_bytes(bytes, map.as_ptr() as *const i8, size);
   return Text {
-    bytes: base, length: size
+    bytes: bytes, length: size
   };
 }
 
 /// The NUL-terminated text at `text`.
 pub fn c_text(text : *const i8) -> Text {
   return Text {
-    bytes: text as *mut i8, length: unsafe { strlen(text) }
+    bytes: text as *mut i8, length: unsafe { string_length(text) } as i64
   };
 }
 

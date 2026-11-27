@@ -11,16 +11,13 @@
 //
 // The file is mapped read-only and shared, and each tensor starts a page of 16 KB. So the
 // transfer of a view of a tensor to GPU memory makes no copy: the GPU reads the pages of the file
-// cache. The file cache keeps one copy of the weights for all the runs.
-import std::libc;
-import std::mmap;
+// cache. The file cache keeps one copy of the weights for all the runs. A function that opens the
+// file takes the right to open files, a `&Files`.
+import core::result;
+import std::fs;
+import std::string;
 import std::vec;
 import core::ptr;
-
-extern {
-  pkg fn strlen(s : *const i8) -> i64;
-  pub fn strcmp(a : *const i8, b : *const i8) -> i32;
-}
 
 /// The bytes "VXQWEN01" at the start of the file, read as one little-endian i64.
 const MAGIC : i64 = 3544418966465239126;
@@ -191,14 +188,15 @@ struct Qwen35Weights {
   mtp : Vec<Mtp35>,
 }
 
-/// A weight file mapped into memory, and the position of the next tensor to load.
+/// A weight file mapped into memory, and the position of the next tensor to load. `base` points
+/// into `map`, so it is valid while the `Reader` lives.
 struct Reader {
+  map : Mapping,
   base : *mut i8,
   size : i64,
   table : i64,
   count : i64,
   next : i64,
-  fd : i32,
   version : i64,
 }
 
@@ -215,11 +213,11 @@ fn next_tensor(r : &mut Reader, kind : *const i8, dtype : i64, bits : i64, rows 
   assert(r.next < r.count, "the weight file has fewer tensors than the config needs");
   let entry = r.table / 8 + r.next * ENTRY_WORDS;
   let name : *mut i8 = offset_mut(r.base, entry * 8);
-  let length = unsafe { strlen(name) };
-  let kind_length = unsafe { strlen(kind) };
+  let length = unsafe { string_length(name) } as i64;
+  let kind_length = unsafe { string_length(kind) } as i64;
   assert(length >= kind_length, "a tensor of the weight file is not the one the config needs next");
   let tail : *mut i8 = offset_mut(name, length - kind_length);
-  assert(unsafe { strcmp(tail, kind) } == 0, "a tensor of the weight file is not the one the config needs next");
+  assert(unsafe { string_compare(tail, kind) } == 0, "a tensor of the weight file is not the one the config needs next");
 
   let rank : i64 = if cols == 0 {
     1
@@ -362,22 +360,15 @@ fn zero_f16(n : i32) -> Tensor<f16, [?], Memory::HBM> {
   return transfer(Tensor<f16>([n]), Memory::HBM);
 }
 
-/// Whether `p` is MAP_FAILED, the address -1 that mmap gives when it fails.
-fn map_failed(p : *mut i8) -> bool {
-  let failed : *mut i8 = offset_mut(unsafe { 0 as *mut i8 }, -1);
-  return eq(p as *const i8, failed as *const i8);
-}
-
 /// Maps the weight file at `path` into memory, and checks its magic word and version.
-fn open_weight_file(path : *const i8) -> Reader {
-  let fd : i32 = unsafe { open(path, 0) };
-  assert(fd >= 0, "cannot open the weight file");
-  let size : i64 = unsafe { lseek(fd, 0, 2) };
-  assert(size > 0, "cannot read the size of the weight file");
-  let base : *mut i8 = unsafe { mmap(0 as *mut i8, size, 1, 1, fd, 0) };
-  assert(!map_failed(base), "cannot map the weight file into memory");
+fn open_weight_file(files : &Files, path : &String) -> Reader {
+  let file = File::open(files, path, OpenMode::Read).expect("cannot open the weight file");
+  let map = file.map().expect("cannot map the weight file into memory");
+  let size = map.len();
+  assert(size > 0, "the weight file is empty");
+  let base = map.as_ptr() as *mut i8;
   let mut r = Reader {
-    base: base, size: size, table: 0, count: 0, next: 0, fd: fd, version: 0
+    map: map, base: base, size: size, table: 0, count: 0, next: 0, version: 0
   };
   assert(size >= 4096 && word(&r, 0) == MAGIC, "this is not a weight file of the Qwen app");
   r.version = word(&r, 1);
@@ -387,9 +378,8 @@ fn open_weight_file(path : *const i8) -> Reader {
   return r;
 }
 
-/// Unmaps the weight file. The tensors in GPU memory stay.
-fn close_weight_file(r : &Reader) -> void {
-  unsafe { munmap(r.base, r.size); close(r.fd); }
+/// Unmaps the weight file, when `r` drops. The tensors in GPU memory stay.
+fn close_weight_file(r : Reader) -> void {
   return;
 }
 
@@ -451,10 +441,10 @@ fn read_config(r : &Reader) -> Config {
 
 /// The arch of the model in the weight file at `path`: 0 for `load_weights`, and 1 for
 /// `load_qwen35_weights`. It reads only the header.
-pub fn weight_file_arch(path : *const i8) -> i32 {
-  let r = open_weight_file(path);
+pub fn weight_file_arch(files : &Files, path : &String) -> i32 {
+  let r = open_weight_file(files, path);
   let arch = read_config(&r).arch;
-  close_weight_file(&r);
+  close_weight_file(r);
   return arch;
 }
 
@@ -466,8 +456,8 @@ fn empty_matrix() -> WeightMatrix {
 }
 
 /// Loads the weight file at `path`, of an arch 1 model, into GPU memory.
-pub fn load_qwen35_weights(path : *const i8) -> Qwen35Weights {
-  let mut r = open_weight_file(path);
+pub fn load_qwen35_weights(files : &Files, path : &String) -> Qwen35Weights {
+  let mut r = open_weight_file(files, path);
   let config = read_config(&r);
   assert(config.arch == ARCH_QWEN35, "this weight file is not of a Qwen3.5 MoE model; use load_weights");
   assert(config.full_attention_interval > 0 && config.num_experts > 0 && config.shared_expert_inter > 0, "a Qwen3.5 MoE model has full attention layers, experts and a shared expert");
@@ -497,7 +487,7 @@ pub fn load_qwen35_weights(path : *const i8) -> Qwen35Weights {
     });
   }
   assert(r.next == r.count, "the weight file has more tensors than the config needs");
-  close_weight_file(&r);
+  close_weight_file(r);
   return Qwen35Weights {
     config: config, embed: embed, layers: layers, final_norm: final_norm, lm_head: lm_head, mtp: mtp
   };
@@ -595,8 +585,8 @@ fn load_qwen35_layer(r : &mut Reader, config : &Config, dtype : i64, full : bool
 }
 
 /// Loads the weight file at `path`, of an arch 0 model, into GPU memory.
-pub fn load_weights(path : *const i8) -> Weights {
-  let mut r = open_weight_file(path);
+pub fn load_weights(files : &Files, path : &String) -> Weights {
+  let mut r = open_weight_file(files, path);
   let config = read_config(&r);
   assert(config.arch == 0, "this weight file is of a Qwen3.5 MoE model; use load_qwen35_weights");
 
@@ -665,7 +655,7 @@ pub fn load_weights(path : *const i8) -> Weights {
     load_matrix(&mut r, matrix_dtype(config.weight_format, true), "lm_head", "lm_head.scale", config.vocab_size, hidden)
   };
   assert(r.next == r.count, "the weight file has more tensors than the config needs");
-  close_weight_file(&r);
+  close_weight_file(r);
   return Weights {
     config: config, embed: embed, layers: layers, final_norm: final_norm, lm_head: lm_head
   };

@@ -18,6 +18,9 @@
 import qwen::weights;
 import core::num;
 import core::convert;
+import std::root;
+import std::string;
+import std::vec;
 
 /// The 16 bits of a bf16 value.
 fn code(v : bf16) -> u32 {
@@ -131,10 +134,10 @@ fn report_matrix(name : *const i8, high_name : *const i8, scale_name : *const i8
   return;
 }
 
-fn main(argc : i32, argv : *mut *mut i8) -> i32 {
-  assert(argc == 2, "give the weight file as the only argument");
-  let arch = weight_file_arch(unsafe { argv[1] });
-  let w = load_qwen35_weights(unsafe { argv[1] });
+fn main(root : Root, args : Vec<String>) -> i32 {
+  assert(args.len() == 2, "give the weight file as the only argument");
+  let arch = weight_file_arch(&root.files, args.get_ref(1));
+  let w = load_qwen35_weights(&root.files, args.get_ref(1));
   let c = &w.config;
   let mut full = 0;
   for l in 0..c.num_layers {

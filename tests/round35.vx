@@ -38,6 +38,8 @@ import qwen::qwen35;
 import qwen::round;
 import qwen::round35;
 import qwen::weights;
+import std::root;
+import std::string;
 
 /// Decodes `tokens` one at a time from position `pos`, and gives the logits of each, one after
 /// another.
@@ -159,8 +161,8 @@ fn copy_states(dst : &mut Qwen35State, src : &Qwen35State) -> void {
   return;
 }
 
-fn main(argc : i32, argv : *mut *mut i8) -> i32 {
-  let w = load_qwen35_weights(unsafe { argv[1] });
+fn main(root : Root, args : Vec<String>) -> i32 {
+  let w = load_qwen35_weights(&root.files, args.get_ref(1));
   let vocab = w.config.vocab_size;
   let max_seq = 64;
   let mut a = new_qwen35_state(&w.config, max_seq);

@@ -32,6 +32,8 @@ import std::vec;
 import qwen::weights;
 import qwen::model;
 import qwen::prefill;
+import std::root;
+import std::string;
 
 struct PromptToken {
   t : Tensor<i32, [?], Memory::HBM>,
@@ -78,9 +80,9 @@ fn run(w : &Weights, prompt : &Vec<i32>, chunk : i32, steps : i32, logits : &mut
   return;
 }
 
-fn main(argc : i32, argv : *mut *mut i8) -> i32 {
-  assert(argc == 2, "give: WEIGHTS");
-  let w = load_weights(unsafe { argv[1] });
+fn main(root : Root, args : Vec<String>) -> i32 {
+  assert(args.len() == 2, "give: WEIGHTS");
+  let w = load_weights(&root.files, args.get_ref(1));
   let mut prompt = Vec<i32>::new();
   for i in 0..40 {
     prompt.push((i * 37 + 11) % w.config.vocab_size);
