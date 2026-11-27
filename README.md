@@ -33,7 +33,7 @@ the setup, every run, the cases where qwen-vx is slower and the limits, is
 ## Install Vx
 
 The program needs a Mac with Apple Silicon, and the Vx release that [`VX_VERSION`](VX_VERSION)
-names (now v0.0.5). The toolchain also needs LLVM 22 and z3 from Homebrew:
+names (now v0.0.6). The toolchain also needs LLVM 22 and z3 from Homebrew:
 
 ```sh
 brew install llvm@22 z3

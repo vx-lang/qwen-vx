@@ -5,7 +5,7 @@ How to install Vx, prepare a model, run the program, use a session, and run the 
 ## Install Vx
 
 The program needs a Mac with Apple Silicon for the GPU, and the Vx release that the file
-[`VX_VERSION`](../VX_VERSION) names (now v0.0.5). CI tests that release. On a Mac, the Vx toolchain
+[`VX_VERSION`](../VX_VERSION) names (now v0.0.6). CI tests that release. On a Mac, the Vx toolchain
 also needs LLVM 22 and z3 from Homebrew:
 
 ```sh
