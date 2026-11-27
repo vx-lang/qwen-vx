@@ -1,0 +1,8 @@
+<|im_start|>user
+Write a Python function merge_intervals(intervals) that merges overlapping closed intervals and returns them sorted. Add pytest tests for it, with empty input and touching intervals.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+
